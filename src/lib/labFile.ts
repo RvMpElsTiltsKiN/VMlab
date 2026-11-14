@@ -1,13 +1,19 @@
 import type { Edge } from '@xyflow/react';
+import type { Message } from '../i18n';
 import type {
+  DockerEnvVar,
+  DockerPortMap,
+  DockerRunOptions,
   GuestIpMode,
   GuestSystem,
+  LinkConditions,
   MachineData,
   MachineKind,
   MachineNode,
   NetMode,
   NodeNet,
 } from '../types';
+import { hasLinkConditions, LINK_LIMITS } from './link';
 
 /** Nodo tal y como viaja dentro de un archivo `.vmlab`. */
 export interface LabNode {
@@ -23,8 +29,8 @@ export interface LabEdge {
 }
 
 export type ParseLabResult =
-  | { ok: true; nodes: MachineNode[]; edges: Edge[]; warnings: string[] }
-  | { ok: false; error: string };
+  | { ok: true; nodes: MachineNode[]; edges: Edge[]; warnings: Message[] }
+  | { ok: false; error: Message };
 
 /** 5 MB. Se comprueba sobre `text.length` antes de llamar a `JSON.parse`. */
 const MAX_TEXT = 5 * 1024 * 1024;
@@ -32,6 +38,34 @@ const MAX_NODES = 200;
 const MAX_EDGES = 1000;
 const COORD_LIMIT = 100_000;
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Límites de las opciones de Docker. Los mismos que `validate::docker_run_options`. */
+export const RUN_LIMITS = {
+  env: 32,
+  ports: 32,
+  keyLength: 128,
+  valueLength: 1024,
+} as const;
+
+/** Nombre de variable de entorno aceptado por Docker (solo ASCII). */
+export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/** `char::is_control` de Rust: categoría Unicode Cc. */
+const CONTROL_RE = /[\p{Cc}]/u;
+
+/** Longitud en caracteres (no en unidades UTF-16), como el backend. */
+export function charLength(value: string): number {
+  return [...value].length;
+}
+
+export function hasControlChars(value: string): boolean {
+  return CONTROL_RE.test(value);
+}
+
+/** Puerto válido para Docker (el backend ya no admite 0 por el tipo `u16`). */
+export function validPortNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 65_535;
+}
 
 const NET_MODES: readonly NetMode[] = ['nat', 'bridged', 'intnet', 'hostonly', 'natnetwork', 'none'];
 const GUEST_SYSTEMS: readonly GuestSystem[] = [
@@ -64,7 +98,9 @@ const ALL_DATA_KEYS = new Set<string>([
   'label',
   'target',
   'image',
+  'run',
   'net',
+  'link',
   'slot',
   ...GUEST_STRING_KEYS,
   'guestSystem',
@@ -80,8 +116,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const nameOf = (label: string, id: string): string => (label.trim() ? label : id);
 
-function kindName(value: unknown): string {
-  return typeof value === 'string' && value ? value : 'desconocido';
+function kindName(value: unknown): string | null {
+  return typeof value === 'string' && value ? value : null;
 }
 
 function droppedKeys(keys: string[]): string {
@@ -99,12 +135,77 @@ function exportNet(net: NodeNet | undefined): NodeNet | undefined {
   return out;
 }
 
+/** Lista blanca de las condiciones de red para exportar. */
+function exportLink(link: LinkConditions | undefined): LinkConditions | undefined {
+  if (!hasLinkConditions(link)) return undefined;
+  if (!Number.isInteger(link.delayMs) || link.delayMs < 0 || link.delayMs > LINK_LIMITS.delayMs) return undefined;
+  if (!Number.isInteger(link.jitterMs) || link.jitterMs < 0 || link.jitterMs > link.delayMs) return undefined;
+  if (!Number.isInteger(link.lossTenths) || link.lossTenths < 0 || link.lossTenths > LINK_LIMITS.lossTenths) {
+    return undefined;
+  }
+
+  const out: LinkConditions = {
+    delayMs: link.delayMs,
+    jitterMs: link.jitterMs,
+    lossTenths: link.lossTenths,
+  };
+  if (link.rateKbit !== undefined) {
+    if (
+      !Number.isInteger(link.rateKbit) ||
+      link.rateKbit < LINK_LIMITS.rateKbitMin ||
+      link.rateKbit > LINK_LIMITS.rateKbitMax
+    ) {
+      return undefined;
+    }
+    out.rateKbit = link.rateKbit;
+  }
+  return out;
+}
+
+/** Lista blanca de `run` para exportar. Descarta filas inválidas y duplicadas. */
+function exportRun(run: DockerRunOptions | undefined): DockerRunOptions | undefined {
+  if (!run) return undefined;
+
+  const env: DockerEnvVar[] = [];
+  const keys = new Set<string>();
+  const envIn = Array.isArray(run.env) ? run.env : [];
+  for (const item of envIn) {
+    if (env.length >= RUN_LIMITS.env) break;
+    if (!item || typeof item.key !== 'string' || typeof item.value !== 'string') continue;
+    if (!ENV_KEY_RE.test(item.key) || keys.has(item.key)) continue;
+    if (charLength(item.value) > RUN_LIMITS.valueLength || hasControlChars(item.value)) continue;
+    keys.add(item.key);
+    env.push({ key: item.key, value: item.value });
+  }
+
+  const ports: DockerPortMap[] = [];
+  const published = new Set<string>();
+  const portsIn = Array.isArray(run.ports) ? run.ports : [];
+  for (const port of portsIn) {
+    if (ports.length >= RUN_LIMITS.ports) break;
+    if (!port || !validPortNumber(port.host) || !validPortNumber(port.container)) continue;
+    if (port.proto !== 'tcp' && port.proto !== 'udp') continue;
+    const key = `${port.host}/${port.proto}`;
+    if (published.has(key)) continue;
+    published.add(key);
+    ports.push({ host: port.host, container: port.container, proto: port.proto });
+  }
+
+  if (!env.length && !ports.length) return undefined;
+  return { env, ports };
+}
+
 /** Lista blanca de `MachineData` para exportar. La contraseña de invitado nunca se guarda. */
 function exportData(data: MachineData): Record<string, unknown> {
   const out: Record<string, unknown> = { kind: data.kind, label: data.label, target: data.target };
 
+  const link = exportLink(data.link);
+  if (link) out.link = link;
+
   if (data.kind === 'docker') {
     if (typeof data.image === 'string' && data.image && data.image.length <= 200) out.image = data.image;
+    const run = exportRun(data.run);
+    if (run) out.run = run;
     return out;
   }
 
@@ -165,21 +266,21 @@ export function serializeLab(nodes: readonly LabNode[], edges: readonly LabEdge[
   );
 }
 
-function parseNet(value: unknown, label: string, warnings: string[]): NodeNet | undefined {
+function parseNet(value: unknown, label: string, warnings: Message[]): NodeNet | undefined {
   if (!isRecord(value)) {
-    warnings.push(`Nodo «${label}»: la red no es válida; se descarta.`);
+    warnings.push({ key: 'labFile.warn.netInvalid', params: { label } });
     return undefined;
   }
 
   const mode = value.mode;
   if (typeof mode !== 'string' || !NET_MODES.includes(mode as NetMode)) {
-    warnings.push(`Nodo «${label}»: el modo de red no es válido; se descarta la red.`);
+    warnings.push({ key: 'labFile.warn.netModeInvalid', params: { label } });
     return undefined;
   }
 
   const adapter = value.adapter;
   if (typeof adapter !== 'number' || !Number.isInteger(adapter) || adapter < 1 || adapter > 4) {
-    warnings.push(`Nodo «${label}»: el adaptador de red debe estar entre 1 y 4; se descarta la red.`);
+    warnings.push({ key: 'labFile.warn.netAdapterInvalid', params: { label } });
     return undefined;
   }
 
@@ -190,25 +291,190 @@ function parseNet(value: unknown, label: string, warnings: string[]): NodeNet | 
     if (typeof raw === 'string' && raw.length <= 200) {
       if (raw) net[key] = raw;
     } else {
-      warnings.push(`Nodo «${label}»: «${key}» de la red no es válido; se descarta.`);
+      warnings.push({ key: 'labFile.warn.netFieldInvalid', params: { label, field: key } });
     }
   }
 
   const unknown = Object.keys(value).filter((key) => key !== 'mode' && key !== 'adapter' && key !== 'name' && key !== 'bridge');
   if (unknown.length) {
-    warnings.push(`Nodo «${label}»: se descartaron campos de red desconocidos (${droppedKeys(unknown)}).`);
+    warnings.push({ key: 'labFile.warn.netUnknown', params: { label, fields: droppedKeys(unknown) } });
   }
   return net;
 }
 
-function parseGuestFields(data: Record<string, unknown>, out: MachineData, label: string, warnings: string[]): void {
+/** Límites de las condiciones de red (los mismos que valida el backend). */
+function parseLink(value: unknown, label: string, warnings: Message[]): LinkConditions | undefined {
+  if (!isRecord(value)) {
+    warnings.push({ key: 'labFile.warn.linkInvalid', params: { label } });
+    return undefined;
+  }
+
+  const delayMs = value.delayMs;
+  if (
+    typeof delayMs !== 'number' ||
+    !Number.isInteger(delayMs) ||
+    delayMs < 0 ||
+    delayMs > LINK_LIMITS.delayMs
+  ) {
+    warnings.push({ key: 'labFile.warn.linkDelay', params: { label } });
+    return undefined;
+  }
+
+  const jitterMs = value.jitterMs;
+  if (
+    typeof jitterMs !== 'number' ||
+    !Number.isInteger(jitterMs) ||
+    jitterMs < 0 ||
+    jitterMs > LINK_LIMITS.jitterMs ||
+    jitterMs > delayMs
+  ) {
+    warnings.push({ key: 'labFile.warn.linkJitter', params: { label } });
+    return undefined;
+  }
+
+  const lossTenths = value.lossTenths;
+  if (
+    typeof lossTenths !== 'number' ||
+    !Number.isInteger(lossTenths) ||
+    lossTenths < 0 ||
+    lossTenths > LINK_LIMITS.lossTenths
+  ) {
+    warnings.push({ key: 'labFile.warn.linkLoss', params: { label } });
+    return undefined;
+  }
+
+  const out: LinkConditions = { delayMs, jitterMs, lossTenths };
+  const rateKbit = value.rateKbit;
+  if (rateKbit !== undefined && rateKbit !== null) {
+    if (
+      typeof rateKbit !== 'number' ||
+      !Number.isInteger(rateKbit) ||
+      rateKbit < LINK_LIMITS.rateKbitMin ||
+      rateKbit > LINK_LIMITS.rateKbitMax
+    ) {
+      warnings.push({ key: 'labFile.warn.linkRate', params: { label } });
+    } else {
+      out.rateKbit = rateKbit;
+    }
+  }
+
+  const unknown = Object.keys(value).filter(
+    (key) => key !== 'delayMs' && key !== 'jitterMs' && key !== 'lossTenths' && key !== 'rateKbit',
+  );
+  if (unknown.length) {
+    warnings.push({ key: 'labFile.warn.linkUnknown', params: { label, fields: droppedKeys(unknown) } });
+  }
+
+  return hasLinkConditions(out) ? out : undefined;
+}
+
+/** Límites de `run` en un archivo importado (los mismos que el backend). */
+function parseRun(value: unknown, label: string, warnings: Message[]): DockerRunOptions | undefined {
+  if (!isRecord(value)) {
+    warnings.push({ key: 'labFile.warn.runInvalid', params: { label } });
+    return undefined;
+  }
+
+  const env: DockerEnvVar[] = [];
+  const keys = new Set<string>();
+  let envFull = false;
+  if (value.env !== undefined) {
+    if (!Array.isArray(value.env)) {
+      warnings.push({ key: 'labFile.warn.envListInvalid', params: { label } });
+    } else {
+      for (const item of value.env) {
+        if (!isRecord(item) || typeof item.key !== 'string' || typeof item.value !== 'string') {
+          warnings.push({ key: 'labFile.warn.envInvalid', params: { label } });
+          continue;
+        }
+        if (!ENV_KEY_RE.test(item.key)) {
+          warnings.push({ key: 'labFile.warn.envKeyInvalid', params: { label, key: item.key } });
+          continue;
+        }
+        if (charLength(item.value) > RUN_LIMITS.valueLength) {
+          warnings.push({
+            key: 'labFile.warn.envValueLong',
+            params: { label, key: item.key, max: RUN_LIMITS.valueLength },
+          });
+          continue;
+        }
+        if (hasControlChars(item.value)) {
+          warnings.push({ key: 'labFile.warn.envValueControl', params: { label, key: item.key } });
+          continue;
+        }
+        if (keys.has(item.key)) {
+          warnings.push({ key: 'labFile.warn.envDup', params: { label, key: item.key } });
+          continue;
+        }
+        if (env.length >= RUN_LIMITS.env) {
+          envFull = true;
+          continue;
+        }
+        keys.add(item.key);
+        env.push({ key: item.key, value: item.value });
+      }
+      if (envFull) {
+        warnings.push({ key: 'labFile.warn.envExtra', params: { label, max: RUN_LIMITS.env } });
+      }
+    }
+  }
+
+  const ports: DockerPortMap[] = [];
+  const published = new Set<string>();
+  let portsFull = false;
+  if (value.ports !== undefined) {
+    if (!Array.isArray(value.ports)) {
+      warnings.push({ key: 'labFile.warn.portListInvalid', params: { label } });
+    } else {
+      for (const item of value.ports) {
+        if (!isRecord(item)) {
+          warnings.push({ key: 'labFile.warn.portInvalid', params: { label } });
+          continue;
+        }
+        if (!validPortNumber(item.host) || !validPortNumber(item.container)) {
+          warnings.push({ key: 'labFile.warn.portRange', params: { label } });
+          continue;
+        }
+        const proto = item.proto;
+        if (proto !== 'tcp' && proto !== 'udp') {
+          warnings.push({ key: 'labFile.warn.portProto', params: { label } });
+          continue;
+        }
+        const key = `${item.host}/${proto}`;
+        if (published.has(key)) {
+          warnings.push({ key: 'labFile.warn.portDup', params: { label, port: item.host, proto } });
+          continue;
+        }
+        if (ports.length >= RUN_LIMITS.ports) {
+          portsFull = true;
+          continue;
+        }
+        published.add(key);
+        ports.push({ host: item.host, container: item.container, proto });
+      }
+      if (portsFull) {
+        warnings.push({ key: 'labFile.warn.portExtra', params: { label, max: RUN_LIMITS.ports } });
+      }
+    }
+  }
+
+  const unknown = Object.keys(value).filter((key) => key !== 'env' && key !== 'ports');
+  if (unknown.length) {
+    warnings.push({ key: 'labFile.warn.runUnknown', params: { label, fields: droppedKeys(unknown) } });
+  }
+
+  if (!env.length && !ports.length) return undefined;
+  return { env, ports };
+}
+
+function parseGuestFields(data: Record<string, unknown>, out: MachineData, label: string, warnings: Message[]): void {
   for (const key of GUEST_STRING_KEYS) {
     const value = data[key];
     if (value === undefined) continue;
     if (typeof value === 'string' && value.length <= 200) {
       if (value) out[key] = value;
     } else {
-      warnings.push(`Nodo «${label}»: «${key}» no es válido; se descarta.`);
+      warnings.push({ key: 'labFile.warn.guestFieldInvalid', params: { label, field: key } });
     }
   }
 
@@ -217,7 +483,7 @@ function parseGuestFields(data: Record<string, unknown>, out: MachineData, label
     if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 32) {
       out.guestPrefix = value;
     } else {
-      warnings.push(`Nodo «${label}»: el prefijo de invitado debe ser un entero entre 0 y 32; se descarta.`);
+      warnings.push({ key: 'labFile.warn.guestPrefix', params: { label } });
     }
   }
 
@@ -226,7 +492,7 @@ function parseGuestFields(data: Record<string, unknown>, out: MachineData, label
     if (typeof value === 'string' && GUEST_SYSTEMS.includes(value as GuestSystem)) {
       out.guestSystem = value as GuestSystem;
     } else {
-      warnings.push(`Nodo «${label}»: el sistema de red del invitado no es válido; se descarta.`);
+      warnings.push({ key: 'labFile.warn.guestSystem', params: { label } });
     }
   }
 
@@ -235,24 +501,24 @@ function parseGuestFields(data: Record<string, unknown>, out: MachineData, label
     if (typeof value === 'string' && GUEST_MODES.includes(value as GuestIpMode)) {
       out.guestMode = value as GuestIpMode;
     } else {
-      warnings.push(`Nodo «${label}»: el modo de IP del invitado no es válido; se descarta.`);
+      warnings.push({ key: 'labFile.warn.guestMode', params: { label } });
     }
   }
 }
 
-function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: string[]): MachineNode | null {
+function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Message[]): MachineNode | null {
   if (!isRecord(raw)) {
-    warnings.push(`Nodo ${index + 1}: no es un objeto; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodeNotObject', params: { index: index + 1 } });
     return null;
   }
 
   const id = raw.id;
   if (typeof id !== 'string' || !ID_RE.test(id)) {
-    warnings.push(`Nodo ${index + 1}: el identificador no es válido; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodeIdInvalid', params: { index: index + 1 } });
     return null;
   }
   if (seen.has(id)) {
-    warnings.push(`Nodo «${id}»: identificador duplicado; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodeIdDup', params: { id } });
     return null;
   }
 
@@ -266,31 +532,36 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: str
     Math.abs(position.x) > COORD_LIMIT ||
     Math.abs(position.y) > COORD_LIMIT
   ) {
-    warnings.push(`Nodo «${id}»: la posición no es válida; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodePosition', params: { id } });
     return null;
   }
 
   const data = raw.data;
   if (!isRecord(data)) {
-    warnings.push(`Nodo «${id}»: no tiene datos válidos; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodeData', params: { id } });
     return null;
   }
 
   const kind = data.kind;
   if (kind !== 'vbox' && kind !== 'docker') {
-    warnings.push(`Nodo «${id}»: el tipo «${kindName(kind)}» no es válido; se descarta.`);
+    const kindLabel = kindName(kind);
+    warnings.push(
+      kindLabel
+        ? { key: 'labFile.warn.nodeKind', params: { id, kind: kindLabel } }
+        : { key: 'labFile.warn.nodeKindUnknown', params: { id } },
+    );
     return null;
   }
 
   const label = data.label;
   if (typeof label !== 'string' || label.length > 100) {
-    warnings.push(`Nodo «${id}»: el nombre no es válido; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodeName', params: { id } });
     return null;
   }
 
   const target = data.target;
   if (typeof target !== 'string' || target.length > 200) {
-    warnings.push(`Nodo «${id}»: el destino no es válido; se descarta.`);
+    warnings.push({ key: 'labFile.warn.nodeTarget', params: { id } });
     return null;
   }
 
@@ -299,7 +570,12 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: str
 
   const unknown = Object.keys(data).filter((key) => !ALL_DATA_KEYS.has(key));
   if (unknown.length) {
-    warnings.push(`Nodo «${display}»: se descartaron campos desconocidos (${droppedKeys(unknown)}).`);
+    warnings.push({ key: 'labFile.warn.nodeUnknown', params: { label: display, fields: droppedKeys(unknown) } });
+  }
+
+  if (data.link !== undefined) {
+    const link = parseLink(data.link, display, warnings);
+    if (link) out.link = link;
   }
 
   if (kind === 'docker') {
@@ -307,31 +583,38 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: str
       if (typeof data.image === 'string' && data.image.length <= 200) {
         if (data.image) out.image = data.image;
       } else {
-        warnings.push(`Nodo «${display}»: la imagen no es válida; se descarta.`);
+        warnings.push({ key: 'labFile.warn.imageInvalid', params: { label: display } });
       }
     }
+    if (data.run !== undefined) {
+      const run = parseRun(data.run, display, warnings);
+      if (run) out.run = run;
+    }
     if (data.net !== undefined) {
-      warnings.push(`Nodo «${display}»: la red de VirtualBox no se aplica a un contenedor; se descarta.`);
+      warnings.push({ key: 'labFile.warn.dockerNet', params: { label: display } });
     }
     if (data.slot === true) {
-      warnings.push(`Nodo «${display}»: un hueco de VM no se aplica a un contenedor; se descarta.`);
+      warnings.push({ key: 'labFile.warn.dockerSlot', params: { label: display } });
     } else if (data.slot !== undefined && data.slot !== false) {
-      warnings.push(`Nodo «${display}»: «slot» no es válido; se descarta.`);
+      warnings.push({ key: 'labFile.warn.slotInvalid', params: { label: display } });
     }
     const guest = [...GUEST_KEYS].filter((key) => data[key] !== undefined);
     if (guest.length) {
-      warnings.push(`Nodo «${display}»: se descartaron campos de invitado no aplicables a un contenedor.`);
+      warnings.push({ key: 'labFile.warn.dockerGuest', params: { label: display } });
     }
   } else {
     if (data.image !== undefined) {
-      warnings.push(`Nodo «${display}»: la imagen no se usa en una máquina VirtualBox; se descarta.`);
+      warnings.push({ key: 'labFile.warn.vboxImage', params: { label: display } });
+    }
+    if (data.run !== undefined) {
+      warnings.push({ key: 'labFile.warn.vboxRun', params: { label: display } });
     }
     if (data.slot === true && !target) {
       out.slot = true;
     } else if (data.slot === true) {
-      warnings.push(`Nodo «${display}»: un hueco de VM no puede tener destino; se descarta la marca de hueco.`);
+      warnings.push({ key: 'labFile.warn.slotTarget', params: { label: display } });
     } else if (data.slot !== undefined && data.slot !== false) {
-      warnings.push(`Nodo «${display}»: «slot» no es válido; se descarta.`);
+      warnings.push({ key: 'labFile.warn.slotInvalid', params: { label: display } });
     }
     if (data.net !== undefined) {
       const net = parseNet(data.net, display, warnings);
@@ -350,37 +633,43 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: str
  * problemas estructurales (JSON roto, formato o versión, límites) son fatales.
  */
 export function parseLab(text: string): ParseLabResult {
-  if (typeof text !== 'string') return { ok: false, error: 'El archivo no contiene texto válido.' };
-  if (text.length > MAX_TEXT) return { ok: false, error: 'El archivo supera el tamaño máximo de 5 MB.' };
+  if (typeof text !== 'string') return { ok: false, error: { key: 'labFile.error.noText' } };
+  if (text.length > MAX_TEXT) return { ok: false, error: { key: 'labFile.error.tooLarge' } };
 
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch {
-    return { ok: false, error: 'El archivo no es un JSON válido.' };
+    return { ok: false, error: { key: 'labFile.error.json' } };
   }
 
-  if (!isRecord(raw)) return { ok: false, error: 'El archivo no contiene un laboratorio válido.' };
-  if (raw.format !== 'vmlab-lab') return { ok: false, error: 'El archivo no es un laboratorio de VMLab.' };
+  if (!isRecord(raw)) return { ok: false, error: { key: 'labFile.error.notLab' } };
+  if (raw.format !== 'vmlab-lab') return { ok: false, error: { key: 'labFile.error.notVmlab' } };
 
   const version = raw.version;
   if (typeof version === 'number' && version > 1) {
-    return { ok: false, error: 'El laboratorio fue creado con una versión más nueva de VMLab.' };
+    return { ok: false, error: { key: 'labFile.error.newerVersion' } };
   }
   if (version !== 1) {
-    return { ok: false, error: 'La versión del archivo no es compatible con esta versión de VMLab.' };
+    return { ok: false, error: { key: 'labFile.error.version' } };
   }
 
-  if (!Array.isArray(raw.nodes)) return { ok: false, error: 'El archivo no contiene una lista de nodos válida.' };
-  if (!Array.isArray(raw.edges)) return { ok: false, error: 'El archivo no contiene una lista de conexiones válida.' };
+  if (!Array.isArray(raw.nodes)) return { ok: false, error: { key: 'labFile.error.nodes' } };
+  if (!Array.isArray(raw.edges)) return { ok: false, error: { key: 'labFile.error.edges' } };
   if (raw.nodes.length > MAX_NODES) {
-    return { ok: false, error: `El laboratorio tiene ${raw.nodes.length} nodos; el máximo es ${MAX_NODES}.` };
+    return {
+      ok: false,
+      error: { key: 'labFile.error.tooManyNodes', params: { count: raw.nodes.length, max: MAX_NODES } },
+    };
   }
   if (raw.edges.length > MAX_EDGES) {
-    return { ok: false, error: `El laboratorio tiene ${raw.edges.length} conexiones; el máximo es ${MAX_EDGES}.` };
+    return {
+      ok: false,
+      error: { key: 'labFile.error.tooManyEdges', params: { count: raw.edges.length, max: MAX_EDGES } },
+    };
   }
 
-  const warnings: string[] = [];
+  const warnings: Message[] = [];
   const nodes: MachineNode[] = [];
   const ids = new Set<string>();
 
@@ -396,21 +685,21 @@ export function parseLab(text: string): ParseLabResult {
 
   raw.edges.forEach((item, index) => {
     if (!isRecord(item) || typeof item.source !== 'string' || typeof item.target !== 'string') {
-      warnings.push(`Conexión ${index + 1}: no es válida; se descarta.`);
+      warnings.push({ key: 'labFile.warn.edgeInvalid', params: { index: index + 1 } });
       return;
     }
     const { source, target } = item;
     if (!ids.has(source) || !ids.has(target)) {
-      warnings.push(`Conexión ${source} → ${target}: hace referencia a un nodo que no existe; se descarta.`);
+      warnings.push({ key: 'labFile.warn.edgeMissing', params: { source, target } });
       return;
     }
     if (source === target) {
-      warnings.push(`Conexión «${source}»: une un nodo consigo mismo; se descarta.`);
+      warnings.push({ key: 'labFile.warn.edgeSelf', params: { source } });
       return;
     }
     const key = source < target ? `${source}|${target}` : `${target}|${source}`;
     if (seen.has(key)) {
-      warnings.push(`Conexión duplicada entre «${source}» y «${target}»; se descarta.`);
+      warnings.push({ key: 'labFile.warn.edgeDup', params: { source, target } });
       return;
     }
     seen.add(key);

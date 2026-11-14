@@ -1,23 +1,41 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import {
+  formatMessage,
+  resolveLang,
+  technicalText,
+  useT,
+  type Lang,
+  type Locale,
+  type Message,
+  type Translate,
+} from '../i18n';
+import { composeToLab, type ComposeLab } from '../lib/compose';
+import { ipc } from '../lib/ipc';
 import { TEMPLATES, type LabTemplate } from '../lib/templates';
+import { checkUpdatesOnStartup, setCheckUpdatesOnStartup } from '../lib/updates';
 import { useLab, type LabMode } from '../store/useLab';
 import type { LabSnapInfo } from '../types';
+import { AboutDialog } from './AboutDialog';
 
 type Pending =
   | { kind: 'file'; text: string; name: string }
   | { kind: 'template'; template: LabTemplate };
 
+type ComposePending = { name: string; lab: ComposeLab; warnings: Message[] };
+
 type SnapConfirm = { kind: 'restore' | 'delete'; snap: LabSnapInfo };
 
 const TWO_DIGITS = (n: number) => String(n).padStart(2, '0');
 
+const errText = (e: unknown) => (typeof e === 'string' ? e : e instanceof Error ? e.message : JSON.stringify(e));
+
 /** Fecha legible para ISO de VirtualBox y para el formato de `docker images`. */
-function snapDate(value: string | null): string {
-  if (!value) return 'fecha desconocida';
+function snapDate(value: string | null, t: Translate, locale: Locale): string {
+  if (!value) return t('snaps.dateUnknown');
   const normalized = value.replace(' ', 'T').replace(' +0000 UTC', 'Z');
   const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return value;
-  return `${date.toLocaleDateString('es-ES')} ${TWO_DIGITS(date.getHours())}:${TWO_DIGITS(date.getMinutes())}`;
+  return `${date.toLocaleDateString(locale === 'es' ? 'es-ES' : 'en-US')} ${TWO_DIGITS(date.getHours())}:${TWO_DIGITS(date.getMinutes())}`;
 }
 
 /**
@@ -27,11 +45,18 @@ function snapDate(value: string | null): string {
  * cierra al hacer clic fuera o al pulsar Escape.
  */
 export function LabMenu() {
+  const t = useT();
+  const lang = useLab((s) => s.lang);
+  const setLang = useLab((s) => s.setLang);
+  const locale = resolveLang(lang);
   const exportLab = useLab((s) => s.exportLab);
   const importLab = useLab((s) => s.importLab);
   const applyTemplate = useLab((s) => s.applyTemplate);
   const toast = useLab((s) => s.toast);
   const nodeCount = useLab((s) => s.nodes.length);
+  const hasEnvVars = useLab((s) =>
+    s.nodes.some((n) => n.data.kind === 'docker' && (n.data.run?.env.length ?? 0) > 0),
+  );
   const labsnaps = useLab((s) => s.labsnaps);
   const labsnapBusy = useLab((s) => s.labsnapBusy);
   const refreshLabsnaps = useLab((s) => s.refreshLabsnaps);
@@ -43,12 +68,18 @@ export function LabMenu() {
 
   const rootRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const composeRef = useRef<HTMLInputElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [templatesOpen, setTemplatesOpen] = useState(false);
   const [snapsOpen, setSnapsOpen] = useState(false);
   const [snapLabel, setSnapLabel] = useState('');
   const [snapConfirm, setSnapConfirm] = useState<SnapConfirm | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [composePending, setComposePending] = useState<ComposePending | null>(null);
+  const [composeBusy, setComposeBusy] = useState(false);
+  const [exportWarn, setExportWarn] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [checkUpdates, setCheckUpdates] = useState(checkUpdatesOnStartup);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -60,12 +91,14 @@ export function LabMenu() {
   }, [menuOpen]);
 
   useEffect(() => {
-    if (!menuOpen && !templatesOpen && !snapsOpen && !snapConfirm && !pending) return;
+    if (!menuOpen && !templatesOpen && !snapsOpen && !snapConfirm && !pending && !composePending && !exportWarn) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       setMenuOpen(false);
       setTemplatesOpen(false);
       setPending(null);
+      setComposePending(null);
+      setExportWarn(false);
       if (!labsnapBusy) {
         setSnapsOpen(false);
         setSnapConfirm(null);
@@ -73,7 +106,7 @@ export function LabMenu() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [menuOpen, templatesOpen, snapsOpen, snapConfirm, pending, labsnapBusy]);
+  }, [menuOpen, templatesOpen, snapsOpen, snapConfirm, pending, composePending, exportWarn, labsnapBusy]);
 
   async function onFile(event: ChangeEvent<HTMLInputElement>) {
     const input = event.currentTarget;
@@ -85,7 +118,29 @@ export function LabMenu() {
       if (nodeCount > 0) setPending({ kind: 'file', text, name: file.name });
       else await importLab(text, 'replace');
     } catch {
-      toast('error', 'No se pudo leer el archivo.');
+      toast('error', t('sidebar.fileReadError'));
+    }
+  }
+
+  async function onComposeFile(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    setComposeBusy(true);
+    try {
+      const text = await file.text();
+      const json = await ipc.composeConfig(text);
+      const result = composeToLab(json);
+      if ('error' in result) {
+        toast('error', formatMessage(result.error));
+        return;
+      }
+      setComposePending({ name: file.name, lab: result.lab, warnings: result.warnings });
+    } catch (e) {
+      toast('error', technicalText(errText(e)));
+    } finally {
+      setComposeBusy(false);
     }
   }
 
@@ -101,6 +156,19 @@ export function LabMenu() {
     if (!action) return;
     if (action.kind === 'file') void importLab(action.text, mode);
     else applyTemplate(action.template, mode);
+  }
+
+  function runCompose(mode: LabMode) {
+    const action = composePending;
+    setComposePending(null);
+    if (!action || action.lab.nodes.length === 0) return;
+    void importLab(JSON.stringify(action.lab), mode);
+  }
+
+  function exportNow() {
+    setMenuOpen(false);
+    if (hasEnvVars) setExportWarn(true);
+    else exportLab();
   }
 
   function openSnaps() {
@@ -131,29 +199,66 @@ export function LabMenu() {
         onClick={() => setMenuOpen((open) => !open)}
         aria-haspopup="menu"
         aria-expanded={menuOpen}
-        title="Plantillas, importar y exportar laboratorios"
+        title={t('lab.menuHint')}
       >
-        Laboratorio <span className="lab-caret" aria-hidden="true">▾</span>
+        {t('lab.title')} <span className="lab-caret" aria-hidden="true">▾</span>
       </button>
 
       {menuOpen && (
         <div className="lab-dropdown" role="menu">
           <button role="menuitem" onClick={() => { setMenuOpen(false); setTemplatesOpen(true); }}>
-            Plantillas…
+            {t('lab.templates')}
           </button>
           <button role="menuitem" onClick={openSnaps}>
-            Instantáneas…
+            {t('lab.snapshots')}
           </button>
           <button role="menuitem" onClick={() => { setMenuOpen(false); fileRef.current?.click(); }}>
-            Importar lab…
+            {t('lab.import')}
           </button>
-          <button role="menuitem" disabled={!hasNodes} onClick={() => { setMenuOpen(false); exportLab(); }}>
-            Exportar lab…
+          <button
+            role="menuitem"
+            disabled={composeBusy}
+            onClick={() => { setMenuOpen(false); composeRef.current?.click(); }}
+          >
+            {composeBusy ? t('lab.importComposeBusy') : t('lab.importCompose')}
           </button>
+          <button role="menuitem" disabled={!hasNodes} onClick={exportNow}>
+            {t('lab.export')}
+          </button>
+          <div className="lab-lang">
+            <label htmlFor="lab-lang-select">{t('lab.lang')}</label>
+            <select
+              id="lab-lang-select"
+              value={lang}
+              onChange={(event) => setLang(event.currentTarget.value as Lang)}
+            >
+              <option value="auto">{t('lab.langAuto')}</option>
+              <option value="es">Español</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+          <label className="lab-check">
+            <input
+              type="checkbox"
+              checked={checkUpdates}
+              onChange={(event) => {
+                const enabled = event.currentTarget.checked;
+                setCheckUpdates(enabled);
+                setCheckUpdatesOnStartup(enabled);
+              }}
+            />
+            {t('lab.checkUpdates')}
+          </label>
+          <div className="lab-about">
+            <button role="menuitem" onClick={() => { setMenuOpen(false); setAboutOpen(true); }}>
+              {t('lab.about')}
+            </button>
+          </div>
         </div>
       )}
 
       <input ref={fileRef} type="file" accept=".vmlab,.json" hidden onChange={onFile} />
+      <input ref={composeRef} type="file" accept=".yml,.yaml" hidden onChange={onComposeFile} />
 
       {templatesOpen && (
         <div
@@ -161,8 +266,8 @@ export function LabMenu() {
           onMouseDown={(event) => { if (event.target === event.currentTarget) setTemplatesOpen(false); }}
         >
           <div className="modal wide" role="dialog" aria-modal="true" aria-labelledby="templates-title">
-            <h3 id="templates-title">Plantillas de laboratorio</h3>
-            <p className="hint">Elige una plantilla para crear el lienzo. Los huecos de VM se asignan después desde el panel derecho.</p>
+            <h3 id="templates-title">{t('templates.title')}</h3>
+            <p className="hint">{t('templates.hint')}</p>
             <div className="template-grid">
               {TEMPLATES.map((template) => {
                 const slots = template.nodes.filter((node) => node.data.slot === true).length;
@@ -171,14 +276,15 @@ export function LabMenu() {
                     <span className="template-name">{template.name}</span>
                     <span className="template-desc">{template.description}</span>
                     <span className="template-meta">
-                      {template.nodes.length} nodo(s) · {slots ? `${slots} hueco(s) de VM` : 'sin huecos de VM'}
+                      {t('templates.count', { count: template.nodes.length })} ·{' '}
+                      {slots ? t('templates.slots', { count: slots }) : t('templates.noSlots')}
                     </span>
                   </button>
                 );
               })}
             </div>
             <div className="modal-actions">
-              <button className="btn" onClick={() => setTemplatesOpen(false)}>Cancelar</button>
+              <button className="btn" onClick={() => setTemplatesOpen(false)}>{t('common.cancel')}</button>
             </div>
           </div>
         </div>
@@ -192,19 +298,19 @@ export function LabMenu() {
           }}
         >
           <div className="modal wide" role="dialog" aria-modal="true" aria-labelledby="snaps-title">
-            <h3 id="snaps-title">Instantáneas del laboratorio</h3>
+            <h3 id="snaps-title">{t('snaps.title')}</h3>
             <p className="hint">
-              Guarda el estado de todas las máquinas del lienzo bajo un nombre y vuelve a él cuando quieras.
+              {t('snaps.hint')}
             </p>
 
             <div className="labsnap-form">
-              <label className="field">Nombre
+              <label className="field">{t('snaps.name')}
                 <input
                   value={snapLabel}
                   maxLength={40}
                   disabled={labsnapBusy}
                   onChange={(event) => setSnapLabel(event.currentTarget.value)}
-                  placeholder="p. ej. Antes de instalar el servidor"
+                  placeholder={t('snaps.placeholder')}
                 />
               </label>
               <button
@@ -212,15 +318,15 @@ export function LabMenu() {
                 disabled={labsnapBusy || !snapLabel.trim() || !hasAssigned}
                 onClick={() => void saveSnap()}
               >
-                {labsnapBusy ? 'Trabajando…' : 'Guardar estado del lab'}
+                {labsnapBusy ? t('snaps.working') : t('snaps.save')}
               </button>
             </div>
-            {!hasAssigned && <p className="hint warn">Asigna al menos una VM o contenedor antes de guardar.</p>}
-            {labsnapBusy && <p className="hint warn">Trabajando… puede tardar minutos.</p>}
+            {!hasAssigned && <p className="hint warn">{t('snaps.needAssigned')}</p>}
+            {labsnapBusy && <p className="hint warn">{t('snaps.busy')}</p>}
 
             <div className="labsnap-list">
               {labsnaps.length === 0 ? (
-                <p className="hint">Todavía no hay instantáneas guardadas.</p>
+                <p className="hint">{t('snaps.empty')}</p>
               ) : (
                 labsnaps.map((snap) => {
                   const total = snap.present.length + snap.missing.length;
@@ -229,10 +335,10 @@ export function LabMenu() {
                       <div className="labsnap-main">
                         <div className="labsnap-name">{snap.label}</div>
                         <div className="labsnap-meta">
-                          {snapDate(snap.createdAt)} · {snap.present.length}/{total} máquina(s)
+                          {snapDate(snap.createdAt, t, locale)} · {t('snaps.machineCount', { present: snap.present.length, total, count: total })}
                         </div>
                         {snap.missing.length > 0 && (
-                          <div className="labsnap-missing">Faltan: {snap.missing.join(', ')}</div>
+                          <div className="labsnap-missing">{t('snaps.missing', { names: snap.missing.join(', ') })}</div>
                         )}
                       </div>
                       <div className="labsnap-actions">
@@ -241,14 +347,14 @@ export function LabMenu() {
                           disabled={labsnapBusy || snap.present.length === 0}
                           onClick={() => setSnapConfirm({ kind: 'restore', snap })}
                         >
-                          Restaurar
+                          {t('common.restore')}
                         </button>
                         <button
                           className="btn danger"
                           disabled={labsnapBusy}
                           onClick={() => setSnapConfirm({ kind: 'delete', snap })}
                         >
-                          Eliminar
+                          {t('common.delete')}
                         </button>
                       </div>
                     </div>
@@ -258,16 +364,16 @@ export function LabMenu() {
             </div>
 
             <div className="labsnap-help">
-              <p className="hint"><b>Ten en cuenta</b></p>
+              <p className="hint"><b>{t('snaps.note')}</b></p>
               <ul className="hint">
-                <li>Para restaurar una VM de VirtualBox, apágala antes.</li>
-                <li>En Docker se conserva el contenedor original renombrado. Los volúmenes y los puertos no se guardan.</li>
-                <li>El lienzo no se guarda en la instantánea: usa «Exportar lab».</li>
+                <li>{t('snaps.noteVbox')}</li>
+                <li>{t('snaps.noteDocker')}</li>
+                <li>{t('snaps.noteCanvas')}</li>
               </ul>
             </div>
 
             <div className="modal-actions">
-              <button className="btn" disabled={labsnapBusy} onClick={() => setSnapsOpen(false)}>Cerrar</button>
+              <button className="btn" disabled={labsnapBusy} onClick={() => setSnapsOpen(false)}>{t('common.close')}</button>
             </div>
           </div>
         </div>
@@ -282,12 +388,12 @@ export function LabMenu() {
         >
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="snap-confirm-title">
             <h3 id="snap-confirm-title">
-              {snapConfirm.kind === 'restore' ? 'Restaurar instantánea' : 'Eliminar instantánea'}
+              {snapConfirm.kind === 'restore' ? t('snaps.confirmRestoreTitle') : t('snaps.confirmDeleteTitle')}
             </h3>
             <p className="hint">
               {snapConfirm.kind === 'restore'
-                ? `Se restaurará «${snapConfirm.snap.label}» en ${snapConfirm.snap.present.length} máquina(s). Las VM encendidas no se tocarán.`
-                : `Se borrará «${snapConfirm.snap.label}» de ${snapConfirm.snap.present.length} máquina(s). Esta acción no se puede deshacer.`}
+                ? t('snaps.confirmRestore', { label: snapConfirm.snap.label, count: snapConfirm.snap.present.length })
+                : t('snaps.confirmDelete', { label: snapConfirm.snap.label, count: snapConfirm.snap.present.length })}
             </p>
             <div className="modal-actions">
               <button
@@ -295,9 +401,78 @@ export function LabMenu() {
                 disabled={labsnapBusy}
                 onClick={() => void confirmSnap()}
               >
-                {snapConfirm.kind === 'restore' ? 'Restaurar' : 'Eliminar'}
+                {snapConfirm.kind === 'restore' ? t('common.restore') : t('common.delete')}
               </button>
-              <button className="btn" disabled={labsnapBusy} onClick={() => setSnapConfirm(null)}>Cancelar</button>
+              <button className="btn" disabled={labsnapBusy} onClick={() => setSnapConfirm(null)}>{t('common.cancel')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {composePending && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => { if (event.target === event.currentTarget) setComposePending(null); }}
+        >
+          <div className="modal wide" role="dialog" aria-modal="true" aria-labelledby="compose-title">
+            <h3 id="compose-title">{t('compose.title')}</h3>
+            <p className="hint">
+              {composePending.lab.nodes.length === 0
+                ? t('compose.none', { name: composePending.name })
+                : t('compose.imported', { count: composePending.lab.nodes.length, name: composePending.name })}
+            </p>
+            {composePending.warnings.length > 0 && (
+              <>
+                <p className="hint warn">
+                  {t('compose.warnings', { count: composePending.warnings.length })}
+                </p>
+                <ul className="compose-warnings">
+                  {composePending.warnings.map((warning, index) => (
+                    <li key={index}>{formatMessage(warning, t)}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+            <div className="modal-actions">
+              <button
+                className="btn primary"
+                disabled={composePending.lab.nodes.length === 0}
+                onClick={() => runCompose('replace')}
+              >
+                {t('common.replace')}
+              </button>
+              <button
+                className="btn"
+                disabled={composePending.lab.nodes.length === 0}
+                onClick={() => runCompose('append')}
+              >
+                {t('common.append')}
+              </button>
+              <button className="btn" onClick={() => setComposePending(null)}>{t('common.cancel')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {exportWarn && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => { if (event.target === event.currentTarget) setExportWarn(false); }}
+        >
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="export-warn-title">
+            <h3 id="export-warn-title">{t('export.title')}</h3>
+            <p className="hint">{t('export.warn')}</p>
+            <div className="modal-actions">
+              <button
+                className="btn primary"
+                onClick={() => {
+                  setExportWarn(false);
+                  exportLab();
+                }}
+              >
+                {t('export.anyway')}
+              </button>
+              <button className="btn" onClick={() => setExportWarn(false)}>{t('common.cancel')}</button>
             </div>
           </div>
         </div>
@@ -309,19 +484,22 @@ export function LabMenu() {
           onMouseDown={(event) => { if (event.target === event.currentTarget) setPending(null); }}
         >
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="lab-mode-title">
-            <h3 id="lab-mode-title">{pending.kind === 'file' ? 'Importar laboratorio' : 'Añadir plantilla'}</h3>
+            <h3 id="lab-mode-title">{pending.kind === 'file' ? t('import.title') : t('import.addTemplate')}</h3>
             <p className="hint">
-              El lienzo ya tiene {nodeCount} nodo(s). ¿Quieres reemplazarlo o añadir{' '}
-              {pending.kind === 'file' ? `el contenido de «${pending.name}»` : `la plantilla «${pending.template.name}»`}?
+              {pending.kind === 'file'
+                ? t('import.conflictFile', { count: nodeCount, name: pending.name })
+                : t('import.conflictTemplate', { count: nodeCount, name: pending.template.name })}
             </p>
             <div className="modal-actions">
-              <button className="btn primary" onClick={() => runPending('replace')}>Reemplazar</button>
-              <button className="btn" onClick={() => runPending('append')}>Añadir</button>
-              <button className="btn" onClick={() => setPending(null)}>Cancelar</button>
+              <button className="btn primary" onClick={() => runPending('replace')}>{t('common.replace')}</button>
+              <button className="btn" onClick={() => runPending('append')}>{t('common.append')}</button>
+              <button className="btn" onClick={() => setPending(null)}>{t('common.cancel')}</button>
             </div>
           </div>
         </div>
       )}
+
+      {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
     </div>
   );
 }

@@ -12,6 +12,7 @@ import {
 } from '@xyflow/react';
 import { linkLive } from '../lib/connectivity';
 import { resolveState } from '../lib/status';
+import { useT } from '../i18n';
 import { useLab } from '../store/useLab';
 import type { MachineNode, PaletteItem } from '../types';
 import { LockIcon } from './icons';
@@ -39,6 +40,7 @@ function overSidebar(e: MouseEvent | TouchEvent): boolean {
 }
 
 function Flow() {
+  const t = useT();
   const nodes = useLab((s) => s.nodes);
   const edges = useLab((s) => s.edges);
   const snapshot = useLab((s) => s.snapshot);
@@ -126,9 +128,9 @@ function Flow() {
       setOverSidebar(false);
       if (!dropped) return;
       removeNode(node.id);
-      toast('info', `«${node.data.label}» devuelta al panel`);
+      toast('info', t('canvas.returnedToPanel', { label: node.data.label }));
     },
-    [removeNode, setOverSidebar, toast],
+    [removeNode, setOverSidebar, toast, t],
   );
 
   return (
@@ -164,13 +166,15 @@ function Flow() {
       </ReactFlow>
       {canvasLocked && (
         <div className="canvas-lock-badge" role="status">
-          <LockIcon /> Lienzo bloqueado
+          <LockIcon /> {t('canvas.locked')}
         </div>
       )}
       {nodes.length === 0 && (
         <div className="empty">
-          <h2>Tu laboratorio está vacío</h2>
-          <p>Arrastra máquinas desde el panel izquierdo (o haz doble clic en ellas), conéctalas tirando de sus bordes y pulsa <b>Aplicar red</b>.</p>
+          <h2>{t('canvas.emptyTitle')}</h2>
+          <p>
+            {t('canvas.emptyBodyBefore')} <b>{t('titlebar.apply')}</b>{t('canvas.emptyBodyAfter')}
+          </p>
         </div>
       )}
     </div>

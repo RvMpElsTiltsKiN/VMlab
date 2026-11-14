@@ -17,6 +17,64 @@ export interface NodeNet {
   bridge?: string;
 }
 
+/** Condiciones de red que se aplican al tráfico saliente de un nodo. */
+export interface LinkConditions {
+  /** Retardo en milisegundos (0..10000). */
+  delayMs: number;
+  /** Variación del retardo (0..10000 y nunca mayor que `delayMs`). */
+  jitterMs: number;
+  /** Pérdida en décimas de porcentaje: 15 = 1,5 % (0..1000). */
+  lossTenths: number;
+  /** Límite de velocidad en kbit/s (8..1000000). Sin valor = sin límite. */
+  rateKbit?: number;
+}
+
+/** Resultado de aplicar o quitar las condiciones de red de un nodo. */
+export interface LinkReport {
+  warnings: string[];
+}
+
+export type DockerPortProto = 'tcp' | 'udp';
+
+/** Variable de entorno con la que se crea un contenedor Docker. */
+export interface DockerEnvVar {
+  key: string;
+  value: string;
+}
+
+/** Puerto publicado por un contenedor. Siempre se enlaza a 127.0.0.1. */
+export interface DockerPortMap {
+  host: number;
+  container: number;
+  proto: DockerPortProto;
+}
+
+/** Opciones que solo se usan al crear el contenedor (nunca al arrancarlo). */
+export interface DockerRunOptions {
+  env: DockerEnvVar[];
+  ports: DockerPortMap[];
+}
+
+/**
+ * Filtro de captura de paquetes. Coincide con `CaptureFilter` del núcleo Rust:
+ * las variantes sin datos viajan como cadena y el puerto como `{ port }`.
+ */
+export type CaptureFilter = 'all' | 'icmp' | 'tcp' | 'udp' | 'arp' | { port: number };
+
+/** Captura de paquetes gestionada por el backend. La ruta del fichero nunca sale del backend. */
+export interface CaptureInfo {
+  id: string;
+  kind: MachineKind;
+  target: string;
+  fileName: string;
+  /** Fecha ISO UTC en la que empezó la captura. */
+  startedAt: string;
+  running: boolean;
+  sizeBytes: number;
+  /** Avisos no fatales (filtro ignorado en VirtualBox, imagen por descargar…). */
+  warning?: string;
+}
+
 /** Datos que guarda cada nodo del lienzo. */
 export interface MachineData extends Record<string, unknown> {
   kind: MachineKind;
@@ -25,8 +83,12 @@ export interface MachineData extends Record<string, unknown> {
   target: string;
   /** Solo Docker: imagen con la que crear el contenedor si no existe. */
   image?: string;
+  /** Solo Docker: variables y puertos que se aplican al crear el contenedor. */
+  run?: DockerRunOptions;
   /** Solo VirtualBox: modo de red elegido en el panel derecho. */
   net?: NodeNet;
+  /** Condiciones de red opcionales del nodo. */
+  link?: LinkConditions;
   /** Hueco de VM de una plantilla: todavía no tiene una máquina asignada. */
   slot?: boolean;
   /** Solo VirtualBox/Linux: usuario para Guest Additions (la contraseña nunca se guarda). */
@@ -106,8 +168,21 @@ export interface Snapshot {
   dockerOk: boolean;
 }
 
+/** Nodo de la topología que se envía a `apply_topology` (camelCase, ver model.rs). */
+export interface NodeSpec {
+  id: string;
+  kind: MachineKind;
+  target: string;
+  image?: string;
+  label?: string;
+  net?: NodeNet;
+  link?: LinkConditions;
+  /** Solo Docker: opciones con las que crear el contenedor si no existe. */
+  options?: DockerRunOptions;
+}
+
 export interface TopologyPayload {
-  nodes: { id: string; kind: MachineKind; target: string; image?: string; label?: string; net?: NodeNet }[];
+  nodes: NodeSpec[];
   edges: { from: string; to: string }[];
 }
 
@@ -228,6 +303,19 @@ export interface GuestReport {
   files: string[];
   messages: string[];
   warnings: string[];
+}
+
+/** Entrada del bloque gestionado de `/etc/hosts`. */
+export interface GuestHostEntry {
+  name: string;
+  ipv4: string;
+}
+
+export interface GuestHostsRequest {
+  target: string;
+  username: string;
+  password: string;
+  entries: GuestHostEntry[];
 }
 
 /** Elemento arrastrable de la paleta. */

@@ -40,6 +40,32 @@ export function computeGroups(nodes: MachineNode[], edges: Edge[]) {
   return { groups, nodeGroup };
 }
 
+/** Convierte el nombre visible de un nodo en una etiqueta válida para `/etc/hosts`. */
+export function hostSlug(label: string): string {
+  const base = label
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/g, '');
+  return base || 'vm';
+}
+
+/** Añade `-2`, `-3`… si el nombre ya está ocupado, respetando el límite de 63. */
+export function uniqueHostSlug(label: string, used: Set<string>): string {
+  const base = hostSlug(label);
+  let candidate = base;
+  for (let n = 2; used.has(candidate); n++) {
+    const suffix = `-${n}`;
+    candidate = `${base.slice(0, 63 - suffix.length).replace(/-+$/g, '')}${suffix}`;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
 export function toPayload(nodes: MachineNode[], edges: Edge[]): TopologyPayload {
   return {
     nodes: nodes.map((n) => ({
@@ -49,6 +75,8 @@ export function toPayload(nodes: MachineNode[], edges: Edge[]): TopologyPayload 
       image: n.data.image || undefined,
       label: n.data.label,
       net: n.data.kind === 'vbox' ? n.data.net : undefined,
+      link: n.data.link,
+      options: n.data.kind === 'docker' ? n.data.run : undefined,
     })),
     edges: edges.map((e) => ({ from: e.source, to: e.target })),
   };

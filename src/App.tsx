@@ -3,6 +3,7 @@ import { Canvas } from './components/Canvas';
 import { Inspector } from './components/Inspector';
 import { Sidebar } from './components/Sidebar';
 import { TitleBar } from './components/TitleBar';
+import { UpdateBanner } from './components/UpdateBanner';
 import { useLab } from './store/useLab';
 
 function Toasts() {
@@ -30,6 +31,7 @@ export default function App() {
         <Inspector />
       </main>
       <Toasts />
+      <UpdateBanner />
     </div>
   );
 }

@@ -31,6 +31,11 @@ const COPY: Duration = Duration::from_secs(60);
 const GUEST: Duration = Duration::from_secs(180);
 const BLOCK_START: &str = "# >>> vmlab";
 const BLOCK_END: &str = "# <<< vmlab";
+const HOSTS_START: &str = "# >>> vmlab-hosts";
+const HOSTS_END: &str = "# <<< vmlab-hosts";
+
+/// Preámbulo común: si no se ejecuta como root, se reintenta con `sudo -n`.
+const ROOT_SUDO: &str = "if [ \"$(id -u)\" -ne 0 ]; then\n  if command -v sudo >/dev/null 2>&1; then\n    exec sudo -n /bin/sh \"$0\" \"$@\"\n  fi\n  echo 'VMLAB_ERROR:se necesita root y sudo no está instalado. Usa un usuario root o instala sudo.' >&2\n  exit 2\nfi\n";
 
 fn now_nanos() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
@@ -1012,9 +1017,7 @@ fn reload_nm(iface: &str) -> String {
 
 fn build_script(system: GuestSystem, p: &Params) -> Result<String> {
     let mut s = String::from("#!/bin/sh\nset -u\n");
-    s.push_str(
-        "if [ \"$(id -u)\" -ne 0 ]; then\n  if command -v sudo >/dev/null 2>&1; then\n    exec sudo -n /bin/sh \"$0\" \"$@\"\n  fi\n  echo 'VMLAB_ERROR:se necesita root y sudo no está instalado. Usa un usuario root o instala sudo.' >&2\n  exit 2\nfi\n",
-    );
+    s.push_str(ROOT_SUDO);
 
     match system {
         GuestSystem::Netplan => {
@@ -1100,6 +1103,73 @@ fn build_script(system: GuestSystem, p: &Params) -> Result<String> {
 
     s.push_str("echo 'VMLAB_OK'\n");
     Ok(s)
+}
+
+// ───────────────────────── Nombres de la red (/etc/hosts) ─────────────────────────
+
+/// Bloque gestionado de `/etc/hosts`. Una lista vacía produce un bloque vacío:
+/// el script borra el anterior y deja intacto el resto del fichero.
+fn hosts_block(entries: &[(String, Ipv4Addr)]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    let _ = writeln!(s, "{HOSTS_START}");
+    for (name, addr) in entries {
+        let _ = writeln!(s, "{addr} {name}");
+    }
+    let _ = writeln!(s, "{HOSTS_END}");
+    s
+}
+
+/// Script que sustituye solo el bloque `vmlab-hosts`. El awk es el mismo que usan
+/// los demás bloques gestionados, pero limitado a estos marcadores para no tocar
+/// los de `dhcpcd.conf`, `interfaces` o `dhcpd.conf`. Escribe en un temporal y lo
+/// mueve sobre `/etc/hosts`, conservando el modo del original.
+fn build_hosts_script(entries: &[(String, Ipv4Addr)]) -> String {
+    let mut s = String::from("#!/bin/sh\nset -u\n");
+    s.push_str(ROOT_SUDO);
+    s.push_str(
+        "f='/etc/hosts'\n[ -f \"$f\" ] || : > \"$f\"\ntmp=\"$f.vmlab.tmp\"\n\
+         awk 'BEGIN{{skip=0}} /^# >>> vmlab-hosts$/ {{skip=1; next}} /^# <<< vmlab-hosts$/ {{skip=0; next}} !skip' \"$f\" > \"$tmp\"\n",
+    );
+    let block = hosts_block(entries);
+    if !block.is_empty() {
+        s.push_str(&format!("cat >> \"$tmp\" <<'VMLAB_EOF'\n{block}VMLAB_EOF\n"));
+    }
+    s.push_str("chmod --reference=\"$f\" \"$tmp\" 2>/dev/null || chmod 644 \"$tmp\"\n");
+    s.push_str("mv \"$tmp\" \"$f\"\n");
+    s.push_str("echo 'VMLAB_FILE:/etc/hosts'\n");
+    let msg = if entries.is_empty() {
+        "VMLAB_MSG:/etc/hosts: bloque vmlab-hosts eliminado".to_string()
+    } else {
+        format!("VMLAB_MSG:/etc/hosts: {} nombre(s) escrito(s)", entries.len())
+    };
+    let _ = writeln!(s, "echo {}", q(&msg));
+    s.push_str("echo 'VMLAB_OK'\n");
+    s
+}
+
+/// Valida todas las entradas antes de que sus valores entren en el script.
+fn validated_hosts(entries: &[GuestHostEntry]) -> Result<Vec<(String, Ipv4Addr)>> {
+    if entries.len() > 64 {
+        return Err(CoreError::Invalid(
+            "no se pueden escribir más de 64 nombres en /etc/hosts".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let name = validate::hostname_label(&e.name)?;
+        let addr = validate::hosts_ipv4(&e.ipv4)?;
+        if !seen.insert(name.to_string()) {
+            return Err(CoreError::Invalid(format!(
+                "nombre de host duplicado en /etc/hosts: «{name}»"
+            )));
+        }
+        out.push((name.to_string(), addr));
+    }
+    Ok(out)
 }
 
 // ───────────────────────── Aplicación ─────────────────────────
@@ -1218,6 +1288,47 @@ pub async fn apply(tools: &Tools, req: GuestConfigRequest) -> Result<GuestReport
     }
 
     Ok(GuestReport { system, files, messages, warnings })
+}
+
+/// Escribe (o borra, si la lista está vacía) el bloque gestionado de `/etc/hosts`.
+pub async fn apply_hosts(tools: &Tools, req: GuestHostsRequest) -> Result<GuestReport> {
+    validate::vbox_target(&req.target)?;
+    let entries = validated_hosts(&req.entries)?;
+    let auth = Auth::new(&req.username, &req.password)?;
+    let script = build_hosts_script(&entries);
+    let out = run_script(tools, &req.target, &auth, &script).await?;
+
+    let (files, messages, mut warnings) = parse_markers(&out.stdout);
+    if out.code != 0 || !out.stdout.contains("VMLAB_OK") {
+        let detail = out
+            .stdout
+            .lines()
+            .chain(out.stderr.lines())
+            .find(|l| l.contains("VMLAB_ERROR"))
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| {
+                if out.stderr.trim().is_empty() {
+                    out.stdout.trim().chars().take(400).collect()
+                } else {
+                    out.stderr.trim().chars().take(400).collect()
+                }
+            });
+        return Err(CoreError::Failed {
+            program: "VBoxManage".into(),
+            code: out.code,
+            stderr: detail,
+        });
+    }
+
+    for w in out.stdout.lines().filter_map(|l| l.strip_prefix("VMLAB_WARN:")) {
+        let w = w.trim();
+        if !w.is_empty() && !warnings.iter().any(|x| x == w) {
+            warnings.push(w.to_string());
+        }
+    }
+
+    Ok(GuestReport { system: GuestSystem::Auto, files, messages, warnings })
 }
 
 #[cfg(test)]
@@ -1387,5 +1498,76 @@ mod tests {
         let a = pseudo_uuid("vmlab-eth0");
         assert_eq!(a, pseudo_uuid("vmlab-eth0"));
         assert_eq!(a.len(), 36);
+    }
+
+    fn host_entries() -> Vec<(String, Ipv4Addr)> {
+        vec![
+            ("web".to_string(), Ipv4Addr::new(10, 77, 9, 11)),
+            ("db-2".to_string(), Ipv4Addr::new(10, 77, 9, 12)),
+        ]
+    }
+
+    #[test]
+    fn renders_hosts_block_and_script() {
+        let entries = host_entries();
+        let block = hosts_block(&entries);
+        assert!(block.starts_with("# >>> vmlab-hosts\n"));
+        assert!(block.contains("10.77.9.11 web\n"));
+        assert!(block.contains("10.77.9.12 db-2\n"));
+        assert!(block.ends_with("# <<< vmlab-hosts\n"));
+
+        let script = build_hosts_script(&entries);
+        assert!(script.contains("/^# >>> vmlab-hosts$/"));
+        assert!(script.contains("/^# <<< vmlab-hosts$/"));
+        assert!(script.contains("VMLAB_EOF"));
+        assert!(script.contains("mv \"$tmp\" \"$f\""));
+        assert!(script.contains("VMLAB_FILE:/etc/hosts"));
+        assert!(script.contains("echo 'VMLAB_OK'"));
+    }
+
+    #[test]
+    fn empty_hosts_list_removes_only_its_block() {
+        let block = hosts_block(&[]);
+        assert!(block.is_empty());
+        let script = build_hosts_script(&[]);
+        assert!(script.contains("/^# >>> vmlab-hosts$/"));
+        assert!(!script.contains("VMLAB_EOF"));
+        assert!(script.contains("mv \"$tmp\" \"$f\""));
+        assert!(script.contains("bloque vmlab-hosts eliminado"));
+        // El awk de hosts no borra los bloques generales de otros ficheros.
+        assert!(!script.contains("(vmlab|lablab)"));
+    }
+
+    #[test]
+    fn validates_hosts_entries_before_building_the_script() {
+        let ok = validated_hosts(&[GuestHostEntry {
+            name: "web".into(),
+            ipv4: "10.77.9.11".into(),
+        }])
+        .unwrap();
+        assert_eq!(ok, vec![("web".to_string(), Ipv4Addr::new(10, 77, 9, 11))]);
+
+        for name in ["web;id", "web name", "WEB", "-web", "web-", "ñandu"] {
+            let entries = [GuestHostEntry { name: name.into(), ipv4: "10.77.9.11".into() }];
+            assert!(validated_hosts(&entries).is_err(), "{name}");
+        }
+        for ipv4 in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "127.0.0.1", "10.77.9.999"] {
+            let entries = [GuestHostEntry { name: "web".into(), ipv4: ipv4.into() }];
+            assert!(validated_hosts(&entries).is_err(), "{ipv4}");
+        }
+
+        let duplicate = [
+            GuestHostEntry { name: "web".into(), ipv4: "10.77.9.11".into() },
+            GuestHostEntry { name: "web".into(), ipv4: "10.77.9.12".into() },
+        ];
+        assert!(validated_hosts(&duplicate).is_err());
+
+        let many: Vec<GuestHostEntry> = (0..65)
+            .map(|i| GuestHostEntry {
+                name: format!("vm-{i}"),
+                ipv4: format!("10.77.9.{}", i + 1),
+            })
+            .collect();
+        assert!(validated_hosts(&many).is_err());
     }
 }

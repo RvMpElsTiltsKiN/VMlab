@@ -2,11 +2,23 @@
 use crate::error::{CoreError, Result};
 use crate::model::*;
 use crate::tools::Tools;
-use crate::{connectivity, docker, docker_desktop, guest, topology, vbox};
+use crate::{connectivity, docker, docker_desktop, guest, netem, topology, vbox};
 use std::collections::{HashMap, HashSet};
 
 fn vbox_state(running: bool) -> PowerState {
     if running { PowerState::Running } else { PowerState::Stopped }
+}
+
+/// Crea (sin arrancar) el contenedor de un nodo Docker del segmento cuando todavía
+/// no existe y el nodo tiene imagen. Sin imagen no se toca nada.
+async fn create_missing(tools: &Tools, n: &NodeSpec, network: &str) -> Result<()> {
+    let Some(image) = n.image.as_deref().filter(|i| !i.is_empty()) else {
+        return Ok(());
+    };
+    if docker::exists(tools, &n.target).await? {
+        return Ok(());
+    }
+    docker::create_on_network(tools, &n.target, image, n.options.as_ref(), network).await
 }
 
 pub async fn inventory(tools: &Tools) -> Inventory {
@@ -86,10 +98,17 @@ pub async fn snapshot(tools: &Tools) -> Snapshot {
     Snapshot { states, vbox_ok, docker_ok }
 }
 
-pub async fn act(tools: &Tools, kind: NodeKind, target: &str, image: Option<&str>, a: Action) -> Result<()> {
+pub async fn act(
+    tools: &Tools,
+    kind: NodeKind,
+    target: &str,
+    image: Option<&str>,
+    options: Option<DockerRunOptions>,
+    a: Action,
+) -> Result<()> {
     match kind {
         NodeKind::Vbox => vbox::action(tools, target, a).await,
-        NodeKind::Docker => docker::action(tools, target, image, a).await,
+        NodeKind::Docker => docker::action(tools, target, image, options, a).await,
     }
 }
 
@@ -101,6 +120,11 @@ pub async fn guest_probe(tools: &Tools, target: &str, username: &str, password: 
 /// Escribe y aplica la configuración de red dentro de la VM Linux.
 pub async fn guest_apply(tools: &Tools, request: GuestConfigRequest) -> Result<GuestReport> {
     guest::apply(tools, request).await
+}
+
+/// Escribe los nombres de la red en el bloque gestionado de `/etc/hosts`.
+pub async fn guest_hosts_apply(tools: &Tools, request: GuestHostsRequest) -> Result<GuestReport> {
+    guest::apply_hosts(tools, request).await
 }
 
 /// Prepara la instalación de Guest Additions: monta la ISO y abre la VM con ventana.
@@ -155,7 +179,10 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
                     let ready = if docker_net_ready { Ok(()) } else { docker::ensure_network(tools, &seg.name).await };
                     docker_net_ready = ready.is_ok();
                     match ready {
-                        Ok(()) => docker::set_networks(tools, &n.target, Some(&seg.name)).await,
+                        Ok(()) => match create_missing(tools, n, &seg.name).await {
+                            Ok(()) => docker::set_networks(tools, &n.target, Some(&seg.name)).await,
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(e),
                     }
                 }
@@ -201,9 +228,61 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
         }
     }
 
-    // Limpieza heredada: redes y servidores DHCP de la etapa `lablab-*`.
+    // Condiciones de red por nodo, una vez aplicada la topología de red.
+    for n in t.nodes.iter().filter(|n| n.link.is_some()) {
+        let Some(conditions) = n.link.as_ref() else { continue };
+        if let Err(e) = crate::validate::link_conditions(conditions) {
+            rep.errors.push(format!("{}: {e}", n.display()));
+            continue;
+        }
+        let is_on = match n.kind {
+            NodeKind::Vbox => running.contains(&n.target),
+            NodeKind::Docker => match netem::is_running(tools, &n.target).await {
+                Ok(value) => value,
+                Err(e) => {
+                    rep.errors.push(format!("{}: {e}", n.display()));
+                    continue;
+                }
+            },
+        };
+        if !is_on {
+            rep.warnings.push(format!(
+                "arranca {} y vuelve a aplicar las condiciones",
+                n.display()
+            ));
+            continue;
+        }
+
+        let result = match n.kind {
+            NodeKind::Vbox => {
+                if conditions.delay_ms > 0
+                    || conditions.jitter_ms > 0
+                    || conditions.loss_tenths > 0
+                {
+                    rep.warnings.push(format!(
+                        "{}: VirtualBox solo aplica el límite de velocidad; se ignoran la latencia y la pérdida.",
+                        n.display()
+                    ));
+                }
+                let adapter = n.net.as_ref().map(|net| net.adapter).unwrap_or_else(default_adapter);
+                vbox::set_bandwidth(tools, &n.target, adapter, conditions.rate_kbit).await
+            }
+            NodeKind::Docker => netem::apply_docker(tools, &n.target, conditions)
+                .await
+                .map(|_| None),
+        };
+        match result {
+            Ok(Some(warning)) => rep.warnings.push(format!("{}: {warning}", n.display())),
+            Ok(None) => {}
+            Err(e) => rep.errors.push(format!("{}: {e}", n.display())),
+        }
+    }
+
+    // Limpieza: servidores DHCP de redes gestionadas que el plan ya no usa, y
+    // redes Docker sin contenedores.
     if tools.vboxmanage.is_some() {
-        let _ = vbox::prune_legacy_dhcp(tools).await;
+        let in_use: HashSet<String> = plan.segments.iter().map(|s| s.name.clone()).collect();
+        let _ = vbox::prune_orphan_dhcp(tools, &in_use).await;
     }
     if tools.docker.is_some() {
         let _ = docker::prune_networks(tools).await;

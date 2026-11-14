@@ -96,6 +96,69 @@ impl Default for NodeNet {
     }
 }
 
+/// Condiciones de red que se aplican a un nodo del lienzo.
+///
+/// Docker las aplica con `netem`; VirtualBox solo puede aplicar `rate_kbit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkConditions {
+    /// Retardo en milisegundos (0..=10000).
+    pub delay_ms: u32,
+    /// Variación del retardo en milisegundos (0..=10000 y nunca mayor que `delay_ms`).
+    pub jitter_ms: u32,
+    /// Pérdida en décimas de porcentaje: 15 = 1,5 % (0..=1000).
+    pub loss_tenths: u32,
+    /// Límite de velocidad en kbit/s (8..=1000000). `None` = sin límite.
+    #[serde(default)]
+    pub rate_kbit: Option<u32>,
+}
+
+/// Protocolo de un puerto publicado por un contenedor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProto {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl PortProto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortProto::Tcp => "tcp",
+            PortProto::Udp => "udp",
+        }
+    }
+}
+
+/// Variable de entorno para crear un contenedor Docker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+/// Puerto publicado por un contenedor Docker. Siempre se enlaza a 127.0.0.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortMap {
+    pub host: u16,
+    pub container: u16,
+    #[serde(default)]
+    pub proto: PortProto,
+}
+
+/// Opciones con las que VMLab crea un contenedor Docker que todavía no existe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerRunOptions {
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    #[serde(default)]
+    pub ports: Vec<PortMap>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSpec {
@@ -106,11 +169,17 @@ pub struct NodeSpec {
     /// Solo Docker: imagen para crear el contenedor si todavía no existe.
     #[serde(default)]
     pub image: Option<String>,
+    /// Solo Docker: opciones (`-e`/`-p`) con las que crear el contenedor.
+    #[serde(default)]
+    pub options: Option<DockerRunOptions>,
     #[serde(default)]
     pub label: Option<String>,
     /// Solo VirtualBox: modo y parámetros del adaptador de red.
     #[serde(default)]
     pub net: Option<NodeNet>,
+    /// Condiciones de red opcionales del nodo.
+    #[serde(default)]
+    pub link: Option<LinkConditions>,
 }
 
 impl NodeSpec {
@@ -219,6 +288,13 @@ pub struct ApplyReport {
     pub networks: Vec<String>,
     pub applied: usize,
     pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Resultado de aplicar o quitar las condiciones de red de un nodo.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkReport {
     pub warnings: Vec<String>,
 }
 
@@ -429,4 +505,24 @@ pub struct GuestReport {
     pub files: Vec<String>,
     pub messages: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// Una entrada del bloque gestionado de `/etc/hosts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestHostEntry {
+    pub name: String,
+    pub ipv4: String,
+}
+
+/// Nombres de red que VMLab escribe dentro de una VM Linux.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestHostsRequest {
+    pub target: String,
+    pub username: String,
+    /// Solo vive en memoria durante la operación; nunca se guarda en el lienzo.
+    pub password: String,
+    #[serde(default)]
+    pub entries: Vec<GuestHostEntry>,
 }

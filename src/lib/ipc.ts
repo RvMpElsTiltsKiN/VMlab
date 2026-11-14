@@ -2,18 +2,25 @@
  * Puente con el backend. En Tauri usa `invoke`/eventos; en un navegador normal
  * (npm run dev) cae a un simulador para poder desarrollar la interfaz sin VirtualBox ni Docker.
  */
+import { t } from '../i18n';
 import type {
   Action,
   ApplyReport,
+  CaptureFilter,
+  CaptureInfo,
+  DockerRunOptions,
   DockerStartResult,
   GuestAdditionsPrep,
   GuestConfigRequest,
+  GuestHostsRequest,
   GuestProfile,
   GuestReport,
   Inventory,
   LabSnapInfo,
   LabSnapNode,
   LabSnapReport,
+  LinkConditions,
+  LinkReport,
   MachineKind,
   NodeProbe,
   ProbeNode,
@@ -38,11 +45,23 @@ const real = {
   listMachines: () => invoke<Inventory>('list_machines'),
   startDocker: () => invoke<DockerStartResult>('docker_start'),
   refreshStatus: () => invoke<Snapshot>('refresh_status'),
-  machineAction: (kind: MachineKind, target: string, image: string | undefined, action: Action) =>
-    invoke<void>('machine_action', { kind, target, image: image ?? null, action }),
+  machineAction: (kind: MachineKind, target: string, image: string | undefined, options: DockerRunOptions | undefined, action: Action) =>
+    invoke<void>('machine_action', { kind, target, image: image ?? null, options: options ?? null, action }),
+  composeConfig: (text: string) => invoke<string>('compose_config', { text }),
   openTerminal: (kind: MachineKind, target: string, user?: string, host?: string) =>
     invoke<void>('open_terminal', { kind, target, user: user ?? null, host: host ?? null }),
   applyTopology: (topology: TopologyPayload) => invoke<ApplyReport>('apply_topology', { topology }),
+  linkApply: (kind: MachineKind, target: string, adapter: number | undefined, conditions: LinkConditions) =>
+    invoke<LinkReport>('link_apply', { kind, target, adapter: adapter ?? null, conditions }),
+  linkClear: (kind: MachineKind, target: string, adapter: number | undefined) =>
+    invoke<LinkReport>('link_clear', { kind, target, adapter: adapter ?? null }),
+  linkImagePresent: () => invoke<boolean>('link_image_present'),
+  captureStart: (kind: MachineKind, target: string, adapter: number | undefined, filter: CaptureFilter) =>
+    invoke<CaptureInfo>('capture_start', { kind, target, adapter: adapter ?? null, filter }),
+  captureStop: (id: string) => invoke<CaptureInfo>('capture_stop', { id }),
+  captureList: () => invoke<CaptureInfo[]>('capture_list'),
+  captureOpen: (id: string) => invoke<void>('capture_open', { id }),
+  captureOpenFolder: () => invoke<void>('capture_open_folder'),
   labsnapList: (nodes: LabSnapNode[]) => invoke<LabSnapInfo[]>('labsnap_list', { nodes }),
   labsnapTake: (nodes: LabSnapNode[], label: string) =>
     invoke<LabSnapReport>('labsnap_take', { nodes, label }),
@@ -54,6 +73,8 @@ const real = {
   guestProbe: (target: string, username: string, password: string) =>
     invoke<GuestProfile>('guest_probe', { target, username, password }),
   guestApply: (request: GuestConfigRequest) => invoke<GuestReport>('guest_apply', { request }),
+  guestHostsApply: (request: GuestHostsRequest) =>
+    invoke<GuestReport>('guest_hosts_apply', { request }),
   prepareGuestAdditions: (target: string) =>
     invoke<GuestAdditionsPrep>('guest_additions_prepare', { target }),
   saveWorkspace: (json: string) => invoke<void>('save_workspace', { json }),
@@ -82,6 +103,8 @@ interface MockSnap {
   present: Set<string>;
 }
 const mockSnaps: MockSnap[] = [];
+/** La imagen de `tc` se «descarga» la primera vez que se aplican condiciones. */
+let mockTcImage = false;
 const mockSnapKey = (node: LabSnapNode) => mockKey(node.kind, node.target);
 const mockSnapName = (node: LabSnapNode) => node.label?.trim() || node.target;
 /** Mismo criterio que `validate::labsnap_slug` del núcleo Rust. */
@@ -94,6 +117,32 @@ const mockSlug = (label: string) =>
     .replace(/^-+/, '')
     .slice(0, 40)
     .replace(/-+$/, '');
+
+// ---- Capturas simuladas ----
+interface MockCapture {
+  info: CaptureInfo;
+  startMs: number;
+}
+
+const mockCaptures: MockCapture[] = [];
+let mockCaptureSeq = 0;
+
+/** Marca `AAAAMMDDHHMMSS` en UTC, igual que el backend. */
+const mockCaptureStamp = (ms: number) => new Date(ms).toISOString().replace(/[-:T]/g, '').slice(0, 14);
+
+/** Simula el crecimiento del `.pcap` mientras la captura sigue en marcha. */
+function mockCaptureInfo(capture: MockCapture, now: number): CaptureInfo {
+  if (capture.info.running) {
+    capture.info.sizeBytes = Math.floor(Math.max(0, now - capture.startMs) / 1000) * 64_000;
+  }
+  return { ...capture.info };
+}
+
+const mockCapture = (id: string): MockCapture => {
+  const capture = mockCaptures.find((c) => c.info.id === id);
+  if (!capture) throw new Error(t('mock.captureUnknown'));
+  return capture;
+};
 
 const mock: typeof real = {
   detectTools: async () => ({ vboxmanage: 'C:/Program Files/Oracle/VirtualBox/VBoxManage.exe', docker: 'docker' }),
@@ -119,18 +168,38 @@ const mock: typeof real = {
       engineReady: true,
       waitedSecs: 3,
       desktop: 'C:/Program Files/Docker/Docker/Docker Desktop.exe',
-      message: 'Docker Desktop arrancó en segundo plano y el motor está listo.',
+      message: t('mock.dockerStarted'),
     };
   },
   refreshStatus: async () => ({ states: { ...mockStates }, vboxOk: true, dockerOk: true }),
-  machineAction: async (kind, target, _image, action) => {
+  machineAction: async (kind, target, _image, _options, action) => {
     await delay(700);
     const next = action === 'stop' || action === 'forceStop' ? 'stopped' : action === 'pause' ? 'paused' : 'running';
     mockStates[mockKey(kind, target)] = next;
   },
+  composeConfig: async (text) => {
+    await delay(500);
+    if (!text.trim()) throw new Error(t('mock.composeEmpty'));
+    // Solo en el simulador: un compose de ejemplo válido para poder probar la importación.
+    return JSON.stringify({
+      name: 'vmlab-demo',
+      services: {
+        web: {
+          image: 'nginx:alpine',
+          ports: [{ target: 80, published: '8080', protocol: 'tcp' }],
+        },
+        db: {
+          image: 'mariadb:11',
+          environment: { MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: '1' },
+        },
+      },
+    });
+  },
   openTerminal: async (kind, target) => {
     mockNotice?.(
-      `El terminal solo está disponible en la app de escritorio. Se abriría ${kind === 'docker' ? `docker exec -it ${target}` : `ssh ${target}`}.`,
+      t('mock.terminalDesktop', {
+        command: kind === 'docker' ? `docker exec -it ${target}` : `ssh ${target}`,
+      }),
     );
   },
   applyTopology: async (t) => ({
@@ -139,6 +208,79 @@ const mock: typeof real = {
     errors: [],
     warnings: [],
   }),
+  linkApply: async (kind, target, _adapter, conditions) => {
+    await delay(700);
+    if (kind === 'docker') {
+      if (mockStates[mockKey(kind, target)] !== 'running') throw new Error(t('mock.startContainerFirst'));
+      mockTcImage = true;
+      return { warnings: [] };
+    }
+    const warnings: string[] = [];
+    if (conditions.delayMs > 0 || conditions.jitterMs > 0 || conditions.lossTenths > 0) {
+      warnings.push(t('mock.vboxRateOnly'));
+    }
+    return { warnings };
+  },
+  linkClear: async (kind, target) => {
+    await delay(500);
+    if (kind === 'docker' && mockStates[mockKey(kind, target)] !== 'running') {
+      throw new Error(t('mock.startContainerFirst'));
+    }
+    return { warnings: [] };
+  },
+  linkImagePresent: async () => mockTcImage,
+  captureStart: async (kind, target, _adapter, filter) => {
+    await delay(450);
+    const state = mockStates[mockKey(kind, target)];
+    if (state !== 'running') {
+      throw new Error(t(kind === 'docker' ? 'mock.startContainerFirst' : 'mock.startVmFirst'));
+    }
+    if (mockCaptures.some((c) => c.info.running && c.info.kind === kind && c.info.target === target)) {
+      throw new Error(t('mock.captureAlreadyRunning'));
+    }
+    const startMs = Date.now();
+    const info: CaptureInfo = {
+      id: `cap-${++mockCaptureSeq}`,
+      kind,
+      target,
+      fileName: `${mockSlug(target) || 'nodo'}-${mockCaptureStamp(startMs)}.pcap`,
+      startedAt: new Date(startMs).toISOString(),
+      running: true,
+      sizeBytes: 0,
+    };
+    if (kind === 'docker' && !mockTcImage) {
+      info.warning = t('mock.netshootNotDownloaded');
+      mockTcImage = true;
+    }
+    if (kind === 'vbox' && filter !== 'all') {
+      info.warning = t('mock.vboxNoBpf');
+    }
+    mockCaptures.push({ info, startMs });
+    return { ...info };
+  },
+  captureStop: async (id) => {
+    await delay(350);
+    const capture = mockCapture(id);
+    if (capture.info.running) {
+      capture.info.running = false;
+      capture.info.sizeBytes = Math.floor(Math.max(0, Date.now() - capture.startMs) / 1000) * 64_000;
+    }
+    return { ...capture.info };
+  },
+  captureList: async () => {
+    await delay(120);
+    const now = Date.now();
+    return mockCaptures
+      .map((c) => mockCaptureInfo(c, now))
+      .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  },
+  captureOpen: async (id) => {
+    const capture = mockCapture(id);
+    mockNotice?.(t('mock.wiresharkDesktop', { file: capture.info.fileName }));
+  },
+  captureOpenFolder: async () => {
+    mockNotice?.(t('mock.captureFolder'));
+  },
   labsnapList: async (nodes) => {
     await delay(250);
     return mockSnaps
@@ -155,9 +297,9 @@ const mock: typeof real = {
     await delay(1200);
     const clean = label.trim();
     const id = mockSlug(clean);
-    if (!id) throw new Error('el nombre debe incluir al menos una letra o un número');
+    if (!id) throw new Error(t('mock.snapNameNeedsAlnum'));
     if (mockSnaps.some((snap) => snap.id === id)) {
-      throw new Error('ya existe una instantánea con ese nombre');
+      throw new Error(t('mock.snapAlreadyExists'));
     }
     mockSnaps.push({
       id,
@@ -168,26 +310,29 @@ const mock: typeof real = {
     return {
       done: nodes.length,
       errors: [],
-      warnings: nodes.some((n) => n.kind === 'docker')
-        ? ['Los volúmenes de Docker no se incluyen en la instantánea.']
-        : [],
+      warnings: nodes.some((n) => n.kind === 'docker') ? [t('mock.snapVolumes')] : [],
     };
   },
   labsnapRestore: async (nodes, id) => {
     await delay(1400);
     const snap = mockSnaps.find((s) => s.id === id);
-    if (!snap) throw new Error('la instantánea no existe');
+    if (!snap) throw new Error(t('mock.snapMissing'));
     const restored = nodes.filter((n) => snap.present.has(mockSnapKey(n)));
     const warnings = restored
       .filter((n) => n.kind === 'docker')
-      .map((n) => `El contenedor original «${mockSnapName(n)}» se conserva como «${n.target}-prerestore-demo».`);
-    if (warnings.length) warnings.push('Pulsa «Aplicar red» para reconectar los contenedores restaurados');
+      .map((n) =>
+        t('mock.snapRestoredOriginal', {
+          name: mockSnapName(n),
+          target: n.target,
+        }),
+      );
+    if (warnings.length) warnings.push(t('mock.snapApplyNetwork'));
     return { done: restored.length, errors: [], warnings };
   },
   labsnapDelete: async (nodes, id) => {
     await delay(800);
     const index = mockSnaps.findIndex((snap) => snap.id === id);
-    if (index < 0) throw new Error('la instantánea no existe');
+    if (index < 0) throw new Error(t('mock.snapMissing'));
     const [snap] = mockSnaps.splice(index, 1);
     const done = nodes.filter((n) => snap.present.has(mockSnapKey(n))).length || snap.present.size;
     return { done, errors: [], warnings: [] };
@@ -242,7 +387,7 @@ const mock: typeof real = {
         },
         {
           system: 'dhcpd',
-          label: 'Servidor DHCP ISC (dhcpd.conf)',
+          label: t('mock.dhcpdLabel'),
           configPath: '/etc/dhcp/dhcpd.conf',
           active: false,
           recommended: true,
@@ -260,7 +405,22 @@ const mock: typeof real = {
     return {
       system: request.system === 'auto' ? 'netplan' : request.system,
       files: request.ipMode === 'server' ? ['/etc/dhcp/dhcpd.conf'] : [`/etc/netplan/90-vmlab.yaml`],
-      messages: [`Configuración escrita para ${request.interface ?? 'la interfaz'}`],
+      messages: [
+        t('mock.guestConfigWritten', { iface: request.interface ?? t('mock.guestIfaceFallback') }),
+      ],
+      warnings: [],
+    };
+  },
+  guestHostsApply: async (request) => {
+    await delay(900);
+    return {
+      system: 'auto',
+      files: ['/etc/hosts'],
+      messages: [
+        request.entries.length
+          ? t('mock.hostsWritten', { count: request.entries.length })
+          : t('mock.hostsCleared'),
+      ],
       warnings: [],
     };
   },
@@ -294,8 +454,8 @@ const mock: typeof real = {
     } catch { return null; }
   },
   async onStatus(cb) {
-    const t = setInterval(() => cb({ states: { ...mockStates }, vboxOk: true, dockerOk: true }), 1500);
-    return () => clearInterval(t);
+    const timer = setInterval(() => cb({ states: { ...mockStates }, vboxOk: true, dockerOk: true }), 1500);
+    return () => clearInterval(timer);
   },
 };
 

@@ -4,11 +4,14 @@
 //! solo enviar datos (tipos cerrados) que `vmlab-core` valida antes de ejecutar.
 use crate::state::AppState;
 use vmlab_core::model::{
-    Action, ApplyReport, DockerStartInfo, GuestAdditionsPrep, GuestConfigRequest, GuestProfile, GuestReport, Inventory,
-    LabSnapInfo, LabSnapNode, LabSnapReport, NodeKind, NodeProbe, ProbeNode, Snapshot, Topology,
+    default_adapter, Action, ApplyReport, DockerRunOptions, DockerStartInfo, GuestAdditionsPrep, GuestConfigRequest,
+    GuestHostsRequest,
+    GuestProfile, GuestReport, Inventory, LabSnapInfo, LabSnapNode, LabSnapReport, LinkConditions, LinkReport, NodeKind,
+    NodeProbe, ProbeNode, Snapshot, Topology,
 };
+use vmlab_core::capture::{self, CaptureFilter, CaptureInfo};
 use vmlab_core::tools::Tools;
-use vmlab_core::{engine, labsnap, terminal};
+use vmlab_core::{compose, engine, labsnap, netem, terminal, vbox};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
@@ -76,10 +79,17 @@ pub async fn machine_action(
     kind: NodeKind,
     target: String,
     image: Option<String>,
+    options: Option<DockerRunOptions>,
     action: Action,
 ) -> Result<(), String> {
     let tools = state.tools().await;
-    engine::act(&tools, kind, &target, image.as_deref(), action).await.map_err(s)
+    engine::act(&tools, kind, &target, image.as_deref(), options, action).await.map_err(s)
+}
+
+/// Valida un `docker-compose.yml` con `docker compose config` y devuelve su JSON.
+#[tauri::command]
+pub async fn compose_config(state: State<'_, AppState>, text: String) -> Result<String, String> {
+    compose::config(&state.tools().await, &text).await.map_err(s)
 }
 
 /// Abre una ventana de consola conectada al nodo (Docker exec o SSH a la VM).
@@ -100,6 +110,164 @@ pub async fn apply_topology(state: State<'_, AppState>, topology: Topology) -> R
     Ok(engine::apply(&state.tools().await, &topology).await)
 }
 
+/// Aplica las condiciones de red de un nodo (netem en Docker, límite en VirtualBox).
+#[tauri::command]
+pub async fn link_apply(
+    state: State<'_, AppState>,
+    kind: NodeKind,
+    target: String,
+    adapter: Option<u8>,
+    conditions: LinkConditions,
+) -> Result<LinkReport, String> {
+    let tools = state.tools().await;
+    let mut report = LinkReport::default();
+    match kind {
+        NodeKind::Docker => netem::apply_docker(&tools, &target, &conditions).await.map_err(s)?,
+        NodeKind::Vbox => {
+            if conditions.delay_ms > 0 || conditions.jitter_ms > 0 || conditions.loss_tenths > 0 {
+                report.warnings.push(
+                    "VirtualBox solo aplica el límite de velocidad; se ignoran la latencia y la pérdida."
+                        .into(),
+                );
+            }
+            let adapter = adapter.unwrap_or_else(default_adapter);
+            if let Some(warning) =
+                vbox::set_bandwidth(&tools, &target, adapter, conditions.rate_kbit).await.map_err(s)?
+            {
+                report.warnings.push(warning);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Quita las condiciones de red de un nodo.
+#[tauri::command]
+pub async fn link_clear(
+    state: State<'_, AppState>,
+    kind: NodeKind,
+    target: String,
+    adapter: Option<u8>,
+) -> Result<LinkReport, String> {
+    let tools = state.tools().await;
+    let mut report = LinkReport::default();
+    match kind {
+        NodeKind::Docker => netem::clear_docker(&tools, &target).await.map_err(s)?,
+        NodeKind::Vbox => {
+            let adapter = adapter.unwrap_or_else(default_adapter);
+            if let Some(warning) =
+                vbox::set_bandwidth(&tools, &target, adapter, None).await.map_err(s)?
+            {
+                report.warnings.push(warning);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Indica si la imagen de `tc` ya está descargada (para pedir confirmación antes).
+#[tauri::command]
+pub async fn link_image_present(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(netem::image_present(&state.tools().await).await)
+}
+
+/// Arranca una captura de paquetes. El backend elige siempre el fichero y el id.
+#[tauri::command]
+pub async fn capture_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: NodeKind,
+    target: String,
+    adapter: Option<u8>,
+    filter: CaptureFilter,
+) -> Result<CaptureInfo, String> {
+    let tools = state.tools().await;
+    let dir = capture::prepare_dir().map_err(s)?;
+    let id = state.next_capture_id();
+    state.reserve_capture(&id, kind, &target)?;
+
+    let started_at = capture::now_secs();
+    let adapter = adapter.unwrap_or_else(default_adapter);
+    let mut warning = None;
+
+    let started = match kind {
+        NodeKind::Docker => {
+            if !netem::image_present(&tools).await {
+                warning = Some(format!(
+                    "la imagen {} aún no está descargada; se descargará al iniciar la captura",
+                    netem::TC_IMAGE
+                ));
+            }
+            match capture::start_docker(&tools, &target, &id, &filter, &dir).await {
+                Ok(started) => started,
+                Err(e) => {
+                    state.abort_capture(&id);
+                    return Err(s(e));
+                }
+            }
+        }
+        NodeKind::Vbox => {
+            if filter != CaptureFilter::All {
+                warning = Some(
+                    "VirtualBox no admite filtros BPF; se capturará todo el tráfico del adaptador."
+                        .into(),
+                );
+            }
+            match capture::start_vbox(&tools, &target, adapter, &dir).await {
+                Ok(started) => started,
+                Err(e) => {
+                    state.abort_capture(&id);
+                    return Err(s(e));
+                }
+            }
+        }
+    };
+
+    let handle_adapter = matches!(kind, NodeKind::Vbox).then_some(adapter);
+    let mut info =
+        state.complete_capture(&id, started.file, started_at, handle_adapter, started.child)?;
+    info.warning = warning;
+    crate::state::spawn_capture_watchdog(app, id);
+    Ok(info)
+}
+
+/// Detiene una captura activa o devuelve los metadatos de una ya terminada.
+#[tauri::command]
+pub async fn capture_stop(state: State<'_, AppState>, id: String) -> Result<CaptureInfo, String> {
+    let tools = state.tools().await;
+    state.stop_capture(&id, &tools).await
+}
+
+/// Lista las capturas (activas y terminadas) de esta sesión.
+#[tauri::command]
+pub async fn capture_list(state: State<'_, AppState>) -> Result<Vec<CaptureInfo>, String> {
+    Ok(state.capture_list())
+}
+
+/// Abre una captura con Wireshark o, si no está instalado, su carpeta.
+#[tauri::command]
+pub async fn capture_open(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let file = state.capture_file(&id)?;
+    if !file.is_file() {
+        return Err("el fichero de captura ya no existe".into());
+    }
+    match capture::find_wireshark() {
+        Some(exe) => capture::open_in_wireshark(&exe, &file).map_err(s),
+        None => {
+            let dir = capture::prepare_dir().map_err(s)?;
+            let _ = capture::open_folder(&dir);
+            Err(capture::WIRESHARK_MISSING.to_string())
+        }
+    }
+}
+
+/// Abre la carpeta de capturas en el explorador de Windows.
+#[tauri::command]
+pub async fn capture_open_folder() -> Result<(), String> {
+    let dir = capture::prepare_dir().map_err(s)?;
+    capture::open_folder(&dir).map_err(s)
+}
+
 /// Sondea la VM (Linux) a través de Guest Additions y devuelve gestores, rutas e interfaces.
 #[tauri::command]
 pub async fn guest_probe(
@@ -117,6 +285,15 @@ pub async fn guest_probe(
 #[tauri::command]
 pub async fn guest_apply(state: State<'_, AppState>, request: GuestConfigRequest) -> Result<GuestReport, String> {
     engine::guest_apply(&state.tools().await, request).await.map_err(s)
+}
+
+/// Escribe los nombres de la red del lienzo en `/etc/hosts` de la VM Linux.
+#[tauri::command]
+pub async fn guest_hosts_apply(
+    state: State<'_, AppState>,
+    request: GuestHostsRequest,
+) -> Result<GuestReport, String> {
+    engine::guest_hosts_apply(&state.tools().await, request).await.map_err(s)
 }
 
 /// Monta la ISO de Guest Additions y abre la VM para instalar o actualizar las adiciones.

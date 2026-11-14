@@ -1,7 +1,7 @@
 //! Control de contenedores con la CLI de Docker.
 //! Cada segmento de red de VMLab es una red *bridge* de Docker llamada `vmlab-xxxxxxxx`.
 use crate::error::{CoreError, Result};
-use crate::model::{Action, LinkInfo, PowerState};
+use crate::model::{Action, DockerRunOptions, LinkInfo, PowerState};
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
 use crate::validate;
@@ -102,7 +102,91 @@ pub async fn vmlab_link(tools: &Tools, name: &str) -> Result<LinkInfo> {
     })
 }
 
-pub async fn action(tools: &Tools, name: &str, image: Option<&str>, action: Action) -> Result<()> {
+/// Argumentos `-e`/`-p` compartidos por `docker run` y `docker create`.
+///
+/// Cada `-e`/`-p` viaja como argumento propio y `KEY=VALUE` como **un solo**
+/// argumento, de modo que ningún valor necesita comillas ni pasa por un shell.
+/// Los puertos se publican siempre en `127.0.0.1`.
+fn option_args(opts: Option<&DockerRunOptions>) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    if let Some(opts) = opts {
+        validate::docker_run_options(opts)?;
+        for e in &opts.env {
+            args.push("-e".to_string());
+            args.push(format!("{}={}", e.key, e.value));
+        }
+        for p in &opts.ports {
+            args.push("-p".to_string());
+            args.push(format!("127.0.0.1:{}:{}/{}", p.host, p.container, p.proto.as_str()));
+        }
+    }
+    Ok(args)
+}
+
+/// Argumentos de `docker run` para crear un contenedor con las opciones del nodo.
+pub fn run_args(name: &str, image: &str, opts: Option<&DockerRunOptions>) -> Result<Vec<String>> {
+    validate::container_name(name)?;
+    validate::docker_image(image)?;
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+    ];
+    args.extend(option_args(opts)?);
+    args.push(image.to_string());
+    Ok(args)
+}
+
+/// Argumentos de `docker create` para crear el contenedor **sin arrancarlo**
+/// conectado ya a la red del segmento.
+pub fn create_args(
+    name: &str,
+    image: &str,
+    opts: Option<&DockerRunOptions>,
+    network: &str,
+) -> Result<Vec<String>> {
+    validate::container_name(name)?;
+    validate::docker_image(image)?;
+    validate::network_name(network)?;
+    let mut args = vec!["create".to_string(), "--name".to_string(), name.to_string()];
+    args.extend(option_args(opts)?);
+    args.push("--network".to_string());
+    args.push(network.to_string());
+    args.push(image.to_string());
+    Ok(args)
+}
+
+/// Indica si el contenedor ya existe (aunque esté parado).
+pub async fn exists(tools: &Tools, name: &str) -> Result<bool> {
+    validate::container_name(name)?;
+    match run_ok(tools.docker()?, &["inspect", "-f", "{{.Id}}", name], SHORT).await {
+        Ok(_) => Ok(true),
+        Err(CoreError::Failed { stderr, .. }) if stderr.contains("No such") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Crea el contenedor sin arrancarlo y lo deja conectado a `network`.
+pub async fn create_on_network(
+    tools: &Tools,
+    name: &str,
+    image: &str,
+    options: Option<&DockerRunOptions>,
+    network: &str,
+) -> Result<()> {
+    let args = create_args(name, image, options, network)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(tools.docker()?, &refs, LONG).await.map(|_| ())
+}
+
+pub async fn action(
+    tools: &Tools,
+    name: &str,
+    image: Option<&str>,
+    options: Option<DockerRunOptions>,
+    action: Action,
+) -> Result<()> {
     validate::container_name(name)?;
     let bin = tools.docker()?;
     match action {
@@ -114,8 +198,9 @@ pub async fn action(tools: &Tools, name: &str, image: Option<&str>, action: Acti
                     let image = image
                         .filter(|i| !i.is_empty())
                         .ok_or_else(|| CoreError::Invalid("el contenedor no existe y el nodo no tiene imagen".into()))?;
-                    validate::docker_image(image)?;
-                    run_ok(bin, &["run", "-d", "--name", name, image], LONG).await.map(|_| ())
+                    let args = run_args(name, image, options.as_ref())?;
+                    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    run_ok(bin, &refs, LONG).await.map(|_| ())
                 }
                 Err(e) => Err(e),
             }
@@ -272,6 +357,12 @@ pub async fn snapshot_take(tools: &Tools, container: &str, id: &str, label: &str
     let image = snapshot_image(container, id)?;
     validate::labsnap_label(label)?;
     let bin = tools.docker()?;
+    // `docker commit` puede sobrescribir una etiqueta existente; se comprueba antes
+    // para no perder una instantánea anterior con el mismo nombre.
+    let inspected = run(bin, &["image", "inspect", image.as_str()], SHORT).await?;
+    if inspected.code == 0 {
+        return Err(CoreError::Message("ya existe una instantánea con ese nombre".into()));
+    }
     let change_snapshot = label_change("vmlab.snapshot", id);
     let change_label = label_change("vmlab.label", label);
     let change_container = label_change("vmlab.container", container);
@@ -296,7 +387,20 @@ pub async fn snapshot_take(tools: &Tools, container: &str, id: &str, label: &str
 
 pub async fn snapshot_delete(tools: &Tools, container: &str, id: &str) -> Result<()> {
     let image = snapshot_image(container, id)?;
-    run_ok(tools.docker()?, &["rmi", image.as_str()], LONG).await.map(|_| ())
+    match run_ok(tools.docker()?, &["rmi", image.as_str()], LONG).await {
+        Ok(_) => Ok(()),
+        Err(CoreError::Failed { stderr, .. }) if image_in_use(&stderr) => Err(CoreError::Message(
+            "la imagen está en uso por el contenedor restaurado; elimina o renombra ese contenedor y vuelve a intentarlo"
+                .into(),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// Detecta el conflicto de Docker al borrar una imagen que usa un contenedor.
+fn image_in_use(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("image is being used by") || m.contains("image is in use by")
 }
 
 fn output_message(out: &crate::runner::Output) -> String {
@@ -316,6 +420,18 @@ pub fn prerestore_name(original: &str, stamp: &str) -> String {
     let max_original = 64usize.saturating_sub(suffix.len());
     let base: String = original.chars().take(max_original).collect();
     format!("{base}{suffix}")
+}
+
+/// Añade al error original si se pudo deshacer el renombrado del contenedor.
+fn restore_failure(error: &CoreError, undone: bool, original: &str, preserved: &str) -> CoreError {
+    let note = if undone {
+        "se deshizo el renombrado y el contenedor original volvió a su estado anterior".to_string()
+    } else {
+        format!(
+            "no se pudo deshacer el renombrado por completo; revisa los contenedores «{original}» y «{preserved}»"
+        )
+    };
+    CoreError::Message(format!("{error}. {note}"))
 }
 
 /// Restaura la instantánea como un contenedor nuevo. Si el contenedor original
@@ -339,8 +455,8 @@ pub async fn snapshot_restore(tools: &Tools, container: &str, id: &str) -> Resul
     };
 
     let mut renamed = None;
-    if let Some(running) = running {
-        if running {
+    if let Some(was_running) = running {
+        if was_running {
             run_ok(bin, &["stop", container], LONG).await?;
         }
         let name = prerestore_name(container, &crate::labsnap::utc_now_stamp());
@@ -348,13 +464,130 @@ pub async fn snapshot_restore(tools: &Tools, container: &str, id: &str) -> Resul
         renamed = Some(name);
     }
 
-    run_ok(bin, &["run", "-d", "--name", container, image.as_str()], LONG).await?;
+    // TODO: restaurar los puertos publicados (y las variables de entorno) del
+    // contenedor original. La instantánea actual solo guarda el sistema de
+    // ficheros, así que el contenedor restaurado no vuelve a publicar puertos
+    // en 127.0.0.1 y hay que añadirlos a mano.
+    if let Err(error) = run_ok(bin, &["run", "-d", "--name", container, image.as_str()], LONG).await {
+        if let Some(name) = &renamed {
+            let undo = match run_ok(bin, &["rename", name.as_str(), container], SHORT).await {
+                Ok(_) if running == Some(true) => run_ok(bin, &["start", container], LONG).await.is_ok(),
+                Ok(_) => true,
+                Err(_) => false,
+            };
+            return Err(restore_failure(&error, undo, container, name));
+        }
+        return Err(error);
+    }
     Ok(renamed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{EnvVar, PortMap, PortProto};
+
+    #[test]
+    fn builds_run_args_without_options() {
+        let expected = vec!["run", "-d", "--name", "web", "nginx:latest"];
+        assert_eq!(run_args("web", "nginx:latest", None).unwrap(), expected);
+        let empty = DockerRunOptions::default();
+        assert_eq!(run_args("web", "nginx:latest", Some(&empty)).unwrap(), expected);
+    }
+
+    #[test]
+    fn builds_run_args_with_env_and_ports() {
+        let opts = DockerRunOptions {
+            env: vec![
+                EnvVar { key: "MYSQL_ROOT_PASSWORD".into(), value: "s3creto".into() },
+                EnvVar { key: "MESSAGE".into(), value: "hola mundo = 1 $USER \"x\"".into() },
+            ],
+            ports: vec![
+                PortMap { host: 8080, container: 80, proto: PortProto::Tcp },
+                PortMap { host: 5353, container: 53, proto: PortProto::Udp },
+            ],
+        };
+        assert_eq!(
+            run_args("db", "postgres:16", Some(&opts)).unwrap(),
+            vec![
+                "run",
+                "-d",
+                "--name",
+                "db",
+                "-e",
+                "MYSQL_ROOT_PASSWORD=s3creto",
+                "-e",
+                "MESSAGE=hola mundo = 1 $USER \"x\"",
+                "-p",
+                "127.0.0.1:8080:80/tcp",
+                "-p",
+                "127.0.0.1:5353:53/udp",
+                "postgres:16",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_run_options() {
+        let bad_key = DockerRunOptions {
+            env: vec![EnvVar { key: "2BAD".into(), value: "x".into() }],
+            ..Default::default()
+        };
+        assert!(run_args("web", "nginx:latest", Some(&bad_key)).is_err());
+
+        let duplicated = DockerRunOptions {
+            ports: vec![
+                PortMap { host: 8080, container: 80, proto: PortProto::Tcp },
+                PortMap { host: 8080, container: 81, proto: PortProto::Tcp },
+            ],
+            ..Default::default()
+        };
+        assert!(run_args("web", "nginx:latest", Some(&duplicated)).is_err());
+
+        let zero = DockerRunOptions {
+            ports: vec![PortMap { host: 0, container: 80, proto: PortProto::Tcp }],
+            ..Default::default()
+        };
+        assert!(run_args("web", "nginx:latest", Some(&zero)).is_err());
+
+        assert!(run_args("--privileged", "nginx:latest", None).is_err());
+        assert!(run_args("web", "--rm", None).is_err());
+    }
+
+    #[test]
+    fn builds_create_args_with_env_ports_and_network() {
+        let opts = DockerRunOptions {
+            env: vec![EnvVar { key: "MYSQL_ROOT_PASSWORD".into(), value: "s3creto".into() }],
+            ports: vec![PortMap { host: 8080, container: 80, proto: PortProto::Tcp }],
+        };
+        assert_eq!(
+            create_args("db", "postgres:16", Some(&opts), "vmlab-abcd1234").unwrap(),
+            vec![
+                "create",
+                "--name",
+                "db",
+                "-e",
+                "MYSQL_ROOT_PASSWORD=s3creto",
+                "-p",
+                "127.0.0.1:8080:80/tcp",
+                "--network",
+                "vmlab-abcd1234",
+                "postgres:16",
+            ]
+        );
+        assert_eq!(
+            create_args("web", "nginx:latest", None, "vmlab-abcd1234").unwrap(),
+            vec!["create", "--name", "web", "--network", "vmlab-abcd1234", "nginx:latest"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_create_args() {
+        assert!(create_args("--privileged", "nginx:latest", None, "vmlab-abcd1234").is_err());
+        assert!(create_args("web", "--rm", None, "vmlab-abcd1234").is_err());
+        assert!(create_args("web", "nginx:latest", None, "lab1").is_err());
+        assert!(create_args("web", "nginx:latest", None, "--net").is_err());
+    }
 
     #[test]
     fn recognizes_an_engine_that_is_not_running() {
@@ -455,6 +688,34 @@ vmlab-snap/web\tinvalida!\t2026-11-09 12:00:00 +0000 UTC\tvmlab.label=Mala
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn detects_images_in_use_when_deleting() {
+        assert!(image_in_use(
+            "Error response from daemon: conflict: unable to delete abc (cannot be forced) - image is being used by stopped container def"
+        ));
+        assert!(image_in_use("conflict: image is in use by container abc"));
+        assert!(!image_in_use("Error response from daemon: No such image: vmlab-snap/web:lab"));
+    }
+
+    #[test]
+    fn reports_whether_the_restore_undo_worked() {
+        let error = CoreError::Failed {
+            program: "docker".into(),
+            code: 125,
+            stderr: "no such image".into(),
+        };
+        let undone =
+            restore_failure(&error, true, "web", "web-prerestore-20261109103000").to_string();
+        assert!(undone.contains("no such image"));
+        assert!(undone.contains("se deshizo el renombrado"));
+
+        let failed =
+            restore_failure(&error, false, "web", "web-prerestore-20261109103000").to_string();
+        assert!(failed.contains("no such image"));
+        assert!(failed.contains("no se pudo deshacer"));
+        assert!(failed.contains("web-prerestore-20261109103000"));
     }
 
     #[test]

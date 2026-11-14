@@ -1,3 +1,4 @@
+import type { Translate } from '../i18n';
 import type { MachineData, PowerState, Snapshot } from '../types';
 
 export const EMPTY_SNAPSHOT: Snapshot = { states: {}, vboxOk: false, dockerOk: false };
@@ -10,10 +11,18 @@ export function resolveState(data: Pick<MachineData, 'kind' | 'target'>, snap: S
   return toolOk ? 'missing' : 'unknown';
 }
 
-export const STATE_LABEL: Record<PowerState, string> = {
-  running: 'En ejecución',
-  stopped: 'Detenida',
-  paused: 'Pausada',
-  missing: 'Sin crear',
-  unknown: 'Sin conexión',
-};
+/** Etiqueta traducible del estado. Recibe `t` para no fijar el idioma al cargar el módulo. */
+export function stateLabel(state: PowerState, t: Translate): string {
+  switch (state) {
+    case 'running':
+      return t('state.running');
+    case 'stopped':
+      return t('state.stopped');
+    case 'paused':
+      return t('state.paused');
+    case 'missing':
+      return t('state.missing');
+    case 'unknown':
+      return t('state.unknown');
+  }
+}

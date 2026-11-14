@@ -105,6 +105,24 @@ pub async fn set_network(tools: &Tools, target: &str, network: Option<&str>) -> 
     set_nic(tools, target, &cfg, network).await
 }
 
+/// Nombre de la red interna del modo `Intnet`.
+///
+/// Si el nodo está en un segmento del lienzo, manda la red del segmento y se
+/// valida como red gestionada (`vmlab-*`). Si está aislado y define un nombre
+/// propio, es una red interna cualquiera de VirtualBox y se valida como interfaz.
+fn internal_net_name<'a>(cfg: &'a NodeNet, intnet_fallback: Option<&'a str>) -> Result<Option<&'a str>> {
+    if cfg.mode != NetMode::Intnet {
+        return Ok(None);
+    }
+    match intnet_fallback {
+        Some(name) => validate::network_name(name).map(Some),
+        None => match cfg.name.as_deref().filter(|n| !n.is_empty()) {
+            Some(name) => validate::host_iface(name).map(Some),
+            None => Ok(None),
+        },
+    }
+}
+
 /// Configura el adaptador indicado por el panel derecho. La VM debe estar apagada.
 ///
 /// `intnet_fallback` es la red interna del segmento del lienzo: se usa en el modo
@@ -126,15 +144,7 @@ pub async fn set_nic(tools: &Tools, target: &str, cfg: &NodeNet, intnet_fallback
     //
     // Se valida aquí, antes del reset de la NIC, para que un nombre inválido no deje
     // el adaptador desactivado.
-    let intnet_name = if cfg.mode == NetMode::Intnet {
-        let name = intnet_fallback.or(cfg.name.as_deref().filter(|n| !n.is_empty()));
-        if let Some(name) = name {
-            validate::network_name(name)?;
-        }
-        name
-    } else {
-        None
-    };
+    let intnet_name = internal_net_name(cfg, intnet_fallback)?;
 
     // Al cambiar de modo, VirtualBox conserva opciones del modo anterior
     // (`--intnetN`, `--hostonlyadapterN`, `--bridgeadapterN`…). Se desactiva la NIC
@@ -184,6 +194,147 @@ pub async fn set_nic(tools: &Tools, target: &str, cfg: &NodeNet, intnet_fallback
 
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ok(bin, &argv, SHORT).await.map(|_| ())
+}
+
+// ───────────────────── Límite de ancho de banda ─────────────────────
+
+const BANDWIDTH_HINT: &str = "apaga la VM una vez para asignar el límite";
+
+fn bandwidth_group(adapter: u8) -> String {
+    format!("vmlab-nic{adapter}")
+}
+
+fn bandwidth_set_args(vm: &str, group: &str, limit: &str) -> Vec<String> {
+    vec![
+        "bandwidthctl".into(),
+        vm.into(),
+        "set".into(),
+        group.into(),
+        "--limit".into(),
+        limit.into(),
+    ]
+}
+
+fn bandwidth_add_args(vm: &str, group: &str, rate_kbit: u32) -> Vec<String> {
+    vec![
+        "bandwidthctl".into(),
+        vm.into(),
+        "add".into(),
+        group.into(),
+        "--type".into(),
+        "network".into(),
+        "--limit".into(),
+        format!("{rate_kbit}k"),
+    ]
+}
+
+fn bandwidth_remove_args(vm: &str, group: &str) -> Vec<String> {
+    vec!["bandwidthctl".into(), vm.into(), "remove".into(), group.into()]
+}
+
+fn nic_group_args(vm: &str, adapter: u8, group: Option<&str>) -> Vec<String> {
+    vec![
+        "modifyvm".into(),
+        vm.into(),
+        format!("--nicbandwidthgroup{adapter}"),
+        group.unwrap_or("none").into(),
+    ]
+}
+
+fn show_vm_on(out: &str) -> bool {
+    out.lines()
+        .find_map(|line| line.trim().strip_prefix("VMState="))
+        .map(|value| {
+            let value = value.trim().trim_matches('"');
+            value.eq_ignore_ascii_case("running") || value.eq_ignore_ascii_case("paused")
+        })
+        .unwrap_or(false)
+}
+
+fn group_is_assigned(out: &str, adapter: u8, group: &str) -> bool {
+    let key = format!("nicbandwidthgroup{adapter}=");
+    out.lines().any(|line| {
+        line.trim()
+            .strip_prefix(&key)
+            .is_some_and(|value| value.trim().trim_matches('"') == group)
+    })
+}
+
+fn list_has_group(out: &str, group: &str) -> bool {
+    out.lines().any(|line| {
+        line.split(|c: char| c == '=' || c == ':' || c.is_whitespace())
+            .map(|token| token.trim().trim_matches('"'))
+            .any(|token| token == group)
+    })
+}
+
+async fn bandwidth_exists(bin: &Path, vm: &str, group: &str) -> bool {
+    run(bin, &["bandwidthctl", vm, "list"], SHORT)
+        .await
+        .map(|out| out.code == 0 && list_has_group(&out.stdout, group))
+        .unwrap_or(false)
+}
+
+async fn run_bandwidth(bin: &Path, args: Vec<String>) -> Result<()> {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(bin, &argv, SHORT).await.map(|_| ())
+}
+
+/// Aplica o retira el límite de ancho de banda del adaptador indicado.
+///
+/// El grupo `vmlab-nic<N>` se puede modificar con la VM encendida si ya estaba
+/// asignado. Si no lo estaba, `modifyvm` exige apagarla y se devuelve un aviso.
+pub async fn set_bandwidth(
+    tools: &Tools,
+    vm: &str,
+    adapter: u8,
+    rate_kbit: Option<u32>,
+) -> Result<Option<String>> {
+    validate::vbox_target(vm)?;
+    if !(1..=4).contains(&adapter) {
+        return Err(CoreError::Invalid("el adaptador debe estar entre 1 y 4".into()));
+    }
+    if let Some(rate) = rate_kbit {
+        if !(8..=1_000_000).contains(&rate) {
+            return Err(CoreError::Invalid(
+                "la velocidad debe estar entre 8 y 1000000 kbit/s".into(),
+            ));
+        }
+    }
+
+    let bin = tools.vbox()?;
+    let group = bandwidth_group(adapter);
+    let info = run_ok(bin, &["showvminfo", vm, "--machinereadable"], SHORT).await?;
+    let vm_on = show_vm_on(&info.stdout);
+    let assigned = group_is_assigned(&info.stdout, adapter, &group);
+
+    let Some(rate) = rate_kbit else {
+        if vm_on {
+            if assigned {
+                run_bandwidth(bin, bandwidth_set_args(vm, &group, "0")).await?;
+            }
+            return Ok(None);
+        }
+        run_bandwidth(bin, nic_group_args(vm, adapter, None)).await?;
+        if bandwidth_exists(bin, vm, &group).await {
+            run_bandwidth(bin, bandwidth_remove_args(vm, &group)).await?;
+        }
+        return Ok(None);
+    };
+
+    if vm_on && !assigned {
+        return Ok(Some(BANDWIDTH_HINT.into()));
+    }
+
+    if !bandwidth_exists(bin, vm, &group).await {
+        run_bandwidth(bin, bandwidth_add_args(vm, &group, rate)).await?;
+    }
+    run_bandwidth(bin, bandwidth_set_args(vm, &group, &format!("{rate}k"))).await?;
+
+    if !vm_on {
+        run_bandwidth(bin, nic_group_args(vm, adapter, Some(&group))).await?;
+    }
+    Ok(None)
 }
 
 // ───────────────────── Guest Additions ─────────────────────
@@ -651,28 +802,29 @@ pub async fn ensure_dhcp(tools: &Tools, net: &str) -> Result<()> {
     Err(last_err.expect("al menos un intento"))
 }
 
-/// Nombres de red de los servidores DHCP heredados (`lablab-*`) en la salida de
-/// `VBoxManage list dhcpservers`.
-fn legacy_dhcp_networks(out: &str) -> Vec<String> {
+/// Nombres de red de los servidores DHCP que deben borrarse: los de redes
+/// gestionadas (`vmlab-*` y las antiguas `lablab-*`) que no estén en uso.
+fn orphan_dhcp_networks(out: &str, in_use: &HashSet<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     out.lines()
         .filter_map(|line| line.trim().strip_prefix("NetworkName:"))
         .map(str::trim)
-        .filter(|name| name.starts_with("lablab-") && validate::managed_network(name))
+        .filter(|name| validate::managed_network(name))
+        .filter(|name| !in_use.contains(*name))
         .filter(|name| seen.insert((*name).to_string()))
         .map(ToOwned::to_owned)
         .collect()
 }
 
-/// Borra los servidores DHCP de las redes antiguas `lablab-*`.
+/// Borra los servidores DHCP de redes gestionadas que el plan actual ya no usa.
 ///
 /// A diferencia de las redes internas (que desaparecen cuando ningún adaptador las
 /// usa), los servidores DHCP de VirtualBox persisten en su configuración. Se prueban
 /// las dos variantes de opción (`--network` en VirtualBox 7 y `--netname` en 6).
-pub async fn prune_legacy_dhcp(tools: &Tools) -> Result<()> {
+pub async fn prune_orphan_dhcp(tools: &Tools, in_use: &HashSet<String>) -> Result<()> {
     let bin = tools.vbox()?;
     let out = run_ok(bin, &["list", "dhcpservers"], SHORT).await?;
-    for net in legacy_dhcp_networks(&out.stdout) {
+    for net in orphan_dhcp_networks(&out.stdout, in_use) {
         let new_arg = format!("--network={net}");
         let old_arg = format!("--netname={net}");
         for net_arg in [new_arg.as_str(), old_arg.as_str()] {
@@ -802,21 +954,59 @@ mod tests {
     }
 
     #[test]
-    fn finds_only_legacy_dhcp_servers() {
+    fn finds_orphan_dhcp_servers_but_keeps_the_ones_in_use() {
         let out = "\
-NetworkName:    lablab-0a1b2c3d
+NetworkName:    vmlab-en-uso
 IP:             10.77.5.2
 Enabled:        Yes
 
-NetworkName:    vmlab-0a1b2c3d
+NetworkName:    vmlab-huerfano
 IP:             10.77.6.2
 Enabled:        Yes
 
-NetworkName:    lablab-
+NetworkName:    lablab-vieja
 IP:             10.77.7.2
 Enabled:        Yes
+
+NetworkName:    Mi Red
+IP:             10.77.8.2
+Enabled:        Yes
+
+NetworkName:    otra-red
+IP:             10.77.9.2
+Enabled:        Yes
+
+NetworkName:    lablab-
+IP:             10.77.10.2
+Enabled:        Yes
 ";
-        assert_eq!(legacy_dhcp_networks(out), vec!["lablab-0a1b2c3d".to_string()]);
+        let in_use: HashSet<String> = ["vmlab-en-uso".to_string()].into_iter().collect();
+        assert_eq!(
+            orphan_dhcp_networks(out, &in_use),
+            vec!["vmlab-huerfano".to_string(), "lablab-vieja".to_string()]
+        );
+    }
+
+    #[test]
+    fn isolated_intnet_accepts_a_custom_name() {
+        let cfg = NodeNet { name: Some("lab1".into()), ..Default::default() };
+        assert_eq!(internal_net_name(&cfg, None).unwrap(), Some("lab1"));
+    }
+
+    #[test]
+    fn isolated_intnet_rejects_an_option_like_name() {
+        let cfg = NodeNet { name: Some("--x".into()), ..Default::default() };
+        assert!(internal_net_name(&cfg, None).is_err());
+    }
+
+    #[test]
+    fn segment_network_wins_over_the_custom_name() {
+        let cfg = NodeNet { mode: NetMode::Intnet, name: Some("lab1".into()), ..Default::default() };
+        assert_eq!(internal_net_name(&cfg, Some("vmlab-0a1b2c3d")).unwrap(), Some("vmlab-0a1b2c3d"));
+
+        // Con red de segmento, un nombre propio inválido no se llega a validar.
+        let odd = NodeNet { mode: NetMode::Intnet, name: Some("--x".into()), ..Default::default() };
+        assert_eq!(internal_net_name(&odd, Some("vmlab-0a1b2c3d")).unwrap(), Some("vmlab-0a1b2c3d"));
     }
 
     #[test]
@@ -967,5 +1157,55 @@ SnapshotDescription-2="VMLab|2026-11-09T13:00:00Z|Inválida"
         assert!(no_snapshots("VBoxManage: error: This machine does not have any snapshots"));
         assert!(no_snapshots("No snapshots found"));
         assert!(!no_snapshots("VBoxManage: error: Could not find a snapshot named vmlab-x"));
+    }
+
+    #[test]
+    fn builds_bandwidthctl_and_modifyvm_arguments() {
+        fn strings(items: &[&str]) -> Vec<String> {
+            items.iter().map(|item| item.to_string()).collect()
+        }
+
+        assert_eq!(bandwidth_group(2), "vmlab-nic2");
+        assert_eq!(
+            bandwidth_set_args("Ubuntu", "vmlab-nic2", "1000k"),
+            strings(&["bandwidthctl", "Ubuntu", "set", "vmlab-nic2", "--limit", "1000k"])
+        );
+        assert_eq!(
+            bandwidth_add_args("Ubuntu", "vmlab-nic2", 1000),
+            strings(&[
+                "bandwidthctl", "Ubuntu", "add", "vmlab-nic2", "--type", "network", "--limit",
+                "1000k"
+            ])
+        );
+        assert_eq!(
+            bandwidth_remove_args("Ubuntu", "vmlab-nic2"),
+            strings(&["bandwidthctl", "Ubuntu", "remove", "vmlab-nic2"])
+        );
+        assert_eq!(
+            nic_group_args("Ubuntu", 2, Some("vmlab-nic2")),
+            strings(&["modifyvm", "Ubuntu", "--nicbandwidthgroup2", "vmlab-nic2"])
+        );
+        assert_eq!(
+            nic_group_args("Ubuntu", 1, None),
+            strings(&["modifyvm", "Ubuntu", "--nicbandwidthgroup1", "none"])
+        );
+    }
+
+    #[test]
+    fn reads_vm_state_and_bandwidth_groups() {
+        let out = r#"
+VMState="running"
+nic1="nat"
+nicbandwidthgroup1="none"
+nicbandwidthgroup2="vmlab-nic2"
+"#;
+        assert!(show_vm_on(out));
+        assert!(!show_vm_on("VMState=\"poweroff\""));
+        assert!(group_is_assigned(out, 2, "vmlab-nic2"));
+        assert!(!group_is_assigned(out, 1, "vmlab-nic2"));
+
+        let groups = "Name:           Limit:\nvmlab-nic2     1000 kbit/s\n";
+        assert!(list_has_group(groups, "vmlab-nic2"));
+        assert!(!list_has_group(groups, "vmlab-nic1"));
     }
 }

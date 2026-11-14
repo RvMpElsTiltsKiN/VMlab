@@ -207,6 +207,84 @@ Configurar la red dentro de una VM Linux ("Dentro de la VM · Linux"):
 
 
 ------------------------------------------------------------------------------
+  5B. FUNCIONES AVANZADAS
+------------------------------------------------------------------------------
+
+Aparecen en el panel derecho al seleccionar un nodo.
+
+MENÚ "LABORATORIO" (barra superior)
+  Plantillas… ............ crea un lienzo de ejemplo (servidor web + base de
+                           datos, dos máquinas en red interna, contenedores,
+                           VM atacante + objetivo). Los "huecos de VM" se
+                           asignan después con "Asignar una de tus VM".
+  Instantáneas… .......... guarda el estado de TODAS las máquinas del lienzo
+                           bajo un nombre y permite restaurarlo o borrarlo.
+  Importar lab… / Exportar lab…  guarda o carga el laboratorio completo en un
+                           archivo .vmlab, para compartirlo.
+  Importar docker-compose…  convierte los servicios de un docker-compose.yml
+                           en nodos del lienzo. Importa solo ficheros de confianza: Docker
+                           expande variables de tu Windows y lee ficheros
+                           env_file al interpretarlos.
+  Idioma / Language ...... Automático, Español o English.
+  Buscar actualizaciones al iniciar ... activa o desactiva la comprobación.
+  Acerca de VMLab… ....... versión y licencia.
+
+TERMINAL
+  Contenedor: "Abrir terminal" abre una consola dentro (docker exec).
+  VM: "Abrir terminal (SSH)" usa la IP detectada; hace falta un servidor SSH
+  en la VM. La contraseña la escribes en la ventana del terminal; VMLab no la
+  guarda. También hay un botón de terminal en la tarjeta del nodo.
+
+INSTANTÁNEAS DEL LAB
+  1. Menú Laboratorio > Instantáneas…
+  2. Escribe un nombre (p. ej. "Antes de instalar el servidor") y pulsa
+     "Guardar estado del lab".
+  3. Para volver, pulsa Restaurar en esa instantánea.
+  Ten en cuenta:
+    · Para restaurar una VM de VirtualBox, apágala antes (las encendidas no
+      se tocan).
+    · En Docker se conserva el contenedor original renombrado
+      (nombre-prerestore-FECHA). Los volúmenes y los puertos publicados NO
+      se conservan.
+    · El lienzo no se guarda en la instantánea: usa "Exportar lab".
+
+CONDICIONES DE RED ("Condiciones de red")
+  Simula enlaces reales. Eliges un preajuste (LAN, WAN, 4G, Satélite,
+  Conexión mala) o "Personalizado": ancho de banda, latencia, variación y
+  pérdida. Se aplica a TODO el tráfico que sale del nodo: dos nodos con 50 ms
+  dan un ping de ~100 ms. Pulsa "Aplicar condiciones" o "Quitar".
+    · Docker: el contenedor debe estar en marcha. La primera vez se descarga
+      la imagen nicolaka/netshoot (unos 100 MB). Las condiciones se pierden al
+      reiniciar el contenedor.
+    · VirtualBox: solo ancho de banda (latencia y pérdida no están
+      disponibles).
+  Un nodo con condiciones muestra una etiqueta en su tarjeta.
+
+CAPTURA DE PAQUETES
+  Guarda el tráfico del nodo en un .pcap. Elige filtro (todo, ICMP/ping, TCP,
+  UDP, ARP o un puerto), pulsa "Iniciar captura" y luego "Detener y abrir en
+  Wireshark". Las capturas anteriores aparecen en "Capturas recientes".
+    · Hace falta Wireshark para abrirlas; si no está, VMLab abre la carpeta.
+    · VirtualBox no admite filtros: captura todo el adaptador.
+    · Docker usa también la imagen netshoot.
+  Las capturas se guardan en la carpeta temporal (vmlab-captures). Bórralas
+  cuando no las necesites: pueden contener tráfico sensible.
+
+RED, IP Y NOMBRES
+  El apartado "Red" muestra IP (con botón de copiar), segmento y nombre DNS.
+  Los contenedores de la misma red VMLab se resuelven por nombre. En VMs
+  Linux, "Escribir nombres de la red en /etc/hosts" añade los nombres de las
+  demás VMs del segmento (las IP vienen de DHCP y pueden cambiar; si cambian,
+  vuelve a escribirlos).
+
+EJECUCIÓN DE CONTENEDORES ("Ejecución")
+  Variables de entorno y puertos publicados. Solo se aplican al CREAR el
+  contenedor; si ya existe, elimínalo para que VMLab lo cree de nuevo. Los
+  puertos solo se abren en 127.0.0.1 (tu equipo). Las variables se guardan en
+  el archivo del laboratorio: no escribas contraseñas si vas a compartirlo.
+
+
+------------------------------------------------------------------------------
   6. GUEST ADDITIONS (EL "PUENTE" CON LA VM)
 ------------------------------------------------------------------------------
 
@@ -246,6 +324,10 @@ Cuando termines, pulsa "Ya está instalado · comprobar".
     inicias, y puede tardar si hay que descargar la imagen.
   · Al aplicar la red, VMLab crea una red de Docker y conecta a ella los
     contenedores unidos por cables.
+
+Si VMLab arrancó Docker Desktop por ti, lo detiene al cerrar VMLab (y, solo si
+no hay otra distribución de WSL en marcha, apaga WSL para liberar memoria). Un
+Docker Desktop que ya estaba abierto no se toca.
 
 Si Docker está instalado pero apagado verás un aviso rojo en "Contenedores"
 con el botón "Iniciar Docker". VMLab abre Docker Desktop en segundo plano y
@@ -311,6 +393,10 @@ si necesitas buscarlo o pegarlo en una consulta.
   · "Iniciar" arranca las VMs sin ventana. Para ver la consola, usa "Iniciar
     con ventana" en el panel derecho.
   · Quitar una máquina del lienzo nunca la borra de VirtualBox ni de Docker.
+  · Solo Windows. No hay soporte para Hyper-V ni WSL2.
+  · La configuración dentro de la VM es para invitados Linux.
+  · Los mensajes técnicos del motor están en español, también con la interfaz
+    en inglés.
 
 
 ------------------------------------------------------------------------------
@@ -322,6 +408,10 @@ si necesitas buscarlo o pegarlo en una consulta.
   · Las contraseñas de las VMs no se guardan nunca. Se piden cada vez.
   · VMLab ejecuta VBoxManage y docker en tu equipo, sin intérprete de
     comandos intermedio, y valida los nombres que escribes antes de usarlos.
+  · Actualizaciones: al iniciar, VMLab puede consultar GitHub por una versión
+    nueva (verificada con firma). Se desactiva en el menú Laboratorio. No hay
+    telemetría.
+  · Los puertos de contenedores solo se abren en 127.0.0.1.
 
 
 ------------------------------------------------------------------------------
@@ -346,6 +436,9 @@ nuevas (vmlab-…) y VMLab elimina las antiguas cuando quedan vacías.
   Devolver al panel ..... arrastrar el nodo hasta el panel izquierdo
   Cable verde ........... las dos máquinas se ven en la red
   Cable rojo ............ apagadas, sin IP, sin aplicar o en otro modo de red
+  Terminal .............. botón de terminal del nodo o del panel derecho
+  Guardar el lab ........ Laboratorio > Exportar lab… (.vmlab)
+  Volver atrás .......... Laboratorio > Instantáneas…
 
 ==============================================================================
   VMLab · MIT License · © 2026 RvMpElsTiltsKiN

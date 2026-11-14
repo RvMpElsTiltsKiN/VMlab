@@ -1,3 +1,4 @@
+import { t } from '../i18n';
 import type { MachineData } from '../types';
 import type { LabEdge, LabNode } from './labFile';
 
@@ -19,19 +20,31 @@ function edge(source: string, target: string): LabEdge {
 
 const webDatabase: LabTemplate = {
   id: 'web-database',
-  name: 'Servidor web + base de datos',
-  description: 'Nginx y MariaDB en contenedores, conectados entre sí.',
+  get name() { return t('template.web.name'); },
+  get description() { return t('template.web.description'); },
   nodes: [
-    node('web', 80, 100, { kind: 'docker', label: 'Servidor web', target: 'vmlab-web', image: 'nginx:alpine' }),
-    node('db', 300, 100, { kind: 'docker', label: 'Base de datos', target: 'vmlab-db', image: 'mariadb:11' }),
+    node('web', 80, 100, {
+      kind: 'docker',
+      get label() { return t('template.web.webLabel'); },
+      target: 'vmlab-web',
+      image: 'nginx:alpine',
+      run: { env: [], ports: [{ host: 8080, container: 80, proto: 'tcp' }] },
+    }),
+    node('db', 300, 100, {
+      kind: 'docker',
+      get label() { return t('template.web.dbLabel'); },
+      target: 'vmlab-db',
+      image: 'mariadb:11',
+      run: { env: [{ key: 'MARIADB_ALLOW_EMPTY_ROOT_PASSWORD', value: '1' }], ports: [] },
+    }),
   ],
   edges: [edge('web', 'db')],
 };
 
 const internalVms: LabTemplate = {
   id: 'internal-vms',
-  name: 'Dos máquinas en red interna',
-  description: 'Dos huecos para tus VM VirtualBox, unidos por una red interna.',
+  get name() { return t('template.internal.name'); },
+  get description() { return t('template.internal.description'); },
   nodes: [
     node('vm1', 80, 100, { kind: 'vbox', label: 'VM 1', target: '', slot: true, net: { mode: 'intnet', adapter: 2 } }),
     node('vm2', 300, 100, { kind: 'vbox', label: 'VM 2', target: '', slot: true, net: { mode: 'intnet', adapter: 2 } }),
@@ -41,23 +54,49 @@ const internalVms: LabTemplate = {
 
 const containers: LabTemplate = {
   id: 'containers',
-  name: 'Contenedores en red',
-  description: 'Tres contenedores Alpine conectados en una red local de Docker.',
+  get name() { return t('template.containers.name'); },
+  get description() { return t('template.containers.description'); },
   nodes: [
-    node('a', 80, 100, { kind: 'docker', label: 'Contenedor A', target: 'vmlab-a', image: 'alpine:3.20' }),
-    node('b', 300, 100, { kind: 'docker', label: 'Contenedor B', target: 'vmlab-b', image: 'alpine:3.20' }),
-    node('c', 520, 100, { kind: 'docker', label: 'Contenedor C', target: 'vmlab-c', image: 'alpine:3.20' }),
+    node('a', 80, 100, {
+      kind: 'docker',
+      get label() { return t('template.containers.label', { letter: 'A' }); },
+      target: 'vmlab-a',
+      image: 'alpine:3.20',
+    }),
+    node('b', 300, 100, {
+      kind: 'docker',
+      get label() { return t('template.containers.label', { letter: 'B' }); },
+      target: 'vmlab-b',
+      image: 'alpine:3.20',
+    }),
+    node('c', 520, 100, {
+      kind: 'docker',
+      get label() { return t('template.containers.label', { letter: 'C' }); },
+      target: 'vmlab-c',
+      image: 'alpine:3.20',
+    }),
   ],
   edges: [edge('a', 'b'), edge('b', 'c'), edge('a', 'c')],
 };
 
 const attackerTarget: LabTemplate = {
   id: 'attacker-target',
-  name: 'VM atacante + contenedor objetivo',
-  description: 'Una VM VirtualBox y un Nginx en contenedor, unidos por una red interna.',
+  get name() { return t('template.attacker.name'); },
+  get description() { return t('template.attacker.description'); },
   nodes: [
-    node('attacker', 80, 100, { kind: 'vbox', label: 'VM atacante', target: '', slot: true, net: { mode: 'intnet', adapter: 2 } }),
-    node('target', 300, 100, { kind: 'docker', label: 'Objetivo', target: 'vmlab-target', image: 'nginx:alpine' }),
+    node('attacker', 80, 100, {
+      kind: 'vbox',
+      get label() { return t('template.attacker.attackerLabel'); },
+      target: '',
+      slot: true,
+      net: { mode: 'intnet', adapter: 2 },
+    }),
+    node('target', 300, 100, {
+      kind: 'docker',
+      get label() { return t('template.attacker.targetLabel'); },
+      target: 'vmlab-target',
+      image: 'nginx:alpine',
+    }),
   ],
   edges: [edge('attacker', 'target')],
 };

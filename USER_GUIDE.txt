@@ -1,0 +1,412 @@
+==============================================================================
+  VMLab · User Guide
+==============================================================================
+
+VMLab is a canvas where you draw your lab: drag in your VirtualBox virtual
+machines and Docker containers, join them with cables so they form a network,
+and power them on or off with one click. No more digging through VirtualBox
+settings adapter by adapter or writing network files by hand inside each VM.
+
+This guide takes you from zero to two machines talking to each other, and then
+through the advanced features.
+
+
+------------------------------------------------------------------------------
+  1. BEFORE YOU START
+------------------------------------------------------------------------------
+
+You need (VMLab does not include them):
+
+  · VirtualBox, if you will use virtual machines.
+  · Docker Desktop, if you will use containers.
+  · Optional: Wireshark, to open packet captures.
+
+You can use just one of the two. At the top left you will see two badges,
+"VirtualBox" and "Docker":
+
+  Green .... found and working.
+  Red ...... not installed or (Docker) installed but not running.
+
+Tip: to configure the network inside a Linux VM without opening its window,
+the VM needs VirtualBox "Guest Additions" (see section 6).
+
+
+------------------------------------------------------------------------------
+  2. THE WINDOW AT A GLANCE
+------------------------------------------------------------------------------
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ VMLab [Lab ▾] [Apply network] [Start all] [Stop all] [Lock canvas]  │
+  ├────────────┬─────────────────────────────────────┬───────────────────┤
+  │ LEFT       │                                     │ RIGHT             │
+  │ PANEL      │            CANVAS                   │ PANEL             │
+  │            │       (you draw here)               │                   │
+  │ Your VMs   │                                     │ Details of the    │
+  │ and        │                                     │ selection, or a   │
+  │ containers │                                     │ summary of nets   │
+  └────────────┴─────────────────────────────────────┴───────────────────┘
+
+  · Top bar: general actions, the Lab menu, the light/dark theme button and the
+    window controls.
+  · Left panel: everything VMLab found on your computer.
+  · Canvas: your lab.
+  · Right panel: with nothing selected it shows your networks; click a machine
+    to see its options.
+
+
+------------------------------------------------------------------------------
+  3. YOUR FIRST LAB, STEP BY STEP
+------------------------------------------------------------------------------
+
+Example: two virtual machines that can see each other.
+
+  STEP 1 · Add the machines to the canvas
+    In the left panel, under "Virtual machines", drag two VMs onto the canvas
+    (or double-click each one). The refresh button next to "Tools" makes VMLab
+    search again.
+
+  STEP 2 · Join them with a cable
+    Hover over a node: dots appear on its four sides. Drag from one of those
+    dots to the other node. That's a cable. Cables have no direction. All
+    nodes joined together form ONE network.
+
+  STEP 3 · Choose how they connect (optional)
+    Click a VM. In the right panel, under "Network · adapter", the default is
+    "Internal network (VMLab)", exactly what this example needs.
+
+  STEP 4 · Power the VMs off and press "Apply network"
+    VirtualBox only lets you change adapters while the VM is off. VMLab
+    creates the network and assigns it. You will see a notice, and with
+    nothing selected the right panel shows "Last apply" with the result.
+
+  STEP 5 · Start and check
+    Press "Start all" (or ▶ on each node). When both machines have an IP on
+    the same network the cable turns GREEN and animated. If it stays red, see
+    section 8.
+
+
+------------------------------------------------------------------------------
+  4. THE CANVAS
+------------------------------------------------------------------------------
+
+Each machine is a card with its name, type (VirtualBox or Docker), state and
+buttons: start/stop, restart, terminal, and copy IP.
+
+States:
+
+  Running ......... on (pulsing green dot).
+  Stopped ......... off.
+  Paused .......... paused.
+  Not created ..... container that doesn't exist yet: it is created the first
+                    time you start it.
+  Disconnected .... VMLab can't talk to VirtualBox or Docker.
+
+Cables:
+
+  Green, animated . both machines are on and have an IP in the same network.
+  Red ............. no link yet (off, no IP, adapter not connected, or network
+                    not applied).
+
+More:
+
+  · Move: drag the card. It snaps to a grid.
+  · Delete a node or cable: select it and press Delete/Backspace. Removing a
+    node from the canvas does NOT delete the machine or container.
+  · Return a node to the panel: drag it onto the left panel ("Drop here to
+    return it to the panel").
+  · Zoom and pan: mouse wheel and drag the background. Minimap bottom right.
+  · "Lock canvas": freezes zoom and pan while you drag nodes. VMLab remembers
+    it.
+  · Light/dark theme: sun/moon button in the top bar.
+  · Your canvas autosaves.
+
+
+------------------------------------------------------------------------------
+  5. THE RIGHT PANEL
+------------------------------------------------------------------------------
+
+NOTHING SELECTED: shows your networks ("Network 1", "Network 2"…) with members
+and a status: "Communication detected" or "No communication" (with the reason
+when known). It also warns when a network mixes VirtualBox and Docker or a VM
+has its adapter outside the internal network.
+
+A MACHINE SELECTED:
+
+  · Name on canvas: changeable (affects VMLab only).
+  · Power buttons: Start, Start with window (VMs), Stop, Restart, Pause /
+    Resume, Force stop (like pulling the plug).
+  · Docker containers: you can also change the image.
+
+VM network mode ("Network · adapter N"): choose the adapter (NIC 1–4, default
+2) and mode:
+
+  Internal network (VMLab) ... private network between joined VMs, no
+                               internet. VMLab creates it plus a built-in DHCP
+                               server so machines get IPs by themselves.
+  NAT ......................... the VM reaches the internet; not visible to
+                               other VMs.
+  Bridged adapter ............. the VM appears as another computer on your
+                               physical network. Enter your host interface
+                               name (e.g. "Wi-Fi" or "Ethernet").
+  Host-only ................... private network between VM and your PC. Enter
+                               the adapter name (e.g. vboxnet0).
+  NAT network ................. several VMs share a network with internet
+                               access. Enter the NAT network name.
+  Not attached ................ adapter disconnected.
+
+  Important:
+  · Adapter 1 is usually the NAT the VM uses for the internet. VMLab does not
+    touch it unless you choose it.
+  · If a VM has cables but its mode is NOT "Internal network", the cable is
+    not part of the canvas network and VMLab warns you.
+  · Changes are applied with "Apply network", with the VM powered off.
+
+Configure the network inside a Linux VM ("Inside the VM · Linux"):
+
+  Needs: VM RUNNING, Guest Additions installed, and a VM user that is root or
+  has passwordless sudo.
+
+    1. Enter the VM user and password. The password is used only for the
+       operation and is never stored.
+    2. Press "Detect network system". VMLab detects Netplan, NetworkManager,
+       systemd-networkd, ifupdown, wicked, dhcpcd, ConnMan or network-scripts
+       and lists the interfaces and the exact file it would write.
+    3. Leave "System" on Automatic (recommended) and choose the "Interface"
+       (e.g. the second one: eth1 or enp0s8).
+    4. Choose the IP mode:
+         DHCP ........... the machine asks the network for an IP.
+         Static ......... enter IP, prefix (24 = 255.255.255.0), gateway and
+                          optional DNS separated by commas.
+         DHCP server .... the machine hands out IPs (writes dhcpd.conf).
+                          Needs ISC dhcpd installed. Disable the built-in DHCP
+                          of that network to avoid having two.
+    5. Press "Write configuration".
+
+
+------------------------------------------------------------------------------
+  5B. ADVANCED FEATURES
+------------------------------------------------------------------------------
+
+THE "LAB" MENU (top bar)
+  Templates… ............. creates an example canvas (web + database, two
+                           machines on an internal network, containers,
+                           attacker VM + target). VM "slots" are assigned
+                           afterwards with "Assign one of your VMs".
+  Snapshots… ............. saves the state of ALL machines on the canvas under
+                           one name; restore or delete it later.
+  Import lab… / Export lab…  save/load the whole lab as a .vmlab file to share.
+  Import docker-compose…   turns the services of a docker-compose.yml into
+                           canvas nodes. Import only files you trust: Docker
+                           expands variables from your Windows environment and
+                           reads env_file paths while parsing.
+  Language / Idioma ...... Automatic, Español or English.
+  Check for updates on start ... turn the check on or off.
+  About VMLab… ........... version and license.
+
+TERMINAL
+  Container: "Open terminal" opens a shell inside it (docker exec).
+  VM: "Open terminal (SSH)" uses the detected IP; the VM needs an SSH server.
+  You type the password in the terminal window; VMLab never stores it. There
+  is also a terminal button on the node card.
+
+LAB SNAPSHOTS
+  1. Lab menu > Snapshots…
+  2. Type a name (e.g. "Before installing the server") and press "Save lab
+     state".
+  3. To go back, press Restore on that snapshot.
+  Keep in mind:
+    · To restore a VirtualBox VM, power it off first (running ones are not
+      touched).
+    · For Docker, the original container is kept, renamed
+      (name-prerestore-TIMESTAMP). Volumes and published ports are NOT kept.
+    · The canvas layout is not part of the snapshot: use "Export lab".
+
+NETWORK CONDITIONS
+  Simulate real links. Pick a preset (LAN, WAN, 4G, Satellite, Bad
+  connection) or "Custom": bandwidth, latency, jitter and loss. It applies to
+  ALL traffic leaving the node: two nodes with 50 ms each give a ~100 ms ping.
+  Press "Apply conditions" or "Remove".
+    · Docker: the container must be running. The first time, the
+      nicolaka/netshoot image is downloaded (~100 MB). Conditions are lost when
+      the container restarts.
+    · VirtualBox: bandwidth only (no latency or loss).
+  A node with conditions shows a badge on its card.
+
+PACKET CAPTURE
+  Saves the node's traffic to a .pcap. Pick a filter (all, ICMP/ping, TCP,
+  UDP, ARP or a port), press "Start capture", then "Stop and open in
+  Wireshark". Older captures are under "Recent captures".
+    · Wireshark is needed to open them; if missing, VMLab opens the folder.
+    · VirtualBox has no filters: it captures the whole adapter.
+    · Docker also uses the netshoot image.
+  Captures live in the temp folder (vmlab-captures). Delete them when done:
+  they may contain sensitive traffic.
+
+NETWORK, IP AND NAMES
+  The "Network" section shows the IP (with copy button), segment and DNS name.
+  Containers on the same VMLab network resolve each other by name. In Linux
+  VMs, "Write network names to /etc/hosts" adds the names of the other VMs in
+  the segment (IPs come from DHCP and may change; rewrite the list if so).
+
+CONTAINER RUN OPTIONS ("Run")
+  Environment variables and published ports. They only apply when the
+  container is CREATED; if it already exists, delete it so VMLab recreates it.
+  Ports are opened only on 127.0.0.1 (this computer). Variables are saved in
+  the lab file: don't type passwords if you will share it.
+
+
+------------------------------------------------------------------------------
+  6. GUEST ADDITIONS (THE "BRIDGE" TO THE VM)
+------------------------------------------------------------------------------
+
+Guest Additions are a VirtualBox add-on installed inside the VM. Without them
+VMLab can't write the network config inside the machine or read its IP (so the
+cable wouldn't turn green).
+
+In the left panel each VM shows a label:
+
+  "Guest Additions 7.x.x" ........ installed.
+  "Install Guest Additions" ...... not present; press to prepare them.
+  "no data" ...................... VirtualBox couldn't query the VM (e.g. it is
+                                   locked by its window).
+
+Pressing "Install Guest Additions" mounts the install disc in the VM (and
+opens it if it was off). The last step is done inside the VM; the panel tells
+you how:
+
+  Windows:  open the CD drive, run VBoxWindowsAdditions.exe as administrator
+            and reboot.
+  Linux:    sudo mount /dev/cdrom /mnt
+            sudo /mnt/VBoxLinuxAdditions.run
+            (if it asks for a compiler, install build-essential and your
+            kernel headers).
+
+Then press "Already installed · check".
+
+
+------------------------------------------------------------------------------
+  7. DOCKER CONTAINERS
+------------------------------------------------------------------------------
+
+  · Existing containers appear under "Containers".
+  · For a new one use "New container": type a name (letters, digits, "_", "."
+    or "-") and an image (e.g. nginx:latest) and press "Add to canvas". The
+    container is really created the first time you start it (it may take a
+    while if the image must be downloaded).
+  · On "Apply network", VMLab creates a Docker network and connects the
+    containers joined by cables.
+
+If VMLab started Docker Desktop for you, it stops it when you close VMLab (and,
+only if no other WSL distribution is running, shuts WSL down to free memory).
+A Docker Desktop that was already running is left alone.
+
+If Docker is installed but stopped you will see a red notice under
+"Containers" with a "Start Docker" button. VMLab opens Docker Desktop in the
+background and waits up to 3 minutes for the engine. To keep Docker Desktop
+from opening its dashboard, VMLab turns off "Open Docker Dashboard at startup"
+in Docker's settings; you can turn it back on there.
+
+"Technical details" shows the original error if you need to search for it.
+
+
+------------------------------------------------------------------------------
+  8. IF SOMETHING DOESN'T WORK
+------------------------------------------------------------------------------
+
+"The cable stays red although both machines are on"
+  Usually one of these:
+   1. You didn't press "Apply network" (or did it with the VM running).
+   2. The machine has no IP: on the internal network VMLab's DHCP should
+      provide one, but the VM's OS must use that adapter. Many server Linux
+      images leave the second adapter unconfigured: use "Inside the VM ·
+      Linux" to enable it with DHCP.
+   3. Guest Additions are missing: VMLab can't read the IP without them.
+   4. The adapter is in NAT, bridged or another non-"Internal network" mode.
+  With nothing selected, the right panel shows the reason when it knows it.
+
+"Apply network" fails on a VM
+  Power it fully off (a saved or paused state doesn't count) and retry.
+
+"Docker is red"
+  If Docker Desktop is installed, press "Start Docker" or open it and wait for
+  "Engine running", then press refresh in the left panel. If Docker Desktop
+  won't start by itself it's usually WSL 2: try "wsl --update" in PowerShell
+  and restart Docker.
+
+"Detect network system" fails or says no Guest Additions
+  Check the VM is RUNNING and finished booting, user/password are right and
+  the user is root or has passwordless sudo. Install Guest Additions if
+  missing (section 6).
+
+"My container shows 'Not created'"
+  Normal: it doesn't exist yet. It is created with the given image the first
+  time you press ▶.
+
+"Network conditions / capture say they need an image"
+  VMLab needs to download nicolaka/netshoot once (~100 MB). Accept and wait.
+
+"Windows warns about an unknown publisher when installing"
+  The installer is not code-signed. Click "More info" then "Run anyway" (only
+  if you downloaded it from this project's Releases page).
+
+
+------------------------------------------------------------------------------
+  9. LIMITS TO KNOW
+------------------------------------------------------------------------------
+
+  · A network mixing VirtualBox VMs and Docker containers is flagged but not
+    bridged: each technology stays on its own network.
+  · VM adapters can only be changed while the VM is off.
+  · "Start" boots VMs headless. Use "Start with window" in the right panel to
+    see the console.
+  · Paused VMs show as "Running" (a VirtualBox listing limitation).
+  · Removing a machine from the canvas never deletes it.
+  · Windows only. No Hyper-V or WSL2 support.
+  · In-guest configuration is for Linux guests.
+  · Technical messages from the engine are in Spanish, even with the English
+    UI.
+
+
+------------------------------------------------------------------------------
+  10. YOUR DATA AND PRIVACY
+------------------------------------------------------------------------------
+
+  · The canvas (nodes, cables, names, network settings) is stored on your
+    computer, in the app's data folder. It is not sent anywhere.
+  · VM passwords are never stored. They are asked for each time.
+  · VMLab runs VBoxManage and docker on your machine with no intermediate
+    shell, and validates the names you type before using them.
+  · Updates: on start, VMLab can check GitHub for a new version (verified by
+    signature). Turn it off in the Lab menu. There is no telemetry.
+  · Container ports are opened only on 127.0.0.1.
+
+
+------------------------------------------------------------------------------
+  11. COMING FROM LABLAB
+------------------------------------------------------------------------------
+
+VMLab is the new name of LabLab. On first launch it copies your canvas and
+preferences from the old folder, deleting nothing. On "Apply network", machines
+move from the old networks (lablab-…) to the new ones (vmlab-…) and VMLab
+removes the old ones once empty.
+
+
+------------------------------------------------------------------------------
+  QUICK CHEAT SHEET
+------------------------------------------------------------------------------
+
+  Add a machine ......... drag from the left panel, or double-click
+  Connect ............... drag from a node's dot to another node
+  Apply the network ..... "Apply network" button (VMs powered OFF)
+  Power on / off ........ ▶ ■ on each node, or "Start all" / "Stop all"
+  Delete node or cable .. select + Delete
+  Return to panel ....... drag the node onto the left panel
+  Green cable ........... both machines see each other on the network
+  Red cable ............. off, no IP, not applied, or another network mode
+  Terminal .............. node's terminal button or the right panel
+  Save the lab .......... Lab > Export lab… (.vmlab)
+  Go back in time ....... Lab > Snapshots…
+
+==============================================================================
+  VMLab · MIT License · © 2026 RvMpElsTiltsKiN
+==============================================================================

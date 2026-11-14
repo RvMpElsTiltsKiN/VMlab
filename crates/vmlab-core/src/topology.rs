@@ -87,7 +87,7 @@ mod tests {
     use crate::model::Edge;
 
     fn n(id: &str, kind: NodeKind) -> NodeSpec {
-        NodeSpec { id: id.into(), kind, target: id.into(), image: None, label: None, net: None }
+        NodeSpec { id: id.into(), kind, target: id.into(), image: None, options: None, label: None, net: None, link: None }
     }
     fn e(a: &str, b: &str) -> Edge {
         Edge { from: a.into(), to: b.into() }

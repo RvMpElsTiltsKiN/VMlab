@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useT } from '../i18n';
 import { isTauri, windowControls } from '../lib/ipc';
 import { useLab } from '../store/useLab';
 import { CloseIcon, LockIcon, Logo, MaxIcon, MinIcon, MoonIcon, NetworkIcon, PlayIcon, RestoreIcon, StopIcon, SunIcon, UnlockIcon } from './icons';
@@ -10,6 +11,7 @@ import { LabMenu } from './LabMenu';
  * por eso los botones siguen siendo clicables y el resto de la barra arrastra la ventana.
  */
 export function TitleBar() {
+  const t = useT();
   const theme = useLab((s) => s.theme);
   const toggleTheme = useLab((s) => s.toggleTheme);
   const applying = useLab((s) => s.applying);
@@ -37,40 +39,43 @@ export function TitleBar() {
 
       <div className="titlebar-actions">
         <LabMenu />
-        <button className="btn primary" onClick={applyNetwork} disabled={!hasNodes || applying || labsnapBusy} title="Crea las redes definidas por las conexiones">
-          <NetworkIcon /> {applying ? 'Aplicando…' : 'Aplicar red'}
+        <button className="btn primary" onClick={applyNetwork} disabled={!hasNodes || applying || labsnapBusy} title={t('titlebar.applyHint')}>
+          <NetworkIcon /> {applying ? t('titlebar.applying') : t('titlebar.apply')}
         </button>
-        <button className="btn" onClick={() => actAll('start')} disabled={!hasNodes || labsnapBusy} title="Iniciar todas las máquinas del lienzo">
-          <PlayIcon /> Iniciar todo
+        <button className="btn" onClick={() => actAll('start')} disabled={!hasNodes || labsnapBusy} title={t('titlebar.startAllHint')}>
+          <PlayIcon /> {t('titlebar.startAll')}
         </button>
-        <button className="btn" onClick={() => actAll('stop')} disabled={!hasNodes || labsnapBusy} title="Detener todas las máquinas del lienzo">
-          <StopIcon /> Detener todo
+        <button className="btn" onClick={() => actAll('stop')} disabled={!hasNodes || labsnapBusy} title={t('titlebar.stopAllHint')}>
+          <StopIcon /> {t('titlebar.stopAll')}
         </button>
         <button
           className={`btn lock-toggle ${canvasLocked ? 'on' : ''}`}
           onClick={toggleCanvasLock}
           aria-pressed={canvasLocked}
-          title={canvasLocked
-            ? 'Lienzo bloqueado: no se desplaza ni hace zoom. Pulsa para desbloquear.'
-            : 'Bloquear el lienzo para que no se desplace al arrastrar nodos'}
+          title={canvasLocked ? t('titlebar.lockedHint') : t('titlebar.lockHint')}
         >
-          {canvasLocked ? <LockIcon /> : <UnlockIcon />} {canvasLocked ? 'Lienzo bloqueado' : 'Bloquear lienzo'}
+          {canvasLocked ? <LockIcon /> : <UnlockIcon />} {canvasLocked ? t('titlebar.locked') : t('titlebar.lock')}
         </button>
       </div>
 
       <div className="titlebar-spacer" data-tauri-drag-region />
 
-      <button className="icon-btn" onClick={toggleTheme} title={theme === 'dark' ? 'Modo claro' : 'Modo oscuro'} aria-label="Cambiar tema">
+      <button
+        className="icon-btn"
+        onClick={toggleTheme}
+        title={theme === 'dark' ? t('titlebar.lightMode') : t('titlebar.darkMode')}
+        aria-label={t('titlebar.changeTheme')}
+      >
         {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
       </button>
 
       {isTauri && (
         <div className="win-controls">
-          <button onClick={() => windowControls.minimize()} aria-label="Minimizar"><MinIcon /></button>
-          <button onClick={() => windowControls.toggleMaximize()} aria-label={maximized ? 'Restaurar' : 'Maximizar'}>
+          <button onClick={() => windowControls.minimize()} aria-label={t('titlebar.minimize')}><MinIcon /></button>
+          <button onClick={() => windowControls.toggleMaximize()} aria-label={maximized ? t('titlebar.restore') : t('titlebar.maximize')}>
             {maximized ? <RestoreIcon /> : <MaxIcon />}
           </button>
-          <button className="close" onClick={() => windowControls.close()} aria-label="Cerrar"><CloseIcon /></button>
+          <button className="close" onClick={() => windowControls.close()} aria-label={t('titlebar.close')}><CloseIcon /></button>
         </div>
       )}
     </header>

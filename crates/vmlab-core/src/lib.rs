@@ -5,6 +5,8 @@
 //! 1. Nunca se invoca un shell: cada comando es `programa + argv[]`.
 //! 2. Toda cadena que viene de la UI se valida antes de convertirse en argumento.
 //! 3. Todo proceso tiene timeout y se mata si se cancela (`kill_on_drop`).
+pub mod capture;
+pub mod compose;
 pub mod connectivity;
 pub mod docker;
 pub mod docker_desktop;
@@ -13,6 +15,7 @@ pub mod error;
 pub mod guest;
 pub mod labsnap;
 pub mod model;
+pub mod netem;
 pub mod runner;
 pub mod terminal;
 pub mod tools;
