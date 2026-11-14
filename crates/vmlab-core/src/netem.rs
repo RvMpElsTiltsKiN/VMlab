@@ -146,7 +146,7 @@ pub async fn is_running(tools: &Tools, container: &str) -> Result<bool> {
         return Ok(out.stdout.trim().eq_ignore_ascii_case("true"));
     }
     let message = output_message(&out);
-    if message.to_ascii_lowercase().contains("no such") {
+    if crate::docker::no_such_container(&message) {
         Ok(false)
     } else {
         Err(CoreError::Failed {

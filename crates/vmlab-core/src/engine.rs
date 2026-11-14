@@ -279,13 +279,13 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
     }
 
     // Limpieza: servidores DHCP de redes gestionadas que el plan ya no usa, y
-    // redes Docker sin contenedores.
+    // redes Docker sin contenedores. `in_use` protege las redes del plan actual.
+    let in_use: HashSet<String> = plan.segments.iter().map(|s| s.name.clone()).collect();
     if tools.vboxmanage.is_some() {
-        let in_use: HashSet<String> = plan.segments.iter().map(|s| s.name.clone()).collect();
         let _ = vbox::prune_orphan_dhcp(tools, &in_use).await;
     }
     if tools.docker.is_some() {
-        let _ = docker::prune_networks(tools).await;
+        let _ = docker::prune_networks(tools, &in_use).await;
     }
     rep
 }

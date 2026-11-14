@@ -5,6 +5,7 @@ use crate::model::{Action, DockerRunOptions, LinkInfo, PowerState};
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
 use crate::validate;
+use std::collections::HashSet;
 use std::time::Duration;
 
 const SHORT: Duration = Duration::from_secs(20);
@@ -162,7 +163,7 @@ pub async fn exists(tools: &Tools, name: &str) -> Result<bool> {
     validate::container_name(name)?;
     match run_ok(tools.docker()?, &["inspect", "-f", "{{.Id}}", name], SHORT).await {
         Ok(_) => Ok(true),
-        Err(CoreError::Failed { stderr, .. }) if stderr.contains("No such") => Ok(false),
+        Err(CoreError::Failed { stderr, .. }) if no_such_container(&stderr) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -177,7 +178,15 @@ pub async fn create_on_network(
 ) -> Result<()> {
     let args = create_args(name, image, options, network)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_ok(tools.docker()?, &refs, LONG).await.map(|_| ())
+    run_ok(tools.docker()?, &refs, LONG)
+        .await
+        .map(|_| ())
+        .map_err(|e| create_failure(name, e))
+}
+
+/// Error de creación con contexto: el nodo debe decir que no se pudo crear.
+fn create_failure(name: &str, error: CoreError) -> CoreError {
+    CoreError::Message(format!("no se pudo crear el contenedor «{name}»: {error}"))
 }
 
 pub async fn action(
@@ -194,7 +203,7 @@ pub async fn action(
             match run_ok(bin, &["start", name], SHORT).await {
                 Ok(_) => Ok(()),
                 // El contenedor no existe todavía: se crea desde la imagen del nodo.
-                Err(CoreError::Failed { stderr, .. }) if stderr.contains("No such container") => {
+                Err(CoreError::Failed { stderr, .. }) if no_such_container(&stderr) => {
                     let image = image
                         .filter(|i| !i.is_empty())
                         .ok_or_else(|| CoreError::Invalid("el contenedor no existe y el nodo no tiene imagen".into()))?;
@@ -246,7 +255,7 @@ pub async fn set_networks(tools: &Tools, container: &str, keep: Option<&str>) ->
     let current = match vmlab_networks_of(tools, container).await {
         Ok(c) => c,
         // Contenedor aún sin crear: nada que desconectar, y tampoco se puede conectar todavía.
-        Err(CoreError::Failed { stderr, .. }) if stderr.contains("No such") => {
+        Err(CoreError::Failed { stderr, .. }) if no_such_container(&stderr) => {
             return match keep {
                 Some(_) => Err(CoreError::Invalid("el contenedor aún no existe: inícialo una vez y vuelve a aplicar".into())),
                 None => Ok(()),
@@ -260,19 +269,36 @@ pub async fn set_networks(tools: &Tools, container: &str, keep: Option<&str>) ->
     if let Some(net) = keep {
         validate::network_name(net)?;
         if !current.iter().any(|n| n == net) {
-            run_ok(bin, &["network", "connect", net, container], SHORT).await?;
+            // Un contenedor `created` puede no listar sus redes en `inspect` aunque
+            // se creara con `--network`; Docker responde "already exists in network".
+            match run_ok(bin, &["network", "connect", net, container], SHORT).await {
+                Ok(_) => {}
+                Err(CoreError::Failed { stderr, .. }) if already_in_network(&stderr) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(())
 }
 
+/// `true` si el error de `network connect` dice que el contenedor ya está conectado.
+fn already_in_network(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("already exists in network")
+}
+
+/// `true` si la red es gestionada por VMLab y no pertenece al plan actual.
+fn should_prune(name: &str, keep: &HashSet<String>) -> bool {
+    validate::managed_network(name) && !keep.contains(name)
+}
+
 /// Borra las redes `vmlab-*` y las antiguas `lablab-*` que ya no tienen
-/// contenedores (las que estén en uso fallan y se ignoran).
-pub async fn prune_networks(tools: &Tools) -> Result<()> {
+/// contenedores (las que estén en uso fallan y se ignoran). Nunca borra una red
+/// del plan actual, aunque todavía no tenga contenedores arrancados.
+pub async fn prune_networks(tools: &Tools, keep: &HashSet<String>) -> Result<()> {
     let bin = tools.docker()?;
     for filter in ["name=vmlab-", "name=lablab-"] {
         let out = run_ok(bin, &["network", "ls", "--filter", filter, "--format", "{{.Name}}"], SHORT).await?;
-        for net in out.stdout.lines().map(str::trim).filter(|n| validate::managed_network(n)) {
+        for net in out.stdout.lines().map(str::trim).filter(|n| should_prune(n, keep)) {
             let _ = run_ok(bin, &["network", "rm", net], SHORT).await;
         }
     }
@@ -408,11 +434,10 @@ fn output_message(out: &crate::runner::Output) -> String {
     raw.trim().chars().take(500).collect()
 }
 
-fn no_such_container(message: &str) -> bool {
+pub(crate) fn no_such_container(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     m.contains("no such container") || m.contains("no such object")
 }
-
 /// Nombre del contenedor original que se conserva antes de restaurar. Docker limita
 /// el nombre a 64 caracteres, así que se recorta la parte original si hace falta.
 pub fn prerestore_name(original: &str, stamp: &str) -> String {
@@ -587,6 +612,56 @@ mod tests {
         assert!(create_args("web", "--rm", None, "vmlab-abcd1234").is_err());
         assert!(create_args("web", "nginx:latest", None, "lab1").is_err());
         assert!(create_args("web", "nginx:latest", None, "--net").is_err());
+    }
+
+    #[test]
+    fn recognizes_missing_containers_regardless_of_case_and_wording() {
+        for message in [
+            "Error: No such object: x",
+            "error: no such object: x",
+            "Error response from daemon: No such container: x",
+            "ERROR: NO SUCH CONTAINER: x",
+        ] {
+            assert!(no_such_container(message), "{message}");
+        }
+        assert!(!no_such_container(
+            "permission denied while trying to connect to the Docker daemon socket"
+        ));
+    }
+
+    #[test]
+    fn creation_failures_mention_the_container() {
+        let error = create_failure(
+            "vmlab-web",
+            CoreError::Failed {
+                program: "docker".into(),
+                code: 1,
+                stderr: "error: no such object: vmlab-web".into(),
+            },
+        );
+        let text = error.to_string();
+        assert!(text.contains("no se pudo crear el contenedor «vmlab-web»"), "{text}");
+        assert!(text.contains("no such object"), "{text}");
+    }
+
+    #[test]
+    fn only_prunes_unused_managed_networks() {
+        let keep: HashSet<String> = ["vmlab-en-uso".to_string()].into_iter().collect();
+        assert!(!should_prune("vmlab-en-uso", &keep));
+        assert!(should_prune("vmlab-huerfana", &keep));
+        assert!(should_prune("lablab-vieja", &keep));
+        assert!(!should_prune("bridge", &keep));
+        assert!(!should_prune("otra-red", &keep));
+        assert!(!should_prune("vmlab-", &keep));
+    }
+
+    #[test]
+    fn recognizes_already_connected_networks() {
+        assert!(already_in_network(
+            "Error response from daemon: endpoint with name vmlab-web already exists in network vmlab-abcd1234"
+        ));
+        assert!(already_in_network("ALREADY EXISTS IN NETWORK vmlab-abcd1234"));
+        assert!(!already_in_network("permission denied while trying to connect to the Docker daemon socket"));
     }
 
     #[test]

@@ -332,7 +332,7 @@ pub async fn remove_docker_helper(tools: &Tools, id: &str) -> Result<()> {
     let name = format!("vmlab-cap-{id}");
     match run_ok(tools.docker()?, &["rm", "-f", &name], SHORT).await {
         Ok(_) => Ok(()),
-        Err(CoreError::Failed { stderr, .. }) if stderr.contains("No such container") => Ok(()),
+        Err(CoreError::Failed { stderr, .. }) if crate::docker::no_such_container(&stderr) => Ok(()),
         Err(e) => Err(e),
     }
 }
