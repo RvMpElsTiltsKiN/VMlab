@@ -11,14 +11,14 @@ fn vbox_state(running: bool) -> PowerState {
 
 /// Crea (sin arrancar) el contenedor de un nodo Docker del segmento cuando todavía
 /// no existe y el nodo tiene imagen. Sin imagen no se toca nada.
-async fn create_missing(tools: &Tools, n: &NodeSpec, network: &str) -> Result<()> {
+async fn create_missing(tools: &Tools, n: &NodeSpec) -> Result<()> {
     let Some(image) = n.image.as_deref().filter(|i| !i.is_empty()) else {
         return Ok(());
     };
     if docker::exists(tools, &n.target).await? {
         return Ok(());
     }
-    docker::create_on_network(tools, &n.target, image, n.options.as_ref(), network).await
+    docker::create_container(tools, &n.target, image, n.options.as_ref()).await
 }
 
 pub async fn inventory(tools: &Tools) -> Inventory {
@@ -179,7 +179,7 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
                     let ready = if docker_net_ready { Ok(()) } else { docker::ensure_network(tools, &seg.name).await };
                     docker_net_ready = ready.is_ok();
                     match ready {
-                        Ok(()) => match create_missing(tools, n, &seg.name).await {
+                        Ok(()) => match create_missing(tools, n).await {
                             Ok(()) => docker::set_networks(tools, &n.target, Some(&seg.name)).await,
                             Err(e) => Err(e),
                         },

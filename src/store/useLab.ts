@@ -37,6 +37,8 @@ export interface Toast {
   id: number;
   kind: 'ok' | 'info' | 'error';
   text: string;
+  /** Veces que se ha repetido el mismo mensaje de error consecutivo (empieza en 1). */
+  count: number;
 }
 
 interface LabState {
@@ -882,8 +884,30 @@ export const useLab = create<LabState>()((set, get) => ({
 
   toast(kind, text) {
     const id = ++toastSeq;
-    set((s) => ({ toasts: [...s.toasts.slice(-3), { id, kind, text }] }));
-    setTimeout(() => get().dismissToast(id), kind === 'error' ? 8000 : 3500);
+    if (kind !== 'error') {
+      // Éxito e información siguen desapareciendo solos.
+      set((s) => ({
+        toasts: [
+          ...s.toasts.filter((t) => t.kind === 'error'),
+          ...[...s.toasts.filter((t) => t.kind !== 'error'), { id, kind, text, count: 1 }].slice(-3),
+        ],
+      }));
+      setTimeout(() => get().dismissToast(id), 3500);
+      return;
+    }
+
+    // Los errores permanecen hasta que el usuario los cierre. Un mensaje
+    // idéntico al último error no se apila: solo incrementa su contador.
+    set((s) => {
+      const errors = s.toasts.filter((t) => t.kind === 'error');
+      const last = errors[errors.length - 1];
+      if (last && last.text === text) {
+        return { toasts: s.toasts.map((t) => (t.id === last.id ? { ...t, count: t.count + 1 } : t)) };
+      }
+      // Máximo 5 errores visibles: se descarta el más antiguo.
+      const next = [...errors, { id, kind, text, count: 1 }].slice(-5);
+      return { toasts: [...s.toasts.filter((t) => t.kind !== 'error'), ...next] };
+    });
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 }));

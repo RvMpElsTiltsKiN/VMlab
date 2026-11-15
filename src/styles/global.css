@@ -434,8 +434,21 @@ button:disabled { cursor: default; opacity: 0.45; }
   border-radius: 9px; padding: 10px 12px; box-shadow: var(--shadow); cursor: pointer; user-select: text;
   animation: slide 0.18s ease-out; white-space: pre-line;
 }
-.toast.error { border-left-color: var(--danger); }
+.toast.error { border-left-color: var(--danger); cursor: default; }
 .toast.info { border-left-color: var(--docker); }
+.toast-text { user-select: text; cursor: text; }
+.toast-actions {
+  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+  margin-top: 8px; user-select: none;
+}
+.toast-count {
+  margin-right: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.toast-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer;
+}
+.toast-btn:hover { background: var(--panel-2); color: var(--accent); }
 @keyframes slide { from { transform: translateY(8px); opacity: 0; } }
 
 /* ───────── Menú de laboratorio ───────── */

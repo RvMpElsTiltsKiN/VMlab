@@ -25,3 +25,8 @@ Thumbs.db
 *.tmp
 
 Instalador/
+
+# Claves, contraseñas y capturas de red
+*.key
+*.pwd
+*.pcap

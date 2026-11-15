@@ -139,21 +139,16 @@ pub fn run_args(name: &str, image: &str, opts: Option<&DockerRunOptions>) -> Res
     Ok(args)
 }
 
-/// Argumentos de `docker create` para crear el contenedor **sin arrancarlo**
-/// conectado ya a la red del segmento.
-pub fn create_args(
-    name: &str,
-    image: &str,
-    opts: Option<&DockerRunOptions>,
-    network: &str,
-) -> Result<Vec<String>> {
+/// Argumentos de `docker create` para crear el contenedor **sin arrancarlo**.
+///
+/// No fija `--network`: el contenedor queda en el bridge por defecto y la red del
+/// segmento se conecta después con `docker network connect` (`set_networks`), de
+/// modo que cambiar de segmento no deja el contenedor atado a una red eliminada.
+pub fn create_args(name: &str, image: &str, opts: Option<&DockerRunOptions>) -> Result<Vec<String>> {
     validate::container_name(name)?;
     validate::docker_image(image)?;
-    validate::network_name(network)?;
     let mut args = vec!["create".to_string(), "--name".to_string(), name.to_string()];
     args.extend(option_args(opts)?);
-    args.push("--network".to_string());
-    args.push(network.to_string());
     args.push(image.to_string());
     Ok(args)
 }
@@ -168,15 +163,14 @@ pub async fn exists(tools: &Tools, name: &str) -> Result<bool> {
     }
 }
 
-/// Crea el contenedor sin arrancarlo y lo deja conectado a `network`.
-pub async fn create_on_network(
+/// Crea el contenedor sin arrancarlo, en el bridge por defecto.
+pub async fn create_container(
     tools: &Tools,
     name: &str,
     image: &str,
     options: Option<&DockerRunOptions>,
-    network: &str,
 ) -> Result<()> {
-    let args = create_args(name, image, options, network)?;
+    let args = create_args(name, image, options)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ok(tools.docker()?, &refs, LONG)
         .await
@@ -263,6 +257,17 @@ pub async fn set_networks(tools: &Tools, container: &str, keep: Option<&str>) ->
         }
         Err(e) => return Err(e),
     };
+    let mode = run_ok(bin, &["inspect", "-f", "{{.HostConfig.NetworkMode}}", container], SHORT).await?;
+    if let Some(net) = bound_managed_network(mode.stdout.trim()) {
+        // Restos de versiones anteriores: el contenedor quedó atado a una red
+        // gestionada que ya no existe y Docker no lo arrancará. No se borra solo.
+        if run_ok(bin, &["network", "inspect", net], SHORT).await.is_err() {
+            return Err(CoreError::Invalid(format!(
+                "el contenedor «{container}» está atado a la red «{net}», que ya no existe; \
+                 elimínalo con `docker rm {container}` y vuelve a aplicar la red"
+            )));
+        }
+    }
     for net in current.iter().filter(|n| Some(n.as_str()) != keep) {
         run_ok(bin, &["network", "disconnect", "--force", net, container], SHORT).await?;
     }
@@ -284,6 +289,14 @@ pub async fn set_networks(tools: &Tools, container: &str, keep: Option<&str>) ->
 /// `true` si el error de `network connect` dice que el contenedor ya está conectado.
 fn already_in_network(message: &str) -> bool {
     message.to_ascii_lowercase().contains("already exists in network")
+}
+
+/// Si el `HostConfig.NetworkMode` ata el contenedor a una red gestionada,
+/// devuelve su nombre. `bridge`, `default`, `none`, `host` o `container:x`
+/// no cuentan como redes gestionadas.
+fn bound_managed_network(mode: &str) -> Option<&str> {
+    let mode = mode.trim();
+    validate::managed_network(mode).then_some(mode)
 }
 
 /// `true` si la red es gestionada por VMLab y no pertenece al plan actual.
@@ -580,13 +593,13 @@ mod tests {
     }
 
     #[test]
-    fn builds_create_args_with_env_ports_and_network() {
+    fn builds_create_args_with_env_and_ports() {
         let opts = DockerRunOptions {
             env: vec![EnvVar { key: "MYSQL_ROOT_PASSWORD".into(), value: "s3creto".into() }],
             ports: vec![PortMap { host: 8080, container: 80, proto: PortProto::Tcp }],
         };
         assert_eq!(
-            create_args("db", "postgres:16", Some(&opts), "vmlab-abcd1234").unwrap(),
+            create_args("db", "postgres:16", Some(&opts)).unwrap(),
             vec![
                 "create",
                 "--name",
@@ -595,23 +608,32 @@ mod tests {
                 "MYSQL_ROOT_PASSWORD=s3creto",
                 "-p",
                 "127.0.0.1:8080:80/tcp",
-                "--network",
-                "vmlab-abcd1234",
                 "postgres:16",
             ]
         );
         assert_eq!(
-            create_args("web", "nginx:latest", None, "vmlab-abcd1234").unwrap(),
-            vec!["create", "--name", "web", "--network", "vmlab-abcd1234", "nginx:latest"]
+            create_args("web", "nginx:latest", None).unwrap(),
+            vec!["create", "--name", "web", "nginx:latest"]
         );
     }
 
     #[test]
     fn rejects_invalid_create_args() {
-        assert!(create_args("--privileged", "nginx:latest", None, "vmlab-abcd1234").is_err());
-        assert!(create_args("web", "--rm", None, "vmlab-abcd1234").is_err());
-        assert!(create_args("web", "nginx:latest", None, "lab1").is_err());
-        assert!(create_args("web", "nginx:latest", None, "--net").is_err());
+        assert!(create_args("--privileged", "nginx:latest", None).is_err());
+        assert!(create_args("web", "--rm", None).is_err());
+        assert!(create_args("web", "nginx:latest", Some(&DockerRunOptions {
+            env: vec![EnvVar { key: "2BAD".into(), value: "x".into() }],
+            ..Default::default()
+        })).is_err());
+    }
+
+    #[test]
+    fn detects_containers_bound_to_managed_networks() {
+        assert_eq!(bound_managed_network("vmlab-4ddc310c"), Some("vmlab-4ddc310c"));
+        assert_eq!(bound_managed_network("lablab-vieja"), Some("lablab-vieja"));
+        for mode in ["bridge", "default", "none", "host", "container:web", "vmlab-", "mired"] {
+            assert_eq!(bound_managed_network(mode), None, "{mode}");
+        }
     }
 
     #[test]

@@ -478,6 +478,9 @@ export const en: Record<keyof typeof es, string> = {
   'toast.snapSaved': 'Snapshot “{label}”: {count} machine(s) saved',
   'toast.snapRestored': 'Snapshot “{label}”: {count} machine(s) restored',
   'toast.snapDeleted': 'Snapshot “{label}”: {count} machine(s) deleted',
+  'toast.copy': 'Copy',
+  'toast.copied': 'Copied',
+  'toast.dismiss': 'Close',
   'toast.unnamed': 'Unnamed',
 
   // ── .vmlab file warnings ─────────────────────────────────────────

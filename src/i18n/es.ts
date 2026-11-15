@@ -482,6 +482,9 @@ export const es = {
   'toast.snapSaved': 'Instantánea «{label}»: {count} máquina(s) guardada(s)',
   'toast.snapRestored': 'Instantánea «{label}»: {count} máquina(s) restaurada(s)',
   'toast.snapDeleted': 'Instantánea «{label}»: {count} máquina(s) borrada(s)',
+  'toast.copy': 'Copiar',
+  'toast.copied': 'Copiado',
+  'toast.dismiss': 'Cerrar',
   'toast.unnamed': 'Sin nombre',
 
   // ── Avisos de archivos .vmlab ────────────────────────────────────
