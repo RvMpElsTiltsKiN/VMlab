@@ -8,7 +8,7 @@
 Lienzo visual para montar laboratorios locales: arrastra máquinas de **VirtualBox** y contenedores **Docker**, conéctalas para definir redes y contrólalas con un clic. Y además: simula enlaces malos, ve todas las IP, captura paquetes, abre terminales, guarda instantáneas de todo el lab y compártelo en un solo archivo.
 
 <!-- Sustituye por tu captura / GIF (ver docs/screenshots/README.md) -->
-![Ventana principal de VMLab](docs/screenshots/main.png)
+<!-- ![Ventana principal de VMLab](docs/screenshots/main.png) -->
 
 ## Funciones
 
@@ -24,11 +24,11 @@ Lienzo visual para montar laboratorios locales: arrastra máquinas de **VirtualB
 - **Arranque silencioso de Docker Desktop** desde la app. Si lo arrancó VMLab, lo detiene al cerrar VMLab (y, solo si no hay otra distribución de WSL en marcha, apaga WSL para liberar memoria). Un Docker Desktop que ya estaba abierto nunca se toca.
 - **Interfaz bilingüe (español / inglés)**, tema claro/oscuro, comprobación de actualizaciones opcional e instalador pequeño (usa el WebView2 del sistema, sin Chromium embebido).
 
-## Capturas
-
+<!-- ## Capturas (activar cuando existan las capturas en docs/screenshots/)
 | Lienzo | Condiciones de red | Captura de paquetes |
 |---|---|---|
 | ![](docs/screenshots/canvas.png) | ![](docs/screenshots/conditions.png) | ![](docs/screenshots/capture.png) |
+-->
 
 ## Instalación
 

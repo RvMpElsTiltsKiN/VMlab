@@ -8,7 +8,7 @@
 A visual canvas to build local labs: drag **VirtualBox** VMs and **Docker** containers onto the canvas, wire them together to define networks, and control them with one click. Then go further: simulate bad links, see every IP, capture packets, open terminals, snapshot the whole lab and share it as a single file.
 
 <!-- Replace with your own capture / GIF (see docs/screenshots/README.md) -->
-![VMLab main window](docs/screenshots/main.png)
+<!-- ![VMLab main window](docs/screenshots/main.png) -->
 
 ## Features
 
@@ -24,11 +24,11 @@ A visual canvas to build local labs: drag **VirtualBox** VMs and **Docker** cont
 - **Silent Docker Desktop start** from the app. If VMLab started Docker Desktop, it stops it when you close VMLab (and, only if no other WSL distribution is running, shuts WSL down to free memory). A Docker Desktop that was already running is never touched.
 - **Bilingual UI (Spanish / English)**, light/dark theme, optional update check, small installer (uses the system WebView2, no embedded Chromium).
 
-## Screenshots
-
+<!-- ## Screenshots (activar cuando existan las capturas en docs/screenshots/)
 | Canvas | Network conditions | Packet capture |
 |---|---|---|
 | ![](docs/screenshots/canvas.png) | ![](docs/screenshots/conditions.png) | ![](docs/screenshots/capture.png) |
+-->
 
 ## Install
 
