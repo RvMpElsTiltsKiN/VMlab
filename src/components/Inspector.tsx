@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { technicalText, useLocale, useT, type Locale, type Translate } from '../i18n';
 import { groupLive, probeKey } from '../lib/connectivity';
-import { ipc } from '../lib/ipc';
+import { ipc, isTauri } from '../lib/ipc';
 import { charLength, ENV_KEY_RE, hasControlChars, RUN_LIMITS } from '../lib/labFile';
 import { hasLinkConditions, LINK_LIMITS, sameLink } from '../lib/link';
 import { resolveState, stateLabel } from '../lib/status';
@@ -23,7 +23,7 @@ import type {
   NetMode,
   NodeNet,
 } from '../types';
-import { TrashIcon } from './icons';
+import { CameraIcon, TrashIcon } from './icons';
 
 const DEFAULT_NET: NodeNet = { mode: 'intnet', adapter: 2 };
 
@@ -647,6 +647,76 @@ function CapturePanel({ node, state }: { node: MachineNode; state: string }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ScreenshotPanel({ node, state }: { node: MachineNode; state: string }) {
+  const t = useT();
+  const toast = useLab((s) => s.toast);
+  const [busy, setBusy] = useState(false);
+  const running = state === 'running';
+
+  const openFolder = useCallback(() => {
+    void ipc.openScreenshotsFolder().catch((e) => {
+      toast('error', technicalText(t('screenshot.folderError', { detail: errText(e) })));
+    });
+  }, [t, toast]);
+
+  const capture = useCallback(async () => {
+    if (!running || busy) return;
+    setBusy(true);
+    try {
+      const info = await ipc.takeScreenshot(node.data.target);
+      const bytes = await ipc.readScreenshot(info.path);
+      let copied = false;
+      if (isTauri) {
+        try {
+          const { writeImage } = await import('@tauri-apps/plugin-clipboard-manager');
+          await writeImage(bytes);
+          copied = true;
+        } catch {
+          // La captura ya está guardada: se avisa de que no se pudo copiar.
+        }
+      }
+      toast(
+        'ok',
+        copied ? t('screenshot.ok') : t('screenshot.okNoClipboard'),
+        { label: t('screenshot.openFolder'), onClick: openFolder },
+      );
+    } catch (e) {
+      toast('error', technicalText(t('screenshot.error', { detail: errText(e) })));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, node.data.target, openFolder, running, t, toast]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+      if (event.repeat) return;
+      if (event.key.toLowerCase() !== 'p') return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (target?.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (!running || busy) return;
+      event.preventDefault();
+      void capture();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [busy, capture, running]);
+
+  return (
+    <div className="screenshot-box">
+      <button
+        className="btn primary"
+        disabled={!running || busy}
+        title={running ? t('screenshot.shortcut') : t('screenshot.disabled')}
+        onClick={() => void capture()}
+      >
+        <CameraIcon /> {busy ? t('screenshot.busy') : t('screenshot.button')}
+      </button>
     </div>
   );
 }
@@ -1394,6 +1464,8 @@ export function Inspector() {
           {!isSlot && <LinkPanel node={node} state={state} />}
 
           {!isSlot && <CapturePanel node={node} state={state} />}
+
+          {node.data.kind === 'vbox' && !isSlot && <ScreenshotPanel node={node} state={state} />}
 
           {node.data.kind === 'vbox' && !isSlot && <GuestPanel node={node} state={state} />}
 

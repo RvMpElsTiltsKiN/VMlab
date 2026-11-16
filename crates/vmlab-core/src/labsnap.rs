@@ -44,7 +44,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn parts_from_unix(secs: u64) -> (i64, u32, u32, u64, u64, u64) {
+pub(crate) fn parts_from_unix(secs: u64) -> (i64, u32, u32, u64, u64, u64) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (year, month, day) = civil_from_days(days);

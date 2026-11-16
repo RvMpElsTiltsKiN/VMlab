@@ -314,6 +314,17 @@ export const es = {
   'capture.imageBodyAfter': '. La primera vez hay que descargarla: son unos 100 MB y puede tardar unos minutos.',
   'capture.imageApply': 'Descargar y capturar',
 
+  // Captura de pantalla
+  'screenshot.button': 'Captura de pantalla',
+  'screenshot.disabled': 'Inicia la máquina virtual para poder capturar la pantalla.',
+  'screenshot.shortcut': 'Captura la pantalla de la VM (Ctrl+Shift+P)',
+  'screenshot.busy': 'Capturando…',
+  'screenshot.ok': 'Captura guardada y copiada al portapapeles',
+  'screenshot.okNoClipboard': 'Captura guardada (no se pudo copiar al portapapeles)',
+  'screenshot.openFolder': 'Abrir carpeta',
+  'screenshot.error': 'No se pudo capturar la pantalla: {detail}',
+  'screenshot.folderError': 'No se pudo abrir la carpeta de capturas de pantalla: {detail}',
+
   // Información de red
   'info.title': 'Red',
   'info.ip': 'IP',
@@ -598,6 +609,7 @@ export const es = {
   'mock.vboxNoBpf': 'VirtualBox no admite filtros BPF; se capturará todo el tráfico del adaptador.',
   'mock.wiresharkDesktop': 'El simulador no abre Wireshark. En la app de escritorio se abriría {file}.',
   'mock.captureFolder': 'Se abriría la carpeta de capturas de VMLab (solo en la app de escritorio).',
+  'mock.screenshotFolder': 'Se abriría la carpeta de capturas de pantalla de VMLab (solo en la app de escritorio).',
   'mock.snapNameNeedsAlnum': 'el nombre debe incluir al menos una letra o un número',
   'mock.snapAlreadyExists': 'ya existe una instantánea con ese nombre',
   'mock.snapVolumes': 'Los volúmenes de Docker no se incluyen en la instantánea.',

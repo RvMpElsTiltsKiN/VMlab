@@ -7,12 +7,13 @@ use vmlab_core::model::{
     default_adapter, Action, ApplyReport, DockerRunOptions, DockerStartInfo, GuestAdditionsPrep, GuestConfigRequest,
     GuestHostsRequest,
     GuestProfile, GuestReport, Inventory, LabSnapInfo, LabSnapNode, LabSnapReport, LinkConditions, LinkReport, NodeKind,
-    NodeProbe, ProbeNode, Snapshot, Topology,
+    NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology,
 };
 use vmlab_core::capture::{self, CaptureFilter, CaptureInfo};
 use vmlab_core::tools::Tools;
 use vmlab_core::{compose, engine, labsnap, netem, terminal, vbox};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tauri::{AppHandle, Manager, State};
 
 const MAX_WORKSPACE_BYTES: usize = 5 * 1024 * 1024;
@@ -265,6 +266,69 @@ pub async fn capture_open(state: State<'_, AppState>, id: String) -> Result<(), 
 #[tauri::command]
 pub async fn capture_open_folder() -> Result<(), String> {
     let dir = capture::prepare_dir().map_err(s)?;
+    capture::open_folder(&dir).map_err(s)
+}
+
+// ───────────────────── Capturas de pantalla ─────────────────────
+
+/// Carpeta de capturas: `Pictures/VMLab`; si no se puede crear, la carpeta de
+/// datos de la app + `screenshots`. Siempre la elige el backend.
+fn screenshots_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(dir) = app.path().picture_dir().map(|p| p.join("VMLab")) {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return Ok(dir);
+        }
+    }
+    let dir = app.path().app_data_dir().map_err(s)?.join("screenshots");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!("no se pudo crear la carpeta de capturas {}: {e}", dir.display())
+    })?;
+    Ok(dir)
+}
+
+/// Captura la pantalla de una VM en marcha y devuelve la ruta del PNG.
+/// La ruta destino la construye siempre el backend.
+#[tauri::command]
+pub async fn take_screenshot(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target: String,
+) -> Result<ScreenshotInfo, String> {
+    let dir = screenshots_dir(&app)?;
+    let dest = dir.join(vbox::screenshot_filename(&target, SystemTime::now()));
+    vbox::screenshot(&state.tools().await, &target, &dest).await.map_err(s)?;
+    Ok(ScreenshotInfo { path: dest.to_string_lossy().into_owned() })
+}
+
+/// Devuelve los bytes de un PNG solo si está dentro de la carpeta de capturas.
+#[tauri::command]
+pub async fn read_screenshot(app: AppHandle, path: String) -> Result<tauri::ipc::Response, String> {
+    let dir = screenshots_dir(&app)?;
+    let candidate = Path::new(&path);
+    if !vbox::screenshot_path_allowed(&dir, candidate) {
+        return Err("la ruta indicada no está dentro de la carpeta de capturas".into());
+    }
+
+    // Canonicalizar ambas rutas evita que un enlace simbólico escape de la carpeta.
+    let real_dir = std::fs::canonicalize(&dir).map_err(s)?;
+    let real_file = std::fs::canonicalize(candidate).map_err(s)?;
+    if !vbox::screenshot_path_allowed(&real_dir, &real_file) {
+        return Err("la ruta indicada no está dentro de la carpeta de capturas".into());
+    }
+    if !real_file.is_file() {
+        return Err("el fichero de la captura no existe".into());
+    }
+
+    tokio::fs::read(real_file)
+        .await
+        .map(tauri::ipc::Response::new)
+        .map_err(s)
+}
+
+/// Abre la carpeta de capturas en el explorador de Windows.
+#[tauri::command]
+pub async fn open_screenshots_folder(app: AppHandle) -> Result<(), String> {
+    let dir = screenshots_dir(&app)?;
     capture::open_folder(&dir).map_err(s)
 }
 

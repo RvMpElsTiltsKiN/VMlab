@@ -273,6 +273,13 @@ pub struct DockerStartInfo {
     pub message: String,
 }
 
+/// Ruta de una captura de pantalla guardada por VMLab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenshotInfo {
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {

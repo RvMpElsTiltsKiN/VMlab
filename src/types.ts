@@ -75,6 +75,11 @@ export interface CaptureInfo {
   warning?: string;
 }
 
+/** Captura de pantalla PNG guardada por el backend. */
+export interface ScreenshotInfo {
+  path: string;
+}
+
 /** Datos que guarda cada nodo del lienzo. */
 export interface MachineData extends Record<string, unknown> {
   kind: MachineKind;

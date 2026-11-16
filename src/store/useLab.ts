@@ -33,12 +33,18 @@ import type {
 
 export type Theme = 'dark' | 'light';
 export type LabMode = 'replace' | 'append';
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
 export interface Toast {
   id: number;
   kind: 'ok' | 'info' | 'error';
   text: string;
   /** Veces que se ha repetido el mismo mensaje de error consecutivo (empieza en 1). */
   count: number;
+  /** Acción opcional (por ejemplo, abrir una carpeta) en avisos de éxito. */
+  action?: ToastAction;
 }
 
 interface LabState {
@@ -103,7 +109,7 @@ interface LabState {
   setLang: (lang: Lang) => void;
   toggleCanvasLock: () => void;
   setOverSidebar: (over: boolean) => void;
-  toast: (kind: Toast['kind'], text: string) => void;
+  toast: (kind: Toast['kind'], text: string, action?: ToastAction) => void;
   dismissToast: (id: number) => void;
 }
 
@@ -882,17 +888,18 @@ export const useLab = create<LabState>()((set, get) => ({
 
   setOverSidebar: (overSidebar) => set({ overSidebar }),
 
-  toast(kind, text) {
+  toast(kind, text, action) {
     const id = ++toastSeq;
     if (kind !== 'error') {
-      // Éxito e información siguen desapareciendo solos.
+      // Éxito e información siguen desapareciendo solos; con acción duran algo más.
+      const item: Toast = { id, kind, text, count: 1, ...(action ? { action } : {}) };
       set((s) => ({
         toasts: [
           ...s.toasts.filter((t) => t.kind === 'error'),
-          ...[...s.toasts.filter((t) => t.kind !== 'error'), { id, kind, text, count: 1 }].slice(-3),
+          ...[...s.toasts.filter((t) => t.kind !== 'error'), item].slice(-3),
         ],
       }));
-      setTimeout(() => get().dismissToast(id), 3500);
+      setTimeout(() => get().dismissToast(id), action ? 8000 : 3500);
       return;
     }
 

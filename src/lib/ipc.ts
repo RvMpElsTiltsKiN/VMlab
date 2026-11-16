@@ -24,6 +24,7 @@ import type {
   MachineKind,
   NodeProbe,
   ProbeNode,
+  ScreenshotInfo,
   Snapshot,
   ToolsInfo,
   TopologyPayload,
@@ -62,6 +63,12 @@ const real = {
   captureList: () => invoke<CaptureInfo[]>('capture_list'),
   captureOpen: (id: string) => invoke<void>('capture_open', { id }),
   captureOpenFolder: () => invoke<void>('capture_open_folder'),
+  takeScreenshot: (target: string) => invoke<ScreenshotInfo>('take_screenshot', { target }),
+  readScreenshot: async (path: string) => {
+    const bytes = await invoke<ArrayBuffer>('read_screenshot', { path });
+    return new Uint8Array(bytes);
+  },
+  openScreenshotsFolder: () => invoke<void>('open_screenshots_folder'),
   labsnapList: (nodes: LabSnapNode[]) => invoke<LabSnapInfo[]>('labsnap_list', { nodes }),
   labsnapTake: (nodes: LabSnapNode[], label: string) =>
     invoke<LabSnapReport>('labsnap_take', { nodes, label }),
@@ -143,6 +150,12 @@ const mockCapture = (id: string): MockCapture => {
   if (!capture) throw new Error(t('mock.captureUnknown'));
   return capture;
 };
+
+/** PNG 1×1 transparente válido para probar la captura de pantalla en el navegador. */
+const MOCK_SCREENSHOT_PNG = Uint8Array.from(
+  atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII='),
+  (char) => char.charCodeAt(0),
+);
 
 const mock: typeof real = {
   detectTools: async () => ({ vboxmanage: 'C:/Program Files/Oracle/VirtualBox/VBoxManage.exe', docker: 'docker' }),
@@ -280,6 +293,21 @@ const mock: typeof real = {
   },
   captureOpenFolder: async () => {
     mockNotice?.(t('mock.captureFolder'));
+  },
+  takeScreenshot: async (target) => {
+    await delay(600);
+    if (mockStates[mockKey('vbox', target)] !== 'running') {
+      throw new Error(t('mock.startVmFirst'));
+    }
+    const stamp = mockCaptureStamp(Date.now());
+    return { path: `C:/Users/demo/Pictures/VMLab/${mockSlug(target) || 'vm'}-${stamp}.png` };
+  },
+  readScreenshot: async () => {
+    await delay(150);
+    return new Uint8Array(MOCK_SCREENSHOT_PNG);
+  },
+  openScreenshotsFolder: async () => {
+    mockNotice?.(t('mock.screenshotFolder'));
   },
   labsnapList: async (nodes) => {
     await delay(250);

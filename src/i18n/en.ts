@@ -310,6 +310,17 @@ export const en: Record<keyof typeof es, string> = {
   'capture.imageBodyAfter': '. The first time it must be downloaded: it is about 100 MB and may take a few minutes.',
   'capture.imageApply': 'Download and capture',
 
+  // Screenshot
+  'screenshot.button': 'Screenshot',
+  'screenshot.disabled': 'Start the virtual machine to take a screenshot.',
+  'screenshot.shortcut': 'Take a screenshot of the VM (Ctrl+Shift+P)',
+  'screenshot.busy': 'Taking screenshot…',
+  'screenshot.ok': 'Screenshot saved and copied to the clipboard',
+  'screenshot.okNoClipboard': 'Screenshot saved (could not copy to the clipboard)',
+  'screenshot.openFolder': 'Open folder',
+  'screenshot.error': 'Could not take the screenshot: {detail}',
+  'screenshot.folderError': 'Could not open the screenshots folder: {detail}',
+
   // Network information
   'info.title': 'Network',
   'info.ip': 'IP',
@@ -594,6 +605,7 @@ export const en: Record<keyof typeof es, string> = {
   'mock.vboxNoBpf': 'VirtualBox does not support BPF filters; all adapter traffic will be captured.',
   'mock.wiresharkDesktop': 'The simulator does not open Wireshark. In the desktop app it would open {file}.',
   'mock.captureFolder': 'The VMLab captures folder would open (desktop app only).',
+  'mock.screenshotFolder': 'The VMLab screenshots folder would open (desktop app only).',
   'mock.snapNameNeedsAlnum': 'the name must contain at least one letter or number',
   'mock.snapAlreadyExists': 'a snapshot with that name already exists',
   'mock.snapVolumes': 'Docker volumes are not included in the snapshot.',

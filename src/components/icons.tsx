@@ -32,6 +32,7 @@ export const LockIcon = () => <Svg size={14}><rect x="3" y="11" width="18" heigh
 export const UnlockIcon = () => <Svg size={14}><rect x="3" y="11" width="18" height="10" rx="2" /><path d="M7 11V7a5 5 0 0 1 9.9-1" /></Svg>;
 export const CheckIcon = () => <Svg size={12}><path d="m5 12.5 4.5 4.5L19 6.5" /></Svg>;
 export const WarnIcon = () => <Svg size={12}><path d="M12 3 2.5 20h19L12 3Z" /><path d="M12 9v4.5M12 17h.01" /></Svg>;
+export const CameraIcon = () => <Svg size={14}><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" /><circle cx="12" cy="13" r="3.5" /></Svg>;
 
 export const MinIcon = () => <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" /></svg>;
 export const MaxIcon = () => <svg width="10" height="10" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" fill="none" stroke="currentColor" /></svg>;

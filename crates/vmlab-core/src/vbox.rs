@@ -9,7 +9,7 @@ use crate::tools::Tools;
 use crate::validate;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SHORT: Duration = Duration::from_secs(15);
 const LONG: Duration = Duration::from_secs(120);
@@ -942,9 +942,91 @@ pub async fn snapshot_delete(tools: &Tools, target: &str, id: &str) -> Result<()
     run_ok(bin, &["snapshot", target, "delete", name.as_str()], SNAPSHOT).await.map(|_| ())
 }
 
+// ───────────────────── Capturas de pantalla ─────────────────────
+
+/// Deja en el nombre solo `[A-Za-z0-9._-]`; el resto se convierte en `_`.
+fn sanitize_screenshot_name(vm: &str) -> String {
+    vm.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect()
+}
+
+/// Nombre del PNG: `<vm>-AAAAMMDD-HHMMSS.png`. La fecha es UTC, igual que las
+/// instantáneas, y se inyecta para poder probar el formato sin depender del reloj.
+pub fn screenshot_filename(vm: &str, now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (year, month, day, hour, minute, second) = crate::labsnap::parts_from_unix(secs);
+    format!(
+        "{}-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}.png",
+        sanitize_screenshot_name(vm)
+    )
+}
+
+/// `true` solo si `path` está dentro de `dir` y no contiene `..`.
+///
+/// Es la comprobación pura previa; el comando de Tauri además canonicaliza ambas
+/// rutas para que un enlace simbólico no pueda escapar de la carpeta.
+pub fn screenshot_path_allowed(dir: &Path, path: &Path) -> bool {
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return false;
+    }
+    path.starts_with(dir)
+}
+
+/// Captura la pantalla de una VM en marcha y la guarda como PNG en `dest`.
+/// La ruta la construye siempre el backend dentro de su carpeta de capturas.
+pub async fn screenshot(tools: &Tools, vm: &str, dest: &Path) -> Result<()> {
+    validate::vbox_target(vm)?;
+    let bin = tools.vbox()?;
+
+    let info = run_ok(bin, &["showvminfo", vm, "--machinereadable"], SHORT).await?;
+    if !show_vm_on(&info.stdout) {
+        return Err(CoreError::Message("La VM no está encendida".into()));
+    }
+
+    let dest_str = dest.to_string_lossy();
+    run_ok(bin, &["controlvm", vm, "screenshotpng", dest_str.as_ref()], SHORT).await?;
+    if !dest.is_file() {
+        return Err(CoreError::Message("VBoxManage no generó el fichero de la captura".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_screenshot_file_names_with_sanitized_vm_names() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000); // 2023-11-14 22:13:20 UTC
+        assert_eq!(
+            screenshot_filename("Ubuntu Server 22.04 (lab)", now),
+            "Ubuntu_Server_22.04__lab_-20231114-221320.png"
+        );
+        assert_eq!(
+            screenshot_filename("vm/../x", now),
+            "vm_.._x-20231114-221320.png"
+        );
+        assert_eq!(screenshot_filename("web_1", now), "web_1-20231114-221320.png");
+    }
+
+    #[test]
+    fn screenshot_paths_must_stay_inside_the_folder() {
+        let dir = Path::new("/home/u/Pictures/VMLab");
+        assert!(screenshot_path_allowed(dir, &dir.join("vm-20231114-221320.png")));
+        assert!(!screenshot_path_allowed(dir, &dir.join("../fuera.png")));
+        assert!(!screenshot_path_allowed(dir, Path::new("/home/u/Pictures/Otra/fuera.png")));
+        assert!(!screenshot_path_allowed(dir, Path::new("/home/u/Pictures/VMLab2/fuera.png")));
+    }
+
+    #[tokio::test]
+    async fn screenshot_rejects_option_like_vm_names() {
+        let tools = Tools::default();
+        for vm in ["-vm", "--type"] {
+            let error = screenshot(&tools, vm, Path::new("captura.png")).await.unwrap_err();
+            assert!(matches!(error, CoreError::Invalid(_)), "{vm}: {error}");
+        }
+    }
 
     #[test]
     fn subnet_octet_is_stable_and_in_range() {

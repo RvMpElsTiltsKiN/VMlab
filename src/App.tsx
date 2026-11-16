@@ -68,7 +68,22 @@ function Toasts() {
             aria-live="polite"
             onClick={() => dismiss(toast.id)}
           >
-            {toast.text}
+            <div className="toast-text">{toast.text}</div>
+            {toast.action && (
+              <div className="toast-actions">
+                <button
+                  type="button"
+                  className="toast-btn"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toast.action?.onClick();
+                    dismiss(toast.id);
+                  }}
+                >
+                  {toast.action.label}
+                </button>
+              </div>
+            )}
           </div>
         ),
       )}

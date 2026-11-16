@@ -33,6 +33,9 @@ pub fn run() {
             commands::capture_list,
             commands::capture_open,
             commands::capture_open_folder,
+            commands::take_screenshot,
+            commands::read_screenshot,
+            commands::open_screenshots_folder,
             commands::guest_probe,
             commands::guest_apply,
             commands::guest_hosts_apply,
@@ -48,7 +51,8 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init());
 
     let app = builder
         .build(tauri::generate_context!())
