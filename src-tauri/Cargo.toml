@@ -1,6 +1,6 @@
 [package]
 name = "vmlab"
-version = "0.1.0"
+version = "0.1.1"
 description = "VMLab: lienzo visual para gestionar laboratorios de VirtualBox y Docker"
 authors = ["VMLab"]
 edition = "2021"
