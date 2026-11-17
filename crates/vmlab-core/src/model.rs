@@ -172,28 +172,34 @@ pub enum EdgeKind {
     Mount,
 }
 
-/// Ruta donde un disco se monta dentro de un contenedor concreto.
+/// Enlace de un disco con un nodo del lienzo. `container` conserva su nombre
+/// histórico: es el `id` del nodo de destino (Docker o VirtualBox).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskMount {
-    /// `id` del nodo Docker en el lienzo (no el nombre del contenedor).
+    /// `id` del nodo de destino en el lienzo (no su nombre real).
     pub container: String,
-    /// Ruta absoluta dentro del contenedor.
-    pub path: String,
+    /// Ruta absoluta dentro del contenedor. Los enlaces con VM no usan ruta.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
-/// Configuración de un nodo Disco. El nombre base del volumen es `NodeSpec::target`;
-/// el volumen real de Docker se crea como `vmlab-vol-<nombre saneado>`.
+/// Configuración de un nodo Disco. El nombre base es `NodeSpec::target`: con
+/// contenedores se crea `vmlab-vol-<nombre saneado>` y con VMs
+/// `vmlab-disk-<nombre saneado>.vdi`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskSpec {
     /// `true` permite montar el mismo volumen en varios contenedores a la vez.
-    /// Por defecto es exclusivo: un solo contenedor.
+    /// Por defecto es exclusivo: un solo contenedor (y siempre una sola VM).
     #[serde(default)]
     pub shared: bool,
-    /// Un montaje por cada enlace Disco↔contenedor del lienzo.
+    /// Un montaje por cada enlace Disco↔nodo del lienzo.
     #[serde(default)]
     pub mounts: Vec<DiskMount>,
+    /// Tamaño en MB de un disco VDI. `None` usa 10240 MB al crearlo.
+    #[serde(default)]
+    pub size_mb: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,6 +671,41 @@ mod tests {
     }
 
     #[test]
+    fn old_disk_mounts_without_size_or_optional_path_still_load() {
+        let json = serde_json::json!({
+            "nodes": [
+                { "id": "web", "kind": "docker", "target": "web" },
+                {
+                    "id": "d",
+                    "kind": "disk",
+                    "target": "datos",
+                    "disk": {
+                        "shared": false,
+                        "mounts": [{ "container": "web", "path": "/data" }]
+                    }
+                },
+                {
+                    "id": "d2",
+                    "kind": "disk",
+                    "target": "vmdisk",
+                    "disk": {
+                        "shared": false,
+                        "mounts": [{ "container": "vm" }]
+                    }
+                }
+            ],
+            "edges": []
+        });
+        let t: Topology = serde_json::from_value(json).unwrap();
+        let docker = t.nodes[1].disk.as_ref().unwrap();
+        assert_eq!(docker.size_mb, None);
+        assert_eq!(docker.mounts[0].path.as_deref(), Some("/data"));
+        let vdi = t.nodes[2].disk.as_ref().unwrap();
+        assert_eq!(vdi.mounts[0].path, None);
+        assert_eq!(vdi.size_mb, None);
+    }
+
+    #[test]
     fn disk_fields_serialize_in_camel_case() {
         let t = Topology {
             nodes: vec![NodeSpec {
@@ -673,7 +714,8 @@ mod tests {
                 target: "datos".into(),
                 disk: Some(DiskSpec {
                     shared: true,
-                    mounts: vec![DiskMount { container: "web".into(), path: "/data".into() }],
+                    mounts: vec![DiskMount { container: "web".into(), path: Some("/data".into()) }],
+                    size_mb: Some(20_480),
                 }),
                 ..NodeSpec::default()
             }],
@@ -682,7 +724,9 @@ mod tests {
         let json = serde_json::to_value(&t).unwrap();
         assert_eq!(json["nodes"][0]["kind"], "disk");
         assert_eq!(json["nodes"][0]["disk"]["shared"], true);
+        assert_eq!(json["nodes"][0]["disk"]["sizeMb"], 20_480);
         assert_eq!(json["nodes"][0]["disk"]["mounts"][0]["container"], "web");
+        assert_eq!(json["nodes"][0]["disk"]["mounts"][0]["path"], "/data");
         assert_eq!(json["edges"][0]["kind"], "mount");
     }
 }

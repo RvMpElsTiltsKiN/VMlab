@@ -2,9 +2,11 @@
 use crate::error::{CoreError, Result};
 use crate::model::*;
 use crate::tools::Tools;
+use crate::validate::DiskKind;
 use crate::{connectivity, disks, docker, docker_desktop, guest, netem, topology, vbox};
 use crate::docker::MountInfo;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 fn vbox_state(running: bool) -> PowerState {
     if running { PowerState::Running } else { PowerState::Stopped }
@@ -185,9 +187,34 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
     if let Err(e) = crate::validate::disk_topology(t) {
         return ApplyReport { errors: vec![e.to_string()], ..Default::default() };
     }
+    let has_vdi = t
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Disk)
+        .any(|d| matches!(crate::validate::disk_kind(t, d), Ok(DiskKind::Vdi)));
+    if has_vdi && tools.disks_dir.is_none() {
+        return ApplyReport {
+            errors: vec!["no se ha configurado la carpeta de discos de VMLab".into()],
+            ..Default::default()
+        };
+    }
+    if has_vdi && tools.vboxmanage.is_none() {
+        return ApplyReport {
+            errors: vec![CoreError::ToolMissing("VBoxManage").to_string()],
+            ..Default::default()
+        };
+    }
+    let disks_dir: Option<&Path> = tools.disks_dir.as_deref();
     let disk_plans = match disks::plan(t) {
         Ok(plans) => plans,
         Err(e) => return ApplyReport { errors: vec![e.to_string()], ..Default::default() },
+    };
+    let vdi_plans: Vec<disks::VdiPlan> = match disks_dir {
+        Some(dir) => match disks::plan_vdi(t, dir) {
+            Ok(plans) => plans,
+            Err(e) => return ApplyReport { errors: vec![e.to_string()], ..Default::default() },
+        },
+        None => Vec::new(),
     };
     let mounts_by_container = disks::mounts_by_container(&disk_plans);
     let no_mounts: BTreeSet<MountInfo> = BTreeSet::new();
@@ -204,6 +231,55 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
     } else {
         HashSet::new()
     };
+
+    // Los ficheros VDI se crean antes de tocar la red. Un VDI existente nunca se
+    // modifica: como mucho se avisa de que el tamaño pedido no se aplicará.
+    if let Some(dir) = disks_dir {
+        for vdi in &vdi_plans {
+            match vbox::ensure_vdi_file(tools, dir, &vdi.path, vdi.size_mb).await {
+                Ok(Some(warning)) => rep.warnings.push(format!("{}: {warning}", vdi.node.display())),
+                Ok(None) => {}
+                Err(e) => rep.errors.push(format!("{}: {e}", vdi.node.display())),
+            }
+        }
+    }
+
+    // Desconectar primero: permite mover un VDI de una VM a otra sin que la
+    // segunda conexión falle por estar el medio todavía en la primera.
+    if let (Some(dir), true) = (disks_dir, tools.vboxmanage.is_some()) {
+        let vm_nodes: Vec<&NodeSpec> = t.nodes.iter().filter(|n| n.kind == NodeKind::Vbox).collect();
+        let mut wanted_by_vm: HashMap<&str, Vec<PathBuf>> = HashMap::new();
+        for vdi in &vdi_plans {
+            wanted_by_vm.entry(vdi.vm_id.as_str()).or_default().push(vdi.path.clone());
+        }
+        let quiet = !t.nodes.iter().any(|n| n.kind == NodeKind::Disk);
+        for vm in &vm_nodes {
+            let wanted = wanted_by_vm.get(vm.id.as_str()).cloned().unwrap_or_default();
+            if let Err(e) = crate::validate::vbox_target(&vm.target) {
+                rep.errors.push(format!("{}: {e}", vm.display()));
+                continue;
+            }
+            match vbox::detach_stale_vdis(tools, dir, &vm.target, &wanted, running.contains(&vm.target)).await {
+                Ok(warnings) => rep.warnings.extend(warnings),
+                Err(e) if !quiet => rep.errors.push(format!("{}: {e}", vm.display())),
+                Err(_) => {}
+            }
+        }
+        for vm in &vm_nodes {
+            let wanted = wanted_by_vm.get(vm.id.as_str()).cloned().unwrap_or_default();
+            if wanted.is_empty() {
+                continue;
+            }
+            if let Err(e) = crate::validate::vbox_target(&vm.target) {
+                rep.errors.push(format!("{}: {e}", vm.display()));
+                continue;
+            }
+            match vbox::attach_wanted_vdis(tools, dir, &vm.target, &wanted, running.contains(&vm.target)).await {
+                Ok(warnings) => rep.warnings.extend(warnings),
+                Err(e) => rep.errors.push(format!("{}: {e}", vm.display())),
+            }
+        }
+    }
 
     for seg in &plan.segments {
         rep.networks.push(seg.name.clone());

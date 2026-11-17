@@ -2,6 +2,7 @@
 //!
 //! Convención de red: VMLab es dueño del **adaptador 2** de cada VM (red interna
 //! `vmlab-xxxxxxxx`). El adaptador 1 (NAT, internet) no se toca.
+use crate::disks;
 use crate::error::{CoreError, Result};
 use crate::model::{
     Action, GuestAdditionsInfo, GuestAdditionsPrep, LinkInfo, NetMode, NodeIssue, NodeNet,
@@ -869,6 +870,409 @@ pub async fn prepare_guest_additions(tools: &Tools, target: &str) -> Result<Gues
     })
 }
 
+// ───────────────────── Discos VDI ─────────────────────
+
+/// Controlador creado por VMLab cuando la VM no tiene ninguno compatible libre.
+pub const VMLAB_VDI_CONTROLLER: &str = "VMLab SATA";
+
+/// Controladores de `showvminfo` admitidos para discos duros. Nunca IDE: solo
+/// SATA, SCSI, NVMe y VirtIO. El orden es la preferencia al elegir un hueco.
+fn vdi_controller_rank(kind: &str) -> Option<u8> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "intelahci" | "ahci" | "sata" => Some(0),
+        "nvme" => Some(1),
+        "virtio" | "virtio-scsi" | "virtio scsi" => Some(2),
+        "lsilogic" | "lsilogicsas" | "buslogic" | "scsi" => Some(3),
+        _ => None,
+    }
+}
+
+/// Vista pública y pura de `showvminfo --machinereadable` para almacenamiento.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmStorageController {
+    pub name: String,
+    pub kind: String,
+    pub ports: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmStorageAttachment {
+    pub controller: String,
+    pub port: u32,
+    pub device: u32,
+    pub medium: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmStorageInfo {
+    pub running: bool,
+    pub controllers: Vec<VmStorageController>,
+    pub attachments: Vec<VmStorageAttachment>,
+}
+
+/// Parsea controladores, puertos ocupados y estado de la VM sin ejecutar nada.
+pub fn parse_vm_storage(info: &str) -> VmStorageInfo {
+    let (controllers, attachments) = parse_storage(info);
+    VmStorageInfo {
+        running: show_vm_on(info),
+        controllers: controllers
+            .into_iter()
+            .map(|c| VmStorageController { name: c.name, kind: c.kind, ports: c.ports })
+            .collect(),
+        attachments: attachments
+            .into_iter()
+            .map(|s| VmStorageAttachment {
+                controller: s.controller,
+                port: s.port,
+                device: s.device,
+                medium: s.medium,
+            })
+            .collect(),
+    }
+}
+
+/// Primer puerto libre (`device = 0`) de un controlador compatible.
+fn pick_vdi_free_slot(storage: &VmStorageInfo) -> Option<VmStorageAttachment> {
+    let mut controllers: Vec<&VmStorageController> = storage
+        .controllers
+        .iter()
+        .filter(|c| vdi_controller_rank(&c.kind).is_some() && c.ports > 0 && !c.name.starts_with('-'))
+        .collect();
+    controllers.sort_by_key(|c| (vdi_controller_rank(&c.kind).unwrap_or(u8::MAX), c.name.clone()));
+
+    for c in controllers {
+        for port in 0..c.ports {
+            let occupied = storage.attachments.iter().any(|s| {
+                s.controller == c.name
+                    && s.port == port
+                    && s.device == 0
+                    && !empty_medium(&s.medium)
+            });
+            if !occupied {
+                return Some(VmStorageAttachment {
+                    controller: c.name.clone(),
+                    port,
+                    device: 0,
+                    medium: String::new(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn vdi_is_attached(storage: &VmStorageInfo, path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    storage
+        .attachments
+        .iter()
+        .any(|s| !empty_medium(&s.medium) && same_path(&s.medium, path.as_ref()))
+}
+
+/// Arg separado y seguro: nunca empieza por `-` ni lleva caracteres de control.
+fn vdi_path_arg(path: &Path) -> Result<String> {
+    let value = path.to_string_lossy().into_owned();
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.chars().any(|c| c.is_control())
+    {
+        return Err(CoreError::Invalid("ruta de disco VDI no válida".into()));
+    }
+    Ok(value)
+}
+
+pub fn createmedium_args(path: &Path, size_mb: u32) -> Result<Vec<String>> {
+    if !(1..=validate::MAX_VDI_SIZE_MB).contains(&size_mb) {
+        return Err(CoreError::Invalid("el tamaño del disco VDI no está en el rango permitido".into()));
+    }
+    Ok(vec![
+        "createmedium".into(),
+        "disk".into(),
+        "--filename".into(),
+        vdi_path_arg(path)?,
+        "--size".into(),
+        size_mb.to_string(),
+        "--format".into(),
+        "VDI".into(),
+        "--variant".into(),
+        "Standard".into(),
+    ])
+}
+
+pub fn showmediuminfo_args(path: &Path) -> Result<Vec<String>> {
+    Ok(vec!["showmediuminfo".into(), "disk".into(), vdi_path_arg(path)?])
+}
+
+pub fn storagectl_args(vm: &str) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    validate::host_iface(VMLAB_VDI_CONTROLLER)?;
+    Ok(vec![
+        "storagectl".into(),
+        vm.into(),
+        "--name".into(),
+        VMLAB_VDI_CONTROLLER.into(),
+        "--add".into(),
+        "sata".into(),
+        "--controller".into(),
+        "IntelAhci".into(),
+        "--portcount".into(),
+        "8".into(),
+    ])
+}
+
+/// Construye `storageattach`. `medium = None` desconecta sin borrar el fichero.
+pub fn storageattach_args(
+    vm: &str,
+    controller: &str,
+    port: u32,
+    device: u32,
+    medium: Option<&Path>,
+) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    validate::host_iface(controller)?;
+    let medium = match medium {
+        Some(path) => vdi_path_arg(path)?,
+        None => "none".to_string(),
+    };
+    Ok(vec![
+        "storageattach".into(),
+        vm.into(),
+        "--storagectl".into(),
+        controller.into(),
+        "--port".into(),
+        port.to_string(),
+        "--device".into(),
+        device.to_string(),
+        "--type".into(),
+        "hdd".into(),
+        "--medium".into(),
+        medium,
+    ])
+}
+
+fn vm_field_ci(info: &str, field: &str) -> Option<String> {
+    info.lines()
+        .filter_map(parse_kv)
+        .find(|(k, _)| k.eq_ignore_ascii_case(field))
+        .map(|(_, v)| v)
+}
+
+/// Tamaño real de un medio a partir de `showmediuminfo`.
+/// Acepta bytes, `MB`/`GB` y líneas legibles como `Capacity:       10240 MBytes`.
+pub fn parse_medium_size_mb(info: &str) -> Option<u32> {
+    for key in ["Capacity", "Size", "LogicalCapacity"] {
+        let raw = vm_field_ci(info, key).or_else(|| {
+            info.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case(key)
+                    .then(|| value.trim().to_string())
+            })
+        });
+        let Some(raw) = raw else { continue };
+        let value = raw.trim().trim_matches('"').trim();
+        let lower = value.to_ascii_lowercase();
+        for (suffix, factor) in [
+            ("mbytes", 1.0),
+            ("gbytes", 1024.0),
+            ("mib", 1.0),
+            ("mb", 1.0),
+            ("gib", 1024.0),
+            ("gb", 1024.0),
+        ] {
+            if let Some(number) = lower.strip_suffix(suffix) {
+                if let Ok(n) = number.trim().parse::<f64>() {
+                    return Some((n * factor).round() as u32);
+                }
+            }
+        }
+        if let Ok(bytes) = value.replace(' ', "").parse::<u64>() {
+            if let Ok(mb) = u32::try_from(bytes / 1024 / 1024) {
+                return Some(mb);
+            }
+        }
+    }
+    None
+}
+
+fn vdi_command_error(action: &str, e: CoreError) -> CoreError {
+    CoreError::Message(format!("no se pudo {action}: {e}"))
+}
+
+fn vdi_attach_error(e: CoreError) -> CoreError {
+    let text = e.to_string().to_ascii_lowercase();
+    let other_vm = text.contains("already attached")
+        || text.contains("already in use")
+        || text.contains("is in use")
+        || text.contains("attached to another")
+        || text.contains("ya está")
+        || text.contains("ya esta")
+        || text.contains("en uso");
+    if other_vm {
+        CoreError::Message(format!("el disco VDI ya está conectado a otra máquina virtual: {e}"))
+    } else {
+        vdi_command_error("conectar el disco VDI", e)
+    }
+}
+
+/// Crea el VDI si no existe. Si ya existe no lo toca; solo avisa si el tamaño
+/// pedido no coincide con el real. El directorio lo elige siempre el backend.
+pub async fn ensure_vdi_file(
+    tools: &Tools,
+    disks_dir: &Path,
+    path: &Path,
+    size_mb: u32,
+) -> Result<Option<String>> {
+    if !disks::vdi_path_allowed(disks_dir, path) {
+        return Err(CoreError::Invalid("la ruta del disco VDI queda fuera de la carpeta de discos".into()));
+    }
+    let bin = tools.vbox()?;
+    let create = createmedium_args(path, size_mb)?;
+    let create_argv: Vec<&str> = create.iter().map(String::as_str).collect();
+
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            let args = showmediuminfo_args(path)?;
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Ok(info) = run(bin, &argv, SHORT).await {
+                if info.code == 0 {
+                    if let Some(real_mb) = parse_medium_size_mb(&info.stdout) {
+                        if real_mb != size_mb {
+                            return Ok(Some("el tamaño no cambia con discos existentes".into()));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Ok(_) => Err(CoreError::Invalid("la ruta del disco VDI no es un fichero".into())),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    CoreError::Io(format!("no se pudo crear la carpeta de discos {}: {e}", parent.display()))
+                })?;
+            }
+            run_ok(bin, &create_argv, SHORT)
+                .await
+                .map_err(|e| vdi_command_error("crear el disco VDI", e))?;
+            Ok(None)
+        }
+        Err(source) => Err(CoreError::Io(format!("no se pudo consultar {}: {source}", path.display()))),
+    }
+}
+
+/// Desconecta los VDI de VMLab de esta VM que ya no están en el plan. Nunca
+/// borra el fichero ni lo quita del registro de VirtualBox.
+pub async fn detach_stale_vdis(
+    tools: &Tools,
+    disks_dir: &Path,
+    vm: &str,
+    wanted: &[PathBuf],
+    running: bool,
+) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    let bin = tools.vbox()?;
+    let info = run_ok(bin, &["showvminfo", vm, "--machinereadable"], SHORT)
+        .await
+        .map_err(|e| vdi_command_error("leer la información de la VM", e))?;
+    let storage = parse_vm_storage(&info.stdout);
+    let running = running || storage.running;
+    let mut stale = Vec::new();
+    for a in &storage.attachments {
+        if empty_medium(&a.medium) || !disks::vdi_path_allowed(disks_dir, Path::new(&a.medium)) {
+            continue;
+        }
+        if wanted.iter().any(|p| same_path(&p.to_string_lossy(), &a.medium)) {
+            continue;
+        }
+        stale.push((a.controller.clone(), a.port, a.device));
+    }
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+    if running {
+        return Ok(vec![format!("apaga «{vm}» para desconectar el disco")]);
+    }
+    for (controller, port, device) in stale {
+        let args = storageattach_args(vm, &controller, port, device, None)?;
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_ok(bin, &argv, SHORT)
+            .await
+            .map_err(|e| vdi_command_error("desconectar el disco VDI", e))?;
+    }
+    Ok(Vec::new())
+}
+
+/// Conecta los VDI del plan que todavía no están en esta VM. Si está encendida
+/// devuelve avisos y no lanza ninguna modificación de almacenamiento.
+pub async fn attach_wanted_vdis(
+    tools: &Tools,
+    disks_dir: &Path,
+    vm: &str,
+    wanted: &[PathBuf],
+    running: bool,
+) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    let bin = tools.vbox()?;
+    let info = run_ok(bin, &["showvminfo", vm, "--machinereadable"], SHORT)
+        .await
+        .map_err(|e| vdi_command_error("leer la información de la VM", e))?;
+    let mut storage = parse_vm_storage(&info.stdout);
+    let running = running || storage.running;
+    let wanted: Vec<&Path> = wanted
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|p| disks::vdi_path_allowed(disks_dir, p))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if running {
+        let mut warnings = Vec::new();
+        for path in &wanted {
+            if !vdi_is_attached(&storage, path) {
+                warnings.push(format!("apaga «{vm}» para conectar el disco"));
+            }
+        }
+        warnings.dedup();
+        return Ok(warnings);
+    }
+
+    for path in wanted {
+        if vdi_is_attached(&storage, path) {
+            continue;
+        }
+        let slot = match pick_vdi_free_slot(&storage) {
+            Some(slot) => slot,
+            None => {
+                let args = storagectl_args(vm)?;
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                run_ok(bin, &argv, SHORT)
+                    .await
+                    .map_err(|e| vdi_command_error("crear el controlador VMLab SATA", e))?;
+                storage.controllers.push(VmStorageController {
+                    name: VMLAB_VDI_CONTROLLER.into(),
+                    kind: "IntelAhci".into(),
+                    ports: 8,
+                });
+                pick_vdi_free_slot(&storage)
+                    .ok_or_else(|| CoreError::Message("no hay puertos libres para conectar el disco VDI".into()))?
+            }
+        };
+        let args = storageattach_args(vm, &slot.controller, slot.port, slot.device, Some(path))?;
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_ok(bin, &argv, SHORT).await.map_err(vdi_attach_error)?;
+        storage.attachments.push(VmStorageAttachment {
+            controller: slot.controller,
+            port: slot.port,
+            device: slot.device,
+            medium: path.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(Vec::new())
+}
+
 /// Subred /24 determinista por red: `10.77.N.0/24`, con N en 1..=254 derivado del nombre.
 pub fn subnet_octet(net: &str) -> u8 {
     let h = net.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
@@ -1438,5 +1842,132 @@ nicbandwidthgroup2="vmlab-nic2"
         let groups = "Name:           Limit:\nvmlab-nic2     1000 kbit/s\n";
         assert!(list_has_group(groups, "vmlab-nic2"));
         assert!(!list_has_group(groups, "vmlab-nic1"));
+    }
+
+    #[test]
+    fn parses_vdi_storage_and_picks_a_compatible_free_port() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="SATA"
+storagecontrollertype1="IntelAhci"
+storagecontrollerportcount1="2"
+storagecontrollername2="NVMe"
+storagecontrollertype2="NVMe"
+storagecontrollerportcount2="1"
+"IDE-0-0"="C:\\VBox\\VBoxGuestAdditions.iso"
+"SATA-0-0"="C:\\VMs\\sistema.vdi"
+"SATA-0-1"="none"
+"SATA-1-0"="none"
+"NVMe-0-0"="none"
+"#;
+        let storage = parse_vm_storage(info);
+        assert!(!storage.running);
+        assert_eq!(storage.controllers.len(), 3);
+        assert_eq!(storage.attachments.len(), 5);
+        let slot = pick_vdi_free_slot(&storage).unwrap();
+        assert_eq!(slot.controller, "SATA");
+        assert_eq!((slot.port, slot.device), (1, 0));
+    }
+
+    #[test]
+    fn no_compatible_controller_has_no_free_vdi_slot() {
+        let info = r#"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="Floppy"
+storagecontrollertype1="I82078"
+storagecontrollerportcount1="1"
+"IDE-0-0"="none"
+"Floppy-0-0"="none"
+"#;
+        assert!(pick_vdi_free_slot(&parse_vm_storage(info)).is_none());
+    }
+
+    #[test]
+    fn recognizes_an_already_attached_vdi() {
+        let path = Path::new(r"C:\Users\lab\AppData\Roaming\VMLab\disks\vmlab-disk-datos.vdi");
+        let storage = VmStorageInfo {
+            attachments: vec![VmStorageAttachment {
+                controller: "SATA".into(),
+                port: 1,
+                device: 0,
+                medium: path.to_string_lossy().into_owned(),
+            }],
+            ..VmStorageInfo::default()
+        };
+        assert!(vdi_is_attached(&storage, path));
+        assert!(!vdi_is_attached(&storage, Path::new(r"C:\Users\lab\AppData\Roaming\VMLab\disks\vmlab-disk-otro.vdi")));
+    }
+
+    #[test]
+    fn builds_vdi_arguments_without_interpolating_values() {
+        fn strings(items: &[&str]) -> Vec<String> {
+            items.iter().map(|item| (*item).to_string()).collect()
+        }
+        let path = Path::new(r"C:\Users\lab\AppData\Roaming\VMLab\disks\vmlab-disk-datos.vdi");
+        let path_s = path.to_string_lossy().into_owned();
+
+        assert_eq!(
+            createmedium_args(path, 10_240).unwrap(),
+            strings(&[
+                "createmedium", "disk", "--filename", path_s.as_str(), "--size", "10240", "--format",
+                "VDI", "--variant", "Standard"
+            ])
+        );
+        assert_eq!(
+            showmediuminfo_args(path).unwrap(),
+            strings(&["showmediuminfo", "disk", path_s.as_str()])
+        );
+        assert_eq!(
+            storagectl_args("Ubuntu").unwrap(),
+            strings(&[
+                "storagectl", "Ubuntu", "--name", "VMLab SATA", "--add", "sata", "--controller",
+                "IntelAhci", "--portcount", "8"
+            ])
+        );
+        assert_eq!(
+            storageattach_args("Ubuntu", "SATA", 3, 0, Some(path)).unwrap(),
+            strings(&[
+                "storageattach", "Ubuntu", "--storagectl", "SATA", "--port", "3", "--device", "0",
+                "--type", "hdd", "--medium", path_s.as_str()
+            ])
+        );
+        assert_eq!(
+            storageattach_args("Ubuntu", "SATA", 3, 0, None).unwrap(),
+            strings(&[
+                "storageattach", "Ubuntu", "--storagectl", "SATA", "--port", "3", "--device", "0",
+                "--type", "hdd", "--medium", "none"
+            ])
+        );
+
+        assert!(createmedium_args(Path::new("--mal.vdi"), 10).is_err());
+        assert!(createmedium_args(path, 0).is_err());
+        assert!(storagectl_args("--vm").is_err());
+        assert!(storageattach_args("Ubuntu", "--ctl", 0, 0, None).is_err());
+        assert!(storageattach_args("Ubuntu", "SATA", 0, 0, Some(Path::new("--mal.vdi"))).is_err());
+    }
+
+    #[test]
+    fn parses_medium_size_in_megabytes() {
+        assert_eq!(parse_medium_size_mb("capacity=10737418240\n"), Some(10_240));
+        assert_eq!(parse_medium_size_mb("Size=\"20480MB\"\n"), Some(20_480));
+        assert_eq!(parse_medium_size_mb("Capacity=\"20GB\"\n"), Some(20_480));
+        let realistic = "VDI Image Information:\n\
+                         UUID:                 12345678-1234-1234-1234-123456789abc\n\
+                         Format:               VDI\n\
+                         Storage format:       Standard\n\
+                         Capacity:             10240 MBytes\n\
+                         Location:             C:\\VMs\\disco.vdi\n";
+        assert_eq!(parse_medium_size_mb(realistic), Some(10_240));
+        assert_eq!(parse_medium_size_mb("Capacity:       20 GBytes\n"), Some(20_480));
+        assert_eq!(
+            parse_medium_size_mb("UUID: 1234\nFormat: VDI\nLocation: C:\\VMs\\disco.vdi\n"),
+            None
+        );
+        assert_eq!(parse_medium_size_mb("otro=1\n"), None);
     }
 }

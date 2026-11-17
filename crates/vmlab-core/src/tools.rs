@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub struct Tools {
     pub vboxmanage: Option<PathBuf>,
     pub docker: Option<PathBuf>,
+    /// Carpeta de discos decidida por el backend. No viaja a la UI ni la aporta
+    /// el frontend: Tauri la rellena antes de llamar a `engine::apply`.
+    #[serde(skip)]
+    pub disks_dir: Option<PathBuf>,
 }
 
 impl Tools {
@@ -16,6 +20,7 @@ impl Tools {
         Self {
             vboxmanage: find("VBoxManage", &vbox_candidates()),
             docker: find("docker", &docker_candidates()),
+            disks_dir: None,
         }
     }
 

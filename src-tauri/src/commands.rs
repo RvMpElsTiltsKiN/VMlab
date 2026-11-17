@@ -108,8 +108,17 @@ pub async fn open_terminal(
 }
 
 #[tauri::command]
-pub async fn apply_topology(state: State<'_, AppState>, topology: Topology) -> Result<ApplyReport, String> {
-    Ok(engine::apply(&state.tools().await, &topology).await)
+pub async fn apply_topology(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    topology: Topology,
+) -> Result<ApplyReport, String> {
+    // La carpeta de discos la decide el backend con la ruta de datos de la app;
+    // el frontend nunca puede enviar una ruta. No se crea aquí: `engine::apply`
+    // la crea solo cuando hay un VDI que construir.
+    let mut tools = state.tools().await;
+    tools.disks_dir = Some(app.path().app_data_dir().map_err(s)?.join("disks"));
+    Ok(engine::apply(&tools, &topology).await)
 }
 
 /// Aplica las condiciones de red de un nodo (netem en Docker, límite en VirtualBox).

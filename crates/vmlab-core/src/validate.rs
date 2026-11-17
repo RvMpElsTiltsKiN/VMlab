@@ -6,6 +6,11 @@ use crate::model::{DockerRunOptions, EdgeKind, LinkConditions, NodeKind, NodeSpe
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
+/// Tamaño usado al crear un VDI cuando el lienzo no indica uno.
+pub const DEFAULT_VDI_SIZE_MB: u32 = 10_240;
+/// Límite superior del `--size` de `VBoxManage createmedium` (≈ 2 TB).
+pub const MAX_VDI_SIZE_MB: u32 = 2_000_000;
+
 fn bad<T>(what: &str, v: &str) -> Result<T> {
     Err(CoreError::Invalid(format!("{what} «{}»", v.chars().take(60).collect::<String>())))
 }
@@ -281,11 +286,77 @@ pub fn mount_path(s: &str) -> Result<&str> {
     if ok { Ok(s) } else { bad("ruta de montaje no válida", s) }
 }
 
+/// Tipo de almacenamiento que necesita un disco, según sus enlaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskKind {
+    /// Volumen Docker montado en uno o más contenedores.
+    Docker,
+    /// VDI exclusivo conectado a una máquina virtual.
+    Vdi,
+    /// Sin enlaces: todavía no crea nada.
+    Unused,
+}
+
+/// Clasifica un disco mirando tanto `disk.mounts` como las aristas del lienzo.
+/// Un mismo disco no puede mezclar contenedores y máquinas virtuales.
+pub fn disk_kind(t: &Topology, disk: &NodeSpec) -> Result<DiskKind> {
+    let Some(spec) = disk.disk.as_ref() else {
+        return Err(CoreError::Invalid(format!(
+            "el disco «{}» no tiene configuración de montajes",
+            disk.display()
+        )));
+    };
+    let by_id: HashMap<&str, &NodeSpec> = t.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut found: Option<DiskKind> = None;
+    let mut register = |id: &str| -> Result<()> {
+        let Some(target) = by_id.get(id) else {
+            return Err(CoreError::Invalid(format!(
+                "el disco «{}» enlaza con «{}», que no está en el lienzo",
+                disk.display(),
+                id
+            )));
+        };
+        let kind = match target.kind {
+            NodeKind::Docker => DiskKind::Docker,
+            NodeKind::Vbox => DiskKind::Vdi,
+            NodeKind::Disk => {
+                return Err(CoreError::Invalid(format!(
+                    "el disco «{}» no puede enlazarse con otro disco",
+                    disk.display()
+                )))
+            }
+        };
+        match found {
+            Some(previous) if previous != kind => {
+                return Err(CoreError::Invalid(format!(
+                    "el disco «{}» no puede enlazarse a contenedores Docker y máquinas virtuales a la vez",
+                    disk.display()
+                )));
+            }
+            Some(_) => {}
+            None => found = Some(kind),
+        }
+        Ok(())
+    };
+    for m in &spec.mounts {
+        register(&m.container)?;
+    }
+    for e in &t.edges {
+        if e.from == disk.id {
+            register(&e.to)?;
+        }
+        if e.to == disk.id {
+            register(&e.from)?;
+        }
+    }
+    Ok(found.unwrap_or(DiskKind::Unused))
+}
+
 /// Valida la parte de discos de una topología: nombres y rutas, enlaces
-/// Disco↔contenedor, modo exclusivo/compartido y rutas duplicadas.
+/// Disco↔nodo, modo exclusivo/compartido y rutas duplicadas.
 ///
-/// Es una comprobación pura que se ejecuta **antes** de tocar Docker. No mira
-/// redes ni plantillas: una topología sin discos siempre es válida.
+/// Es una comprobación pura que se ejecuta **antes** de tocar Docker o
+/// VirtualBox. No mira redes ni plantillas: una topología sin discos siempre es válida.
 pub fn disk_topology(t: &Topology) -> Result<()> {
     let by_id: HashMap<&str, &NodeSpec> = t.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let disks: Vec<&NodeSpec> = t.nodes.iter().filter(|n| n.kind == NodeKind::Disk).collect();
@@ -300,62 +371,124 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
         }
     }
 
-    let mut volumes = HashSet::new();
-    let mut occupied: HashSet<(&str, String)> = HashSet::new();
+    // El nombre se valida igual para volúmenes y para VDI: serviría para
+    // construir ambos nombres de fichero.
+    let mut names = HashSet::new();
     for d in &disks {
         let volume = volume_name(&d.target)?;
-        if !volumes.insert(volume) {
+        if !names.insert(volume) {
             return Err(CoreError::Invalid(format!(
                 "hay dos discos con el nombre «{}»",
                 d.display()
             )));
         }
-        let Some(spec) = d.disk.as_ref() else {
-            return Err(CoreError::Invalid(format!(
-                "el disco «{}» no tiene configuración de montajes",
-                d.display()
-            )));
-        };
-        if !spec.shared && spec.mounts.len() > 1 {
-            return Err(CoreError::Invalid(format!(
-                "el disco «{}» es exclusivo pero tiene {} enlaces de montaje; \
-                 márcalo como compartido o deja un solo contenedor",
-                d.display(),
-                spec.mounts.len()
-            )));
+        let spec = d.disk.as_ref().ok_or_else(|| {
+            CoreError::Invalid(format!("el disco «{}» no tiene configuración de montajes", d.display()))
+        })?;
+        if let Some(size) = spec.size_mb {
+            if !(1..=MAX_VDI_SIZE_MB).contains(&size) {
+                return Err(CoreError::Invalid(format!(
+                    "el tamaño del disco «{}» debe estar entre 1 y {MAX_VDI_SIZE_MB} MB",
+                    d.display()
+                )));
+            }
         }
-        let mut paths = HashSet::new();
-        for m in &spec.mounts {
-            mount_path(&m.path)?;
-            let Some(container) = by_id.get(m.container.as_str()) else {
-                return Err(CoreError::Invalid(format!(
-                    "el disco «{}» enlaza con «{}», que no está en el lienzo",
-                    d.display(),
-                    m.container
-                )));
-            };
-            if container.kind != NodeKind::Docker {
-                return Err(CoreError::Invalid(format!(
-                    "los discos solo se pueden enlazar a contenedores Docker; \
-                     «{}» no es un contenedor (el enlace con VMs llegará en una fase posterior)",
-                    container.display()
-                )));
+    }
+
+    let mut occupied: HashSet<(&str, String)> = HashSet::new();
+    for d in &disks {
+        let spec = d.disk.as_ref().expect("nombre validado arriba");
+        match disk_kind(t, d)? {
+            DiskKind::Unused => continue,
+            DiskKind::Vdi => {
+                let mut links: HashSet<&str> = spec.mounts.iter().map(|m| m.container.as_str()).collect();
+                for e in &t.edges {
+                    if e.from == d.id {
+                        links.insert(e.to.as_str());
+                    }
+                    if e.to == d.id {
+                        links.insert(e.from.as_str());
+                    }
+                }
+                if spec.shared {
+                    return Err(CoreError::Invalid(
+                        "el modo compartido con máquinas virtuales todavía no está disponible".into(),
+                    ));
+                }
+                if links.len() > 1 || spec.mounts.len() > 1 {
+                    return Err(CoreError::Invalid(format!(
+                        "el disco «{}» solo se puede enlazar con una máquina virtual",
+                        d.display()
+                    )));
+                }
+                for m in &spec.mounts {
+                    let Some(vm) = by_id.get(m.container.as_str()) else {
+                        return Err(CoreError::Invalid(format!(
+                            "el disco «{}» enlaza con «{}», que no está en el lienzo",
+                            d.display(),
+                            m.container
+                        )));
+                    };
+                    if vm.kind != NodeKind::Vbox {
+                        return Err(CoreError::Invalid(format!(
+                            "el disco «{}» mezcla enlaces de contenedor y de máquina virtual",
+                            d.display()
+                        )));
+                    }
+                    vbox_target(&vm.target)?;
+                    // Las rutas solo aplican a contenedores. Si la UI envía una
+                    // por compatibilidad con la fase A, se ignora.
+                }
             }
-            let path = normalize_mount_path(&m.path);
-            if !paths.insert((m.container.as_str(), path.clone())) {
-                return Err(CoreError::Invalid(format!(
-                    "el disco «{}» tiene dos montajes en la misma ruta «{}» del contenedor «{}»",
-                    d.display(),
-                    m.path,
-                    container.display()
-                )));
-            }
-            if !occupied.insert((container.target.as_str(), path)) {
-                return Err(CoreError::Invalid(format!(
-                    "el contenedor «{}» ya tiene otro disco montado en «{}»",
-                    container.display(),
-                    m.path
-                )));
+            DiskKind::Docker => {
+                if !spec.shared && spec.mounts.len() > 1 {
+                    return Err(CoreError::Invalid(format!(
+                        "el disco «{}» es exclusivo pero tiene {} enlaces de montaje; \
+                         márcalo como compartido o deja un solo contenedor",
+                        d.display(),
+                        spec.mounts.len()
+                    )));
+                }
+                let mut paths = HashSet::new();
+                for m in &spec.mounts {
+                    let Some(path) = m.path.as_deref().filter(|p| !p.is_empty()) else {
+                        return Err(CoreError::Invalid(format!(
+                            "el disco «{}» necesita una ruta de montaje para «{}»",
+                            d.display(),
+                            m.container
+                        )));
+                    };
+                    mount_path(path)?;
+                    let Some(container) = by_id.get(m.container.as_str()) else {
+                        return Err(CoreError::Invalid(format!(
+                            "el disco «{}» enlaza con «{}», que no está en el lienzo",
+                            d.display(),
+                            m.container
+                        )));
+                    };
+                    if container.kind != NodeKind::Docker {
+                        return Err(CoreError::Invalid(format!(
+                            "el disco «{}» mezcla enlaces de contenedor y de máquina virtual",
+                            d.display()
+                        )));
+                    }
+                    let path = normalize_mount_path(path);
+                    if !paths.insert((m.container.as_str(), path.clone())) {
+                        return Err(CoreError::Invalid(format!(
+                            "el disco «{}» tiene dos montajes en la misma ruta «{}» del contenedor «{}»",
+                            d.display(),
+                            path,
+                            container.display()
+                        )));
+                    }
+                    if !occupied.insert((container.target.as_str(), path.clone())) {
+                        return Err(CoreError::Invalid(format!(
+                            "el contenedor «{}» ya tiene otro disco montado en «{}»",
+                            container.display(),
+                            path
+                        )));
+                    }
+                }
             }
         }
     }
@@ -384,10 +517,9 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
                 "el disco «{disk_id}» está enlazado con «{other_id}», que no está en el lienzo"
             )));
         };
-        if other.kind != NodeKind::Docker {
+        if !matches!(other.kind, NodeKind::Docker | NodeKind::Vbox) {
             return Err(CoreError::Invalid(format!(
-                "los discos solo se pueden enlazar a contenedores Docker; \
-                 «{}» no es un contenedor (el enlace con VMs llegará en una fase posterior)",
+                "el disco «{disk_id}» solo se puede enlazar con contenedores o máquinas virtuales; «{}» no es válido",
                 other.display()
             )));
         }
@@ -399,8 +531,13 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
             .as_ref()
             .is_some_and(|spec| spec.mounts.iter().any(|m| m.container == other_id));
         if !linked {
+            let detail = if other.kind == NodeKind::Vbox {
+                "no tiene un enlace en el disco"
+            } else {
+                "no tiene una ruta de montaje"
+            };
             return Err(CoreError::Invalid(format!(
-                "el enlace del disco «{}» con «{}» no tiene una ruta de montaje",
+                "el enlace del disco «{}» con «{}» {detail}",
                 disk.display(),
                 other.display()
             )));
@@ -415,9 +552,14 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
                 .iter()
                 .any(|e| (e.from == d.id && e.to == m.container) || (e.to == d.id && e.from == m.container));
             if !linked {
+                let label = m
+                    .path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(m.container.as_str());
                 return Err(CoreError::Invalid(format!(
                     "el montaje «{}» del disco «{}» no tiene un enlace en el lienzo",
-                    m.path,
+                    label,
                     d.display()
                 )));
             }
@@ -743,8 +885,26 @@ mod tests {
                 shared,
                 mounts: mounts
                     .iter()
-                    .map(|(container, path)| DiskMount { container: (*container).into(), path: (*path).into() })
+                    .map(|(container, path)| DiskMount {
+                        container: (*container).into(),
+                        path: Some((*path).into()),
+                    })
                     .collect(),
+                size_mb: None,
+            }),
+            ..NodeSpec::default()
+        }
+    }
+
+    fn vm_disk(id: &str, shared: bool, size_mb: Option<u32>, vm: &str) -> NodeSpec {
+        NodeSpec {
+            id: id.into(),
+            kind: NodeKind::Disk,
+            target: id.into(),
+            disk: Some(DiskSpec {
+                shared,
+                mounts: vec![DiskMount { container: vm.into(), path: None }],
+                size_mb,
             }),
             ..NodeSpec::default()
         }
@@ -833,17 +993,102 @@ mod tests {
     }
 
     #[test]
-    fn disk_cannot_be_linked_to_a_virtual_machine_yet() {
+    fn a_vm_disk_is_valid_without_a_mount_path() {
         let t = Topology {
-            nodes: vec![
-                machine("vm", NodeKind::Vbox),
-                disk("datos", false, &[("vm", "/data")]),
-            ],
+            nodes: vec![machine("vm", NodeKind::Vbox), vm_disk("datos", false, None, "vm")],
+            edges: vec![link("datos", "vm")],
+        };
+        assert_eq!(disk_kind(&t, &t.nodes[1]).unwrap(), DiskKind::Vdi);
+        assert!(disk_topology(&t).is_ok());
+    }
+
+    #[test]
+    fn shared_mode_with_virtual_machines_is_rejected() {
+        let t = Topology {
+            nodes: vec![machine("vm", NodeKind::Vbox), vm_disk("datos", true, None, "vm")],
             edges: vec![link("datos", "vm")],
         };
         let err = disk_topology(&t).unwrap_err().to_string();
-        assert!(err.contains("contenedores Docker"), "{err}");
-        assert!(err.contains("fase posterior"), "{err}");
+        assert_eq!(err, "entrada no válida: el modo compartido con máquinas virtuales todavía no está disponible");
+    }
+
+    #[test]
+    fn a_vm_disk_rejects_more_than_one_link() {
+        let t = Topology {
+            nodes: vec![
+                machine("vm1", NodeKind::Vbox),
+                machine("vm2", NodeKind::Vbox),
+                NodeSpec {
+                    id: "datos".into(),
+                    kind: NodeKind::Disk,
+                    target: "datos".into(),
+                    disk: Some(DiskSpec {
+                        shared: false,
+                        mounts: vec![
+                            DiskMount { container: "vm1".into(), path: None },
+                            DiskMount { container: "vm2".into(), path: None },
+                        ],
+                        size_mb: None,
+                    }),
+                    ..NodeSpec::default()
+                },
+            ],
+            edges: vec![link("datos", "vm1"), link("datos", "vm2")],
+        };
+        let err = disk_topology(&t).unwrap_err().to_string();
+        assert!(err.contains("una máquina virtual"), "{err}");
+    }
+
+    #[test]
+    fn a_disk_cannot_mix_docker_and_virtual_machine_links() {
+        let t = Topology {
+            nodes: vec![
+                machine("web", NodeKind::Docker),
+                machine("vm", NodeKind::Vbox),
+                NodeSpec {
+                    id: "datos".into(),
+                    kind: NodeKind::Disk,
+                    target: "datos".into(),
+                    disk: Some(DiskSpec {
+                        shared: true,
+                        mounts: vec![
+                            DiskMount { container: "web".into(), path: Some("/data".into()) },
+                            DiskMount { container: "vm".into(), path: None },
+                        ],
+                        size_mb: None,
+                    }),
+                    ..NodeSpec::default()
+                },
+            ],
+            edges: vec![link("datos", "web"), link("datos", "vm")],
+        };
+        let err = disk_kind(&t, &t.nodes[2]).unwrap_err().to_string();
+        assert!(err.contains("no puede enlazarse a contenedores Docker y máquinas virtuales"), "{err}");
+        assert!(disk_topology(&t).is_err());
+    }
+
+    #[test]
+    fn vm_disk_size_must_be_in_range() {
+        for size in [0, MAX_VDI_SIZE_MB + 1] {
+            let t = Topology {
+                nodes: vec![
+                    machine("vm", NodeKind::Vbox),
+                    vm_disk("datos", false, Some(size), "vm"),
+                ],
+                edges: vec![link("datos", "vm")],
+            };
+            let err = disk_topology(&t).unwrap_err().to_string();
+            assert!(err.contains("tamaño"), "{err}");
+            assert!(err.contains(&MAX_VDI_SIZE_MB.to_string()), "{err}");
+        }
+        let t = Topology {
+            nodes: vec![
+                machine("vm", NodeKind::Vbox),
+                vm_disk("datos", false, Some(MAX_VDI_SIZE_MB), "vm"),
+            ],
+            edges: vec![link("datos", "vm")],
+        };
+        assert!(disk_topology(&t).is_ok());
     }
 
     #[test]
