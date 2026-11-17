@@ -73,6 +73,9 @@ pub fn open(
             let args = ssh_args(user, host)?;
             (ssh_exe()?, args)
         }
+        NodeKind::Disk => {
+            return Err(CoreError::Invalid("un disco no tiene terminal".into()));
+        }
     };
 
     launch(&program, &args)

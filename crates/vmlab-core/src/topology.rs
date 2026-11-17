@@ -1,7 +1,7 @@
 //! Planificación pura (sin I/O): agrupa los nodos conectados por aristas en segmentos de red.
 //! Cada componente conexo con ≥ 2 nodos es una red local; el resto son nodos aislados.
-use crate::model::{NodeKind, NodeSpec, Topology};
-use std::collections::{BTreeMap, HashMap};
+use crate::model::{EdgeKind, NodeKind, NodeSpec, Topology};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
@@ -45,8 +45,19 @@ fn segment_name(ids: &mut Vec<&str>) -> String {
 
 pub fn plan(t: &Topology) -> Plan {
     let index: HashMap<&str, usize> = t.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+    // Un disco no es un nodo de red: sus enlaces son montajes y no deben unir
+    // contenedores ni cambiar el nombre (hash) del segmento.
+    let disks: HashSet<&str> = t
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Disk)
+        .map(|n| n.id.as_str())
+        .collect();
     let mut parent: Vec<usize> = (0..t.nodes.len()).collect();
     for e in &t.edges {
+        if e.kind != EdgeKind::Network || disks.contains(e.from.as_str()) || disks.contains(e.to.as_str()) {
+            continue;
+        }
         if let (Some(&a), Some(&b)) = (index.get(e.from.as_str()), index.get(e.to.as_str())) {
             let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
             if ra != rb {
@@ -56,6 +67,9 @@ pub fn plan(t: &Topology) -> Plan {
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for i in 0..t.nodes.len() {
+        if disks.contains(t.nodes[i].id.as_str()) {
+            continue;
+        }
         let r = find(&mut parent, i);
         groups.entry(r).or_default().push(i);
     }
@@ -87,10 +101,13 @@ mod tests {
     use crate::model::Edge;
 
     fn n(id: &str, kind: NodeKind) -> NodeSpec {
-        NodeSpec { id: id.into(), kind, target: id.into(), image: None, options: None, label: None, net: None, link: None }
+        NodeSpec { id: id.into(), kind, target: id.into(), ..NodeSpec::default() }
     }
     fn e(a: &str, b: &str) -> Edge {
-        Edge { from: a.into(), to: b.into() }
+        Edge { from: a.into(), to: b.into(), kind: EdgeKind::Network }
+    }
+    fn mount(a: &str, b: &str) -> Edge {
+        Edge { from: a.into(), to: b.into(), kind: EdgeKind::Mount }
     }
 
     #[test]
@@ -130,5 +147,54 @@ mod tests {
     fn mixed_segment_warns() {
         let t = Topology { nodes: vec![n("a", NodeKind::Vbox), n("b", NodeKind::Docker)], edges: vec![e("a", "b")] };
         assert_eq!(plan(&t).warnings.len(), 1);
+    }
+
+    #[test]
+    fn a_disk_does_not_join_two_containers() {
+        let t = Topology {
+            nodes: vec![
+                n("web", NodeKind::Docker),
+                n("db", NodeKind::Docker),
+                n("datos", NodeKind::Disk),
+            ],
+            edges: vec![mount("datos", "web"), mount("datos", "db")],
+        };
+        let p = plan(&t);
+        assert!(p.segments.is_empty(), "un montaje no crea red");
+        assert_eq!(p.isolated.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["web", "db"]);
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_disk_does_not_change_the_segment_name() {
+        let base = Topology {
+            nodes: vec![n("web", NodeKind::Docker), n("db", NodeKind::Docker)],
+            edges: vec![e("web", "db")],
+        };
+        let with_disk = Topology {
+            nodes: vec![
+                n("web", NodeKind::Docker),
+                n("db", NodeKind::Docker),
+                n("datos", NodeKind::Disk),
+            ],
+            edges: vec![e("web", "db"), mount("datos", "web"), mount("datos", "db")],
+        };
+        let (a, b) = (plan(&base), plan(&with_disk));
+        assert_eq!(a.segments.len(), 1);
+        assert_eq!(b.segments.len(), 1);
+        assert_eq!(a.segments[0].name, b.segments[0].name);
+        assert_eq!(b.segments[0].nodes.len(), 2, "el disco no entra en el segmento");
+        assert_eq!(b.isolated.len(), 0);
+    }
+
+    #[test]
+    fn network_edges_through_a_disk_are_ignored() {
+        let t = Topology {
+            nodes: vec![n("a", NodeKind::Docker), n("b", NodeKind::Docker), n("d", NodeKind::Disk)],
+            edges: vec![e("a", "d"), e("d", "b")],
+        };
+        let p = plan(&t);
+        assert!(p.segments.is_empty());
+        assert_eq!(p.isolated.len(), 2);
     }
 }

@@ -2,8 +2,9 @@
 use crate::error::{CoreError, Result};
 use crate::model::*;
 use crate::tools::Tools;
-use crate::{connectivity, docker, docker_desktop, guest, netem, topology, vbox};
-use std::collections::{HashMap, HashSet};
+use crate::{connectivity, disks, docker, docker_desktop, guest, netem, topology, vbox};
+use crate::docker::MountInfo;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 fn vbox_state(running: bool) -> PowerState {
     if running { PowerState::Running } else { PowerState::Stopped }
@@ -11,14 +12,41 @@ fn vbox_state(running: bool) -> PowerState {
 
 /// Crea (sin arrancar) el contenedor de un nodo Docker del segmento cuando todavía
 /// no existe y el nodo tiene imagen. Sin imagen no se toca nada.
-async fn create_missing(tools: &Tools, n: &NodeSpec) -> Result<()> {
+/// Los montajes del plan se pasan a `docker create` con `-v`.
+async fn create_missing(tools: &Tools, n: &NodeSpec, mounts: &BTreeSet<MountInfo>) -> Result<()> {
     let Some(image) = n.image.as_deref().filter(|i| !i.is_empty()) else {
         return Ok(());
     };
     if docker::exists(tools, &n.target).await? {
         return Ok(());
     }
-    docker::create_container(tools, &n.target, image, n.options.as_ref()).await
+    let mounts: Vec<MountInfo> = mounts.iter().cloned().collect();
+    docker::create_container_with_mounts(tools, &n.target, image, n.options.as_ref(), &mounts).await
+}
+
+/// Si el contenedor ya existe pero sus montajes no coinciden con el plan, hay que
+/// recrearlo: `docker create` no admite cambiar `-v` de un contenedor existente.
+/// Devuelve `true` cuando se ha recreado. El volumen nunca se borra.
+async fn sync_mounts(
+    tools: &Tools,
+    n: &NodeSpec,
+    planned: &BTreeSet<MountInfo>,
+) -> Result<bool> {
+    if !docker::exists(tools, &n.target).await? {
+        return Ok(false);
+    }
+    let current = docker::mounts(tools, &n.target).await?;
+    if docker::mounts_match(&current, planned) {
+        return Ok(false);
+    }
+    let image = match n.image.as_deref().filter(|i| !i.is_empty()) {
+        Some(image) => image.to_string(),
+        None => docker::container_image(tools, &n.target).await?,
+    };
+    let mounts: Vec<MountInfo> = planned.iter().cloned().collect();
+    docker::remove_container(tools, &n.target).await?;
+    docker::create_container_with_mounts(tools, &n.target, &image, n.options.as_ref(), &mounts).await?;
+    Ok(true)
 }
 
 pub async fn inventory(tools: &Tools) -> Inventory {
@@ -109,6 +137,9 @@ pub async fn act(
     match kind {
         NodeKind::Vbox => vbox::action(tools, target, a).await,
         NodeKind::Docker => docker::action(tools, target, image, options, a).await,
+        NodeKind::Disk => Err(CoreError::Invalid(
+            "un disco no se puede encender ni apagar; solo se crea el volumen".into(),
+        )),
     }
 }
 
@@ -149,8 +180,25 @@ pub async fn docker_stop(tools: &Tools) -> Result<()> {
 
 /// Aplica la topología del lienzo al sistema. Nunca aborta a la mitad: acumula errores por nodo.
 pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
+    // Los discos se validan antes de cualquier operación: un enlace a una VM o un
+    // disco exclusivo con varios contenedores no debe aplicar parte de la red.
+    if let Err(e) = crate::validate::disk_topology(t) {
+        return ApplyReport { errors: vec![e.to_string()], ..Default::default() };
+    }
+    let disk_plans = match disks::plan(t) {
+        Ok(plans) => plans,
+        Err(e) => return ApplyReport { errors: vec![e.to_string()], ..Default::default() },
+    };
+    let mounts_by_container = disks::mounts_by_container(&disk_plans);
+    let no_mounts: BTreeSet<MountInfo> = BTreeSet::new();
+
     let plan = topology::plan(t);
     let mut rep = ApplyReport { warnings: plan.warnings.clone(), ..Default::default() };
+    for d in &disk_plans {
+        if let Err(e) = docker::volume_create(tools, &d.volume).await {
+            rep.errors.push(format!("{}: {e}", d.node.display()));
+        }
+    }
     let running: HashSet<String> = if tools.vboxmanage.is_some() {
         vbox::running_keys(tools).await.unwrap_or_default()
     } else {
@@ -176,16 +224,32 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
                 )),
                 NodeKind::Vbox => vbox::set_nic(tools, &n.target, &net, Some(&seg.name)).await,
                 NodeKind::Docker => {
+                    let planned = mounts_by_container.get(n.target.as_str()).unwrap_or(&no_mounts);
+                    let recreated = match sync_mounts(tools, n, planned).await {
+                        Ok(value) => value,
+                        Err(e) => {
+                            rep.errors.push(format!("{}: {e}", n.display()));
+                            continue;
+                        }
+                    };
+                    if recreated {
+                        rep.warnings.push(format!(
+                            "«{}»: cambiaron los montajes, así que se ha recreado el contenedor. El volumen se ha conservado. Se pierde el estado del sistema de ficheros del contenedor que no esté en volúmenes (solo se conservan los volúmenes de VMLab).",
+                            n.display()
+                        ));
+                    }
                     let ready = if docker_net_ready { Ok(()) } else { docker::ensure_network(tools, &seg.name).await };
                     docker_net_ready = ready.is_ok();
                     match ready {
-                        Ok(()) => match create_missing(tools, n).await {
+                        Ok(()) => match create_missing(tools, n, planned).await {
                             Ok(()) => docker::set_networks(tools, &n.target, Some(&seg.name)).await,
                             Err(e) => Err(e),
                         },
                         Err(e) => Err(e),
                     }
                 }
+                // Los discos no pertenecen a segmentos de red: no hay nada que hacer.
+                NodeKind::Disk => Ok(()),
             };
             match res {
                 Ok(()) => rep.applied += 1,
@@ -221,7 +285,29 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
 
         let res = match n.kind {
             NodeKind::Vbox => vbox::set_nic(tools, &n.target, &net, None).await,
-            NodeKind::Docker => docker::set_networks(tools, &n.target, None).await,
+            NodeKind::Docker => {
+                let planned = mounts_by_container.get(n.target.as_str()).unwrap_or(&no_mounts);
+                let recreated = match sync_mounts(tools, n, planned).await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        rep.errors.push(format!("{}: {e}", n.display()));
+                        continue;
+                    }
+                };
+                if recreated {
+                    rep.warnings.push(format!(
+                        "«{}»: cambiaron los montajes, así que se ha recreado el contenedor. El volumen se ha conservado. Se pierde el estado del sistema de ficheros del contenedor que no esté en volúmenes (solo se conservan los volúmenes de VMLab).",
+                        n.display()
+                    ));
+                }
+                // Un nodo aislado sí puede tener discos: se crea con sus `-v`
+                // aunque no tenga red, y luego se desconecta de las gestionadas.
+                match create_missing(tools, n, planned).await {
+                    Ok(()) => docker::set_networks(tools, &n.target, None).await,
+                    Err(e) => Err(e),
+                }
+            }
+            NodeKind::Disk => Ok(()),
         };
         if let Err(e) = res {
             rep.errors.push(format!("{}: {e}", n.display()));
@@ -236,6 +322,7 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
             continue;
         }
         let is_on = match n.kind {
+            NodeKind::Disk => false,
             NodeKind::Vbox => running.contains(&n.target),
             NodeKind::Docker => match netem::is_running(tools, &n.target).await {
                 Ok(value) => value,
@@ -270,6 +357,7 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
             NodeKind::Docker => netem::apply_docker(tools, &n.target, conditions)
                 .await
                 .map(|_| None),
+            NodeKind::Disk => Ok(None),
         };
         match result {
             Ok(Some(warning)) => rep.warnings.push(format!("{}: {warning}", n.display())),

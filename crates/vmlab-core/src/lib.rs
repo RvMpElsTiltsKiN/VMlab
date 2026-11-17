@@ -8,6 +8,7 @@
 pub mod capture;
 pub mod compose;
 pub mod connectivity;
+pub mod disks;
 pub mod docker;
 pub mod docker_desktop;
 pub mod engine;

@@ -2,8 +2,8 @@
 //! Como no hay shell, el riesgo real es la *inyección de opciones* (un valor que
 //! empieza por `-` y se interpreta como flag), por eso todos los validadores lo prohíben.
 use crate::error::{CoreError, Result};
-use crate::model::{DockerRunOptions, LinkConditions};
-use std::collections::HashSet;
+use crate::model::{DockerRunOptions, EdgeKind, LinkConditions, NodeKind, NodeSpec, Topology};
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 fn bad<T>(what: &str, v: &str) -> Result<T> {
@@ -192,6 +192,240 @@ pub fn labsnap_slug(label: &str) -> String {
     out
 }
 
+/// Normaliza el nombre visible de un disco a `[a-z0-9][a-z0-9_.-]{0,39}`.
+///
+/// Las tildes y la `ñ` se convierten a su letra base; cualquier otro carácter
+/// que no sea una letra ASCII, un dígito, `_` o `.` se convierte en un guion.
+/// Los separadores repetidos se colapsan y los de los extremos se eliminan,
+/// igual que en los identificadores de instantáneas.
+pub fn sanitize_disk_name(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        let base = match c {
+            'á' | 'à' | 'ä' | 'â' | 'ã' | 'å' | 'Á' | 'À' | 'Ä' | 'Â' | 'Ã' | 'Å' => 'a',
+            'é' | 'è' | 'ë' | 'ê' | 'É' | 'È' | 'Ë' | 'Ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' | 'Í' | 'Ì' | 'Ï' | 'Î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' | 'õ' | 'Ó' | 'Ò' | 'Ö' | 'Ô' | 'Õ' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' | 'Ú' | 'Ù' | 'Ü' | 'Û' => 'u',
+            'ñ' | 'Ñ' => 'n',
+            'ç' | 'Ç' => 'c',
+            c if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
+            '_' | '.' => c,
+            _ => '-',
+        };
+        if base == '-' {
+            if !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+        } else {
+            out.push(base);
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let mut result: String = trimmed.chars().take(40).collect();
+    while result.chars().last().is_some_and(|c| !c.is_ascii_alphanumeric()) {
+        result.pop();
+    }
+    result
+}
+
+/// Nombre base de un disco ya saneado: `[a-z0-9][a-z0-9_.-]{0,39}`.
+pub fn disk_name(s: &str) -> Result<&str> {
+    let mut chars = s.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.len() <= 40
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'));
+    if ok { Ok(s) } else { bad("nombre de disco no válido", s) }
+}
+
+/// Nombre real del volumen Docker: `vmlab-vol-<nombre saneado>`.
+pub fn volume_name(s: &str) -> Result<String> {
+    let clean = sanitize_disk_name(s);
+    disk_name(&clean)?;
+    Ok(format!("vmlab-vol-{clean}"))
+}
+
+/// Comprueba un nombre de volumen ya construido (`vmlab-vol-<x>`).
+pub fn disk_volume_name(s: &str) -> Result<&str> {
+    let Some(rest) = s.strip_prefix("vmlab-vol-") else {
+        return bad("nombre de volumen no válido", s);
+    };
+    disk_name(rest)?;
+    Ok(s)
+}
+
+/// Rutas del sistema que nunca se montan como disco de datos.
+const DANGEROUS_MOUNT_PATHS: [&str; 7] = ["/", "/proc", "/sys", "/dev", "/etc", "/var/run", "/run"];
+
+/// Normaliza una ruta de montaje para compararla (sin barras finales).
+pub fn normalize_mount_path(s: &str) -> String {
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+}
+
+/// Ruta de montaje dentro del contenedor: absoluta tipo Linux, sin `:` ni `,`
+/// (Docker los usa como separadores de `-v`), sin controles, sin `..` y fuera
+/// de las rutas peligrosas del sistema.
+pub fn mount_path(s: &str) -> Result<&str> {
+    let normalized = normalize_mount_path(s);
+    let ok = s.starts_with('/')
+        && s.chars().count() <= 1024
+        && !s.contains(':')
+        && !s.contains(',')
+        && !s.contains('\\')
+        && !s.chars().any(|c| c.is_control())
+        && !s.split('/').any(|part| part == "..")
+        && !DANGEROUS_MOUNT_PATHS
+            .iter()
+            .any(|p| normalized == *p || normalized.starts_with(&format!("{p}/")));
+    if ok { Ok(s) } else { bad("ruta de montaje no válida", s) }
+}
+
+/// Valida la parte de discos de una topología: nombres y rutas, enlaces
+/// Disco↔contenedor, modo exclusivo/compartido y rutas duplicadas.
+///
+/// Es una comprobación pura que se ejecuta **antes** de tocar Docker. No mira
+/// redes ni plantillas: una topología sin discos siempre es válida.
+pub fn disk_topology(t: &Topology) -> Result<()> {
+    let by_id: HashMap<&str, &NodeSpec> = t.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let disks: Vec<&NodeSpec> = t.nodes.iter().filter(|n| n.kind == NodeKind::Disk).collect();
+    let disk_ids: HashSet<&str> = disks.iter().map(|d| d.id.as_str()).collect();
+
+    for n in &t.nodes {
+        if n.kind != NodeKind::Disk && n.disk.is_some() {
+            return Err(CoreError::Invalid(format!(
+                "solo un nodo Disco puede tener montajes: «{}»",
+                n.display()
+            )));
+        }
+    }
+
+    let mut volumes = HashSet::new();
+    let mut occupied: HashSet<(&str, String)> = HashSet::new();
+    for d in &disks {
+        let volume = volume_name(&d.target)?;
+        if !volumes.insert(volume) {
+            return Err(CoreError::Invalid(format!(
+                "hay dos discos con el nombre «{}»",
+                d.display()
+            )));
+        }
+        let Some(spec) = d.disk.as_ref() else {
+            return Err(CoreError::Invalid(format!(
+                "el disco «{}» no tiene configuración de montajes",
+                d.display()
+            )));
+        };
+        if !spec.shared && spec.mounts.len() > 1 {
+            return Err(CoreError::Invalid(format!(
+                "el disco «{}» es exclusivo pero tiene {} enlaces de montaje; \
+                 márcalo como compartido o deja un solo contenedor",
+                d.display(),
+                spec.mounts.len()
+            )));
+        }
+        let mut paths = HashSet::new();
+        for m in &spec.mounts {
+            mount_path(&m.path)?;
+            let Some(container) = by_id.get(m.container.as_str()) else {
+                return Err(CoreError::Invalid(format!(
+                    "el disco «{}» enlaza con «{}», que no está en el lienzo",
+                    d.display(),
+                    m.container
+                )));
+            };
+            if container.kind != NodeKind::Docker {
+                return Err(CoreError::Invalid(format!(
+                    "los discos solo se pueden enlazar a contenedores Docker; \
+                     «{}» no es un contenedor (el enlace con VMs llegará en una fase posterior)",
+                    container.display()
+                )));
+            }
+            let path = normalize_mount_path(&m.path);
+            if !paths.insert((m.container.as_str(), path.clone())) {
+                return Err(CoreError::Invalid(format!(
+                    "el disco «{}» tiene dos montajes en la misma ruta «{}» del contenedor «{}»",
+                    d.display(),
+                    m.path,
+                    container.display()
+                )));
+            }
+            if !occupied.insert((container.target.as_str(), path)) {
+                return Err(CoreError::Invalid(format!(
+                    "el contenedor «{}» ya tiene otro disco montado en «{}»",
+                    container.display(),
+                    m.path
+                )));
+            }
+        }
+    }
+
+    for e in &t.edges {
+        let from_disk = disk_ids.contains(e.from.as_str());
+        let to_disk = disk_ids.contains(e.to.as_str());
+        if !from_disk && !to_disk {
+            if e.kind == EdgeKind::Mount {
+                return Err(CoreError::Invalid(
+                    "un enlace de montaje debe tener un disco en uno de sus extremos".into(),
+                ));
+            }
+            continue;
+        }
+        if from_disk && to_disk {
+            return Err(CoreError::Invalid("no se puede enlazar un disco con otro disco".into()));
+        }
+        let (disk_id, other_id) = if from_disk {
+            (e.from.as_str(), e.to.as_str())
+        } else {
+            (e.to.as_str(), e.from.as_str())
+        };
+        let Some(other) = by_id.get(other_id) else {
+            return Err(CoreError::Invalid(format!(
+                "el disco «{disk_id}» está enlazado con «{other_id}», que no está en el lienzo"
+            )));
+        };
+        if other.kind != NodeKind::Docker {
+            return Err(CoreError::Invalid(format!(
+                "los discos solo se pueden enlazar a contenedores Docker; \
+                 «{}» no es un contenedor (el enlace con VMs llegará en una fase posterior)",
+                other.display()
+            )));
+        }
+        let Some(disk) = by_id.get(disk_id) else {
+            continue;
+        };
+        let linked = disk
+            .disk
+            .as_ref()
+            .is_some_and(|spec| spec.mounts.iter().any(|m| m.container == other_id));
+        if !linked {
+            return Err(CoreError::Invalid(format!(
+                "el enlace del disco «{}» con «{}» no tiene una ruta de montaje",
+                disk.display(),
+                other.display()
+            )));
+        }
+    }
+
+    for d in &disks {
+        let Some(spec) = d.disk.as_ref() else { continue };
+        for m in &spec.mounts {
+            let linked = t
+                .edges
+                .iter()
+                .any(|e| (e.from == d.id && e.to == m.container) || (e.to == d.id && e.from == m.container));
+            if !linked {
+                return Err(CoreError::Invalid(format!(
+                    "el montaje «{}» del disco «{}» no tiene un enlace en el lienzo",
+                    m.path,
+                    d.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Límites de las condiciones de red de un nodo. Todos los valores llegan de la UI
 /// y se comprueban antes de convertirse en argumentos de `tc` o `VBoxManage`.
 pub fn link_conditions(c: &LinkConditions) -> Result<()> {
@@ -277,7 +511,7 @@ pub fn docker_run_options(o: &DockerRunOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EnvVar, PortMap, PortProto};
+    use crate::model::{DiskMount, DiskSpec, Edge, EnvVar, PortMap, PortProto};
 
     #[test]
     fn validates_docker_run_options() {
@@ -494,5 +728,168 @@ mod tests {
 
         let delay_out_of_range = LinkConditions { delay_ms: 10_001, jitter_ms: 0, ..ok };
         assert!(link_conditions(&delay_out_of_range).is_err());
+    }
+
+    fn machine(id: &str, kind: NodeKind) -> NodeSpec {
+        NodeSpec { id: id.into(), kind, target: id.into(), ..NodeSpec::default() }
+    }
+
+    fn disk(id: &str, shared: bool, mounts: &[(&str, &str)]) -> NodeSpec {
+        NodeSpec {
+            id: id.into(),
+            kind: NodeKind::Disk,
+            target: id.into(),
+            disk: Some(DiskSpec {
+                shared,
+                mounts: mounts
+                    .iter()
+                    .map(|(container, path)| DiskMount { container: (*container).into(), path: (*path).into() })
+                    .collect(),
+            }),
+            ..NodeSpec::default()
+        }
+    }
+
+    fn link(a: &str, b: &str) -> Edge {
+        Edge { from: a.into(), to: b.into(), kind: EdgeKind::Mount }
+    }
+
+    #[test]
+    fn sanitizes_and_validates_disk_names() {
+        assert_eq!(sanitize_disk_name("Datos DB"), "datos-db");
+        assert_eq!(sanitize_disk_name("--Datos..DB--"), "datos..db");
+        assert_eq!(sanitize_disk_name("áé ñandú"), "ae-nandu");
+        assert_eq!(sanitize_disk_name("rock&roll"), "rock-roll");
+        assert_eq!(sanitize_disk_name("###"), "");
+        assert_eq!(sanitize_disk_name(&"a".repeat(60)), "a".repeat(40));
+
+        assert_eq!(volume_name("Datos DB").unwrap(), "vmlab-vol-datos-db");
+        assert_eq!(volume_name("-datos").unwrap(), "vmlab-vol-datos");
+        assert!(volume_name("###").is_err());
+        assert!(disk_volume_name("vmlab-vol-datos").is_ok());
+        assert!(disk_volume_name("datos").is_err());
+        assert!(disk_volume_name("vmlab-vol-Datos").is_err());
+        assert!(disk_name(&"a".repeat(40)).is_ok());
+        for s in ["", "-datos", ".datos", "Datos", "a/b", "a:b", "a b", &"a".repeat(41)] {
+            assert!(disk_name(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn validates_mount_paths() {
+        for p in ["/data", "/var/lib/mysql", "/srv/app-1/data", "/datos/"] {
+            assert!(mount_path(p).is_ok(), "{p}");
+        }
+        assert_eq!(normalize_mount_path("/datos/"), "/datos");
+
+        for p in [
+            "data",
+            "",
+            "/",
+            "/proc",
+            "/proc/cpuinfo",
+            "/sys",
+            "/dev",
+            "/etc",
+            "/etc/hosts",
+            "/var/run",
+            "/var/run/docker.sock",
+            "/run",
+            "/run/user",
+            "/datos/../etc",
+            "/datos:x",
+            "/datos,x",
+            "/datos\\x",
+            "/datos\nx",
+            "/datos\u{7}",
+            &format!("/{}", "a".repeat(1025)),
+        ] {
+            assert!(mount_path(p).is_err(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn exclusive_disk_rejects_two_links_and_shared_accepts_them() {
+        let exclusive = Topology {
+            nodes: vec![
+                machine("web", NodeKind::Docker),
+                machine("db", NodeKind::Docker),
+                disk("datos", false, &[("web", "/data"), ("db", "/data")]),
+            ],
+            edges: vec![link("datos", "web"), link("datos", "db")],
+        };
+        let err = disk_topology(&exclusive).unwrap_err().to_string();
+        assert!(err.contains("exclusivo"), "{err}");
+
+        let shared = Topology {
+            nodes: vec![
+                machine("web", NodeKind::Docker),
+                machine("db", NodeKind::Docker),
+                disk("datos", true, &[("web", "/data"), ("db", "/data")]),
+            ],
+            edges: vec![link("datos", "web"), link("datos", "db")],
+        };
+        assert!(disk_topology(&shared).is_ok());
+    }
+
+    #[test]
+    fn disk_cannot_be_linked_to_a_virtual_machine_yet() {
+        let t = Topology {
+            nodes: vec![
+                machine("vm", NodeKind::Vbox),
+                disk("datos", false, &[("vm", "/data")]),
+            ],
+            edges: vec![link("datos", "vm")],
+        };
+        let err = disk_topology(&t).unwrap_err().to_string();
+        assert!(err.contains("contenedores Docker"), "{err}");
+        assert!(err.contains("fase posterior"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_paths_and_incomplete_links() {
+        let same_disk = Topology {
+            nodes: vec![
+                machine("web", NodeKind::Docker),
+                disk("datos", true, &[("web", "/data"), ("web", "/data/")]),
+            ],
+            edges: vec![link("datos", "web")],
+        };
+        let err = disk_topology(&same_disk).unwrap_err().to_string();
+        assert!(err.contains("misma ruta"), "{err}");
+
+        let two_disks = Topology {
+            nodes: vec![
+                machine("web", NodeKind::Docker),
+                disk("uno", false, &[("web", "/data")]),
+                disk("dos", false, &[("web", "/data/")]),
+            ],
+            edges: vec![link("uno", "web"), link("dos", "web")],
+        };
+        let err = disk_topology(&two_disks).unwrap_err().to_string();
+        assert!(err.contains("otro disco montado"), "{err}");
+
+        let no_path = Topology {
+            nodes: vec![machine("web", NodeKind::Docker), disk("datos", false, &[])],
+            edges: vec![link("datos", "web")],
+        };
+        let err = disk_topology(&no_path).unwrap_err().to_string();
+        assert!(err.contains("ruta de montaje"), "{err}");
+
+        let no_link = Topology {
+            nodes: vec![machine("web", NodeKind::Docker), disk("datos", false, &[("web", "/data")])],
+            edges: vec![],
+        };
+        let err = disk_topology(&no_link).unwrap_err().to_string();
+        assert!(err.contains("no tiene un enlace"), "{err}");
+    }
+
+    #[test]
+    fn topologies_without_disks_are_always_valid() {
+        let t = Topology {
+            nodes: vec![machine("vm", NodeKind::Vbox), machine("web", NodeKind::Docker)],
+            edges: vec![Edge { from: "vm".into(), to: "web".into(), kind: EdgeKind::Network }],
+        };
+        assert!(disk_topology(&t).is_ok());
     }
 }

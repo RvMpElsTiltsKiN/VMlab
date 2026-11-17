@@ -18,6 +18,10 @@ async fn probe_one(tools: &Tools, node: ProbeNode) -> NodeProbe {
             vbox::guest_link(tools, &node.target, node.adapter.unwrap_or(DEFAULT_ADAPTER)).await
         }
         NodeKind::Docker => docker::vmlab_link(tools, &node.target).await,
+        // Un disco gestiona un volumen: no participa en el sondeo de red.
+        NodeKind::Disk => Err(crate::error::CoreError::Invalid(
+            "un disco no tiene conexión de red".into(),
+        )),
     };
     match link {
         Ok(l) => NodeProbe {

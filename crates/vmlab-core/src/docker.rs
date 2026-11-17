@@ -5,7 +5,7 @@ use crate::model::{Action, DockerRunOptions, LinkInfo, NodeIssue, PowerState};
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
 use crate::validate;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 const SHORT: Duration = Duration::from_secs(20);
@@ -208,16 +208,58 @@ pub fn run_args(name: &str, image: &str, opts: Option<&DockerRunOptions>) -> Res
     Ok(args)
 }
 
+/// Un montaje tal y como lo informa Docker y como VMLab lo planifica.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MountInfo {
+    /// Nombre del volumen (`vmlab-vol-*`); vacío si es un montaje ajeno a VMLab.
+    pub volume: String,
+    /// Ruta de destino dentro del contenedor.
+    pub path: String,
+}
+
+/// Argumentos de `docker volume create`. El nombre siempre lleva el prefijo gestionado.
+pub fn volume_args(name: &str) -> Result<Vec<String>> {
+    validate::disk_volume_name(name)?;
+    Ok(vec!["volume".to_string(), "create".to_string(), name.to_string()])
+}
+
+/// Crea el volumen si no existe. Docker no modifica un volumen ya presente.
+pub async fn volume_create(tools: &Tools, name: &str) -> Result<()> {
+    let args = volume_args(name)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(tools.docker()?, &refs, SHORT).await.map(|_| ())
+}
+
 /// Argumentos de `docker create` para crear el contenedor **sin arrancarlo**.
 ///
 /// No fija `--network`: el contenedor queda en el bridge por defecto y la red del
 /// segmento se conecta después con `docker network connect` (`set_networks`), de
 /// modo que cambiar de segmento no deja el contenedor atado a una red eliminada.
 pub fn create_args(name: &str, image: &str, opts: Option<&DockerRunOptions>) -> Result<Vec<String>> {
+    create_args_with_mounts(name, image, opts, &[])
+}
+
+/// Igual que `create_args`, pero montando los volúmenes de los discos del lienzo.
+///
+/// Cada `-v` viaja como dos argumentos propios (`-v`, `volumen:ruta`). Los nombres
+/// y las rutas ya vienen validados, así que no hay interpolación de shell ni se
+/// puede colar una opción nueva de Docker.
+pub fn create_args_with_mounts(
+    name: &str,
+    image: &str,
+    opts: Option<&DockerRunOptions>,
+    mounts: &[MountInfo],
+) -> Result<Vec<String>> {
     validate::container_name(name)?;
     validate::docker_image(image)?;
     let mut args = vec!["create".to_string(), "--name".to_string(), name.to_string()];
     args.extend(option_args(opts)?);
+    for mount in mounts {
+        validate::disk_volume_name(&mount.volume)?;
+        validate::mount_path(&mount.path)?;
+        args.push("-v".to_string());
+        args.push(format!("{}:{}", mount.volume, validate::normalize_mount_path(&mount.path)));
+    }
     args.push(image.to_string());
     Ok(args)
 }
@@ -239,12 +281,82 @@ pub async fn create_container(
     image: &str,
     options: Option<&DockerRunOptions>,
 ) -> Result<()> {
-    let args = create_args(name, image, options)?;
+    create_container_with_mounts(tools, name, image, options, &[]).await
+}
+
+/// Crea el contenedor con los montajes del plan de discos.
+pub async fn create_container_with_mounts(
+    tools: &Tools,
+    name: &str,
+    image: &str,
+    options: Option<&DockerRunOptions>,
+    mounts: &[MountInfo],
+) -> Result<()> {
+    let args = create_args_with_mounts(name, image, options, mounts)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ok(tools.docker()?, &refs, LONG)
         .await
         .map(|_| ())
         .map_err(|e| create_failure(name, e))
+}
+
+/// Borra el contenedor para poder recrearlo con otros montajes.
+/// Nunca se pasa `-v`: **los volúmenes no se borran**.
+pub async fn remove_container(tools: &Tools, name: &str) -> Result<()> {
+    validate::container_name(name)?;
+    run_ok(tools.docker()?, &["rm", "-f", name], SHORT).await.map(|_| ())
+}
+
+/// Imagen con la que se creó el contenedor, necesaria para recrearlo.
+pub async fn container_image(tools: &Tools, name: &str) -> Result<String> {
+    validate::container_name(name)?;
+    let out = run_ok(
+        tools.docker()?,
+        &["inspect", "-f", "{{.Config.Image}}", name],
+        SHORT,
+    )
+    .await?;
+    let image = out.stdout.trim().to_string();
+    if image.is_empty() {
+        return Err(CoreError::Message(format!("el contenedor «{name}» no tiene imagen conocida")));
+    }
+    Ok(image)
+}
+
+/// Parsea `docker inspect -f '{{range .Mounts}}{{.Name}}\t{{.Destination}}\n{{end}}'`.
+/// Solo conserva los volúmenes gestionados por VMLab (`vmlab-vol-*`): se ignoran
+/// los montajes sin nombre, los anónimos creados por `VOLUME` en la imagen y los
+/// volúmenes con nombre propio del usuario.
+pub fn parse_mounts(out: &str) -> BTreeSet<MountInfo> {
+    out.lines()
+        .filter_map(|line| {
+            let (volume, path) = line.trim().split_once('\t')?;
+            let path = path.trim();
+            (!volume.is_empty() && !path.is_empty() && validate::disk_volume_name(volume).is_ok()).then(
+                || MountInfo {
+                    volume: volume.to_string(),
+                    path: validate::normalize_mount_path(path),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Montajes reales del contenedor, ordenados para poder compararlos con el plan.
+pub async fn mounts(tools: &Tools, name: &str) -> Result<BTreeSet<MountInfo>> {
+    validate::container_name(name)?;
+    let out = run_ok(
+        tools.docker()?,
+        &["inspect", "-f", "{{range .Mounts}}{{.Name}}\t{{.Destination}}\n{{end}}", name],
+        SHORT,
+    )
+    .await?;
+    Ok(parse_mounts(&out.stdout))
+}
+
+/// `true` si no hay que recrear el contenedor: sus montajes coinciden con el plan.
+pub fn mounts_match(current: &BTreeSet<MountInfo>, planned: &BTreeSet<MountInfo>) -> bool {
+    current == planned
 }
 
 /// Error de creación con contexto: el nodo debe decir que no se pudo crear.
@@ -926,5 +1038,90 @@ vmlab-snap/web\tinvalida!\t2026-11-09 12:00:00 +0000 UTC\tvmlab.label=Mala
         assert_eq!(long.len(), 64);
         assert!(long.starts_with(&"a".repeat(38)));
         assert!(long.ends_with("-prerestore-20261109103000"));
+    }
+
+    #[test]
+    fn builds_volume_creation_args_with_the_managed_prefix() {
+        assert_eq!(
+            volume_args("vmlab-vol-datos").unwrap(),
+            vec!["volume", "create", "vmlab-vol-datos"]
+        );
+        assert!(volume_args("datos").is_err());
+        assert!(volume_args("vmlab-vol-../etc").is_err());
+    }
+
+    #[test]
+    fn create_args_include_mounts_as_separate_arguments() {
+        let mounts = [
+            MountInfo { volume: "vmlab-vol-datos".into(), path: "/data".into() },
+            MountInfo { volume: "vmlab-vol-logs".into(), path: "/var/log/app".into() },
+        ];
+        let args = create_args_with_mounts("web", "nginx:latest", None, &mounts).unwrap();
+        assert_eq!(
+            args,
+            [
+                "create",
+                "--name",
+                "web",
+                "-v",
+                "vmlab-vol-datos:/data",
+                "-v",
+                "vmlab-vol-logs:/var/log/app",
+                "nginx:latest"
+            ]
+        );
+        assert!(args.iter().all(|a| !a.contains(' ') && !a.contains(';') && !a.contains('$')));
+        assert!(!args.iter().any(|a| a == "--network"));
+        assert_eq!(create_args("web", "nginx:latest", None).unwrap()[3], "nginx:latest");
+
+        let bad = [MountInfo { volume: "vmlab-vol-datos".into(), path: "/etc".into() }];
+        assert!(create_args_with_mounts("web", "nginx:latest", None, &bad).is_err());
+    }
+
+    #[test]
+    fn parses_and_compares_mounts_to_decide_a_recreate() {
+        let anonymous = "a".repeat(64);
+        let planned: BTreeSet<MountInfo> = [
+            MountInfo { volume: "vmlab-vol-logs".into(), path: "/var/log/app".into() },
+            MountInfo { volume: "vmlab-vol-datos".into(), path: "/data".into() },
+        ]
+        .into_iter()
+        .collect();
+
+        // Un volumen anónimo de 64 hex y otro con nombre propio no cuentan:
+        // aunque estén en el contenedor, no deben provocar una recreación.
+        let only_foreign_differ = parse_mounts(&format!(
+            "vmlab-vol-datos\t/data\nvmlab-vol-logs\t/var/log/app/\n{anonymous}\t/var/lib/mysql\nmi-volumen\t/datos\n"
+        ));
+        assert!(mounts_match(&only_foreign_differ, &planned));
+
+        let missing = parse_mounts(&format!(
+            "vmlab-vol-datos\t/data\n{anonymous}\t/var/lib/mysql\nmi-volumen\t/datos\n"
+        ));
+        assert!(!mounts_match(&missing, &planned), "al contenedor le falta el volumen de logs");
+        assert!(!mounts_match(&parse_mounts("vmlab-vol-datos\t/otro\n"), &planned));
+        assert!(!mounts_match(
+            &parse_mounts("vmlab-vol-datos\t/data\nvmlab-vol-logs\t/var/log/otro\n"),
+            &planned
+        ));
+        assert!(!mounts_match(
+            &parse_mounts(&format!(
+                "vmlab-vol-datos\t/data\nvmlab-vol-logs\t/var/log/app\nvmlab-vol-extra\t/otro\n{anonymous}\t/var/lib/mysql\n"
+            )),
+            &planned
+        ));
+        assert!(mounts_match(
+            &parse_mounts("vmlab-vol-datos\t/data\nvmlab-vol-logs\t/var/log/app/\n"),
+            &planned
+        ));
+        assert!(mounts_match(&BTreeSet::new(), &BTreeSet::new()));
+    }
+
+    #[test]
+    fn ignores_anonymous_image_volumes_like_mysql() {
+        let anonymous = "a".repeat(64);
+        let current = parse_mounts(&format!("{anonymous}\t/var/lib/mysql\n"));
+        assert!(current.is_empty(), "el volumen anónimo de la imagen no es gestionado");
+        assert!(mounts_match(&current, &BTreeSet::new()), "no se debe recrear el contenedor");
     }
 }

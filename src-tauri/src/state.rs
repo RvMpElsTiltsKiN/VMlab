@@ -242,6 +242,9 @@ impl AppState {
                 NodeKind::Docker => {
                     let _ = capture::remove_docker_helper(tools, id).await;
                 }
+                // Los discos no pueden iniciar capturas, pero la reserva puede
+                // quedar registrada por una llamada fallida: no hay nada que parar.
+                NodeKind::Disk => {}
             }
         }
 

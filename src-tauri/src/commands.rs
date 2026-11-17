@@ -139,6 +139,9 @@ pub async fn link_apply(
                 report.warnings.push(warning);
             }
         }
+        NodeKind::Disk => {
+            return Err("un disco no tiene red: los enlaces de montaje no admiten condiciones de red".into());
+        }
     }
     Ok(report)
 }
@@ -162,6 +165,9 @@ pub async fn link_clear(
             {
                 report.warnings.push(warning);
             }
+        }
+        NodeKind::Disk => {
+            return Err("un disco no tiene red: no hay condiciones de red que quitar".into());
         }
     }
     Ok(report)
@@ -222,6 +228,10 @@ pub async fn capture_start(
                     return Err(s(e));
                 }
             }
+        }
+        NodeKind::Disk => {
+            state.abort_capture(&id);
+            return Err("un disco no tiene tráfico de red: no se puede capturar".into());
         }
     };
 

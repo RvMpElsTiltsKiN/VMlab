@@ -7,6 +7,8 @@ use std::collections::HashMap;
 pub enum NodeKind {
     Vbox,
     Docker,
+    /// Volumen Docker del lienzo. No es una máquina: no tiene red ni estado.
+    Disk,
 }
 
 impl NodeKind {
@@ -14,6 +16,7 @@ impl NodeKind {
         match self {
             NodeKind::Vbox => format!("vbox:{target}"),
             NodeKind::Docker => format!("docker:{target}"),
+            NodeKind::Disk => format!("disk:{target}"),
         }
     }
 }
@@ -159,12 +162,47 @@ pub struct DockerRunOptions {
     pub ports: Vec<PortMap>,
 }
 
+/// Tipo de arista del lienzo. Los cables de red unen nodos en un segmento; los
+/// enlaces de montaje unen un disco con un contenedor y no crean red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeKind {
+    #[default]
+    Network,
+    Mount,
+}
+
+/// Ruta donde un disco se monta dentro de un contenedor concreto.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskMount {
+    /// `id` del nodo Docker en el lienzo (no el nombre del contenedor).
+    pub container: String,
+    /// Ruta absoluta dentro del contenedor.
+    pub path: String,
+}
+
+/// Configuración de un nodo Disco. El nombre base del volumen es `NodeSpec::target`;
+/// el volumen real de Docker se crea como `vmlab-vol-<nombre saneado>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskSpec {
+    /// `true` permite montar el mismo volumen en varios contenedores a la vez.
+    /// Por defecto es exclusivo: un solo contenedor.
+    #[serde(default)]
+    pub shared: bool,
+    /// Un montaje por cada enlace Disco↔contenedor del lienzo.
+    #[serde(default)]
+    pub mounts: Vec<DiskMount>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSpec {
     pub id: String,
     pub kind: NodeKind,
     /// VirtualBox: UUID o nombre de la VM. Docker: nombre del contenedor.
+    /// Disco: nombre base del volumen (sin el prefijo `vmlab-vol-`).
     pub target: String,
     /// Solo Docker: imagen para crear el contenedor si todavía no existe.
     #[serde(default)]
@@ -180,6 +218,25 @@ pub struct NodeSpec {
     /// Condiciones de red opcionales del nodo.
     #[serde(default)]
     pub link: Option<LinkConditions>,
+    /// Solo Disco: modo de uso y rutas de montaje en los contenedores enlazados.
+    #[serde(default)]
+    pub disk: Option<DiskSpec>,
+}
+
+impl Default for NodeSpec {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: NodeKind::Docker,
+            target: String::new(),
+            image: None,
+            options: None,
+            label: None,
+            net: None,
+            link: None,
+            disk: None,
+        }
+    }
 }
 
 impl NodeSpec {
@@ -192,6 +249,9 @@ impl NodeSpec {
 pub struct Edge {
     pub from: String,
     pub to: String,
+    /// Los `.vmlab` antiguos no tenían este campo: todo cable era de red.
+    #[serde(default)]
+    pub kind: EdgeKind,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -588,5 +648,41 @@ mod tests {
             serde_json::to_value(&detail).unwrap(),
             serde_json::json!({ "code": "probeFailed", "detail": "sin respuesta" })
         );
+    }
+
+    #[test]
+    fn old_lab_files_load_without_disk_fields() {
+        let json = serde_json::json!({
+            "nodes": [
+                { "id": "web", "kind": "docker", "target": "web", "image": "nginx:latest" }
+            ],
+            "edges": [{ "from": "web", "to": "web" }]
+        });
+        let t: Topology = serde_json::from_value(json).unwrap();
+        assert_eq!(t.nodes[0].kind, NodeKind::Docker);
+        assert_eq!(t.nodes[0].disk, None);
+        assert_eq!(t.edges[0].kind, EdgeKind::Network);
+    }
+
+    #[test]
+    fn disk_fields_serialize_in_camel_case() {
+        let t = Topology {
+            nodes: vec![NodeSpec {
+                id: "d".into(),
+                kind: NodeKind::Disk,
+                target: "datos".into(),
+                disk: Some(DiskSpec {
+                    shared: true,
+                    mounts: vec![DiskMount { container: "web".into(), path: "/data".into() }],
+                }),
+                ..NodeSpec::default()
+            }],
+            edges: vec![Edge { from: "d".into(), to: "web".into(), kind: EdgeKind::Mount }],
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["nodes"][0]["kind"], "disk");
+        assert_eq!(json["nodes"][0]["disk"]["shared"], true);
+        assert_eq!(json["nodes"][0]["disk"]["mounts"][0]["container"], "web");
+        assert_eq!(json["edges"][0]["kind"], "mount");
     }
 }
