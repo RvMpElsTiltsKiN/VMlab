@@ -7,8 +7,8 @@ import { UpdateBanner } from './components/UpdateBanner';
 import { t } from './i18n';
 import { useLab, type Toast } from './store/useLab';
 
-/** Aviso de error: persistente, copiable y con contador si se repite. */
-function ErrorToast({ toast, dismiss }: { toast: Toast; dismiss: (id: number) => void }) {
+/** Aviso persistente (error o aviso de Apply): copiable y con contador si se repite. */
+function StickyToast({ toast, dismiss }: { toast: Toast; dismiss: (id: number) => void }) {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -27,7 +27,7 @@ function ErrorToast({ toast, dismiss }: { toast: Toast; dismiss: (id: number) =>
   };
 
   return (
-    <div className="toast error" role="alert">
+    <div className={`toast ${toast.kind}`} role="alert">
       <div className="toast-text">{toast.text}</div>
       <div className="toast-actions">
         {toast.count > 1 && <span className="toast-count" aria-label={`×${toast.count}`}>×{toast.count}</span>}
@@ -58,8 +58,8 @@ function Toasts() {
   return (
     <div className="toasts">
       {toasts.map((toast) =>
-        toast.kind === 'error' ? (
-          <ErrorToast key={toast.id} toast={toast} dismiss={dismiss} />
+        toast.kind === 'error' || toast.kind === 'warning' ? (
+          <StickyToast key={toast.id} toast={toast} dismiss={dismiss} />
         ) : (
           <div
             key={toast.id}

@@ -498,6 +498,7 @@ button:disabled { cursor: default; opacity: 0.45; }
   animation: slide 0.18s ease-out; white-space: pre-line;
 }
 .toast.error { border-left-color: var(--danger); cursor: default; }
+.toast.warning { border-left-color: var(--busy); cursor: default; }
 .toast.info { border-left-color: var(--docker); }
 .toast-text { user-select: text; cursor: text; }
 .toast-actions {

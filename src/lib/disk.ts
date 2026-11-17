@@ -3,6 +3,11 @@ import type { Edge, MachineNode, NodeKind } from '../types';
 /** Tipos del lienzo. `MachineKind` sigue siendo el contrato IPC de máquinas. */
 export const DEFAULT_MOUNT_PATH = '/data';
 export const VOLUME_PREFIX = 'vmlab-vol-';
+export const VDI_PREFIX = 'vmlab-disk-';
+/** Igual que `DEFAULT_VDI_SIZE_MB` del núcleo (10 GB). */
+export const DEFAULT_DISK_SIZE_MB = 10_240;
+/** Igual que `MAX_VDI_SIZE_MB` del núcleo. */
+export const MAX_DISK_SIZE_MB = 2_000_000;
 
 export const isDisk = (node: MachineNode): boolean => node.data.kind === 'disk';
 
@@ -41,6 +46,18 @@ export function diskName(raw: string): string {
 /** Nombre real del volumen Docker que crea el backend al aplicar la red. */
 export function volumeName(raw: string): string {
   return `${VOLUME_PREFIX}${diskName(raw)}`;
+}
+
+/** Nombre del fichero VDI que crea el backend en su carpeta de datos. */
+export function vdiName(raw: string): string {
+  return `${VDI_PREFIX}${diskName(raw)}.vdi`;
+}
+
+/** Etiqueta visible del tamaño de un VDI: 10240 MB → «10 GB». */
+export function diskSizeLabel(sizeMb?: number): string {
+  const mb = sizeMb ?? DEFAULT_DISK_SIZE_MB;
+  const gb = mb / 1024;
+  return `${Number.isInteger(gb) ? gb : Number(gb.toFixed(2))} GB`;
 }
 
 export function normalizeMountPath(path: string): string {
@@ -90,16 +107,19 @@ export function nextMountPath(containerId: string, edges: Edge[], exceptDiskId?:
   return n === 1 ? DEFAULT_MOUNT_PATH : `${DEFAULT_MOUNT_PATH}${n}`;
 }
 
-const sameMounts = (a: { container: string; path: string }[] | undefined, b: { container: string; path: string }[]): boolean =>
+type SyncedMount = { container: string; path?: string };
+
+const sameMounts = (a: SyncedMount[] | undefined, b: SyncedMount[]): boolean =>
   !!a && a.length === b.length && a.every((m, i) => m.container === b[i].container && m.path === b[i].path);
 
 /**
  * Mantiene `edges` y `disk.mounts` sincronizados en todo momento.
  *
- * La ruta canónica de cada enlace está en `edge.data.path`; `disk.mounts` se
- * reconstruye a partir de las aristas de montaje. Se descartan los enlaces
- * inválidos (disco-disco, disco-VM, montaje sin disco) para que el backend
- * nunca reciba una topología incoherente.
+ * La ruta canónica de cada enlace de contenedor está en `edge.data.path`;
+ * `disk.mounts` se reconstruye a partir de las aristas de montaje. Los enlaces
+ * con VM no tienen ruta: el backend elige el fichero VDI. Se descartan los
+ * enlaces inválidos (disco-disco, montaje sin disco, mezcla de contenedores y
+ * VMs, o más de una VM en el mismo disco) para no enviar una topología inválida.
  */
 export function syncDiskMounts(
   nodes: MachineNode[],
@@ -107,8 +127,11 @@ export function syncDiskMounts(
 ): { nodes: MachineNode[]; edges: Edge[] } {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const diskIds = new Set(nodes.filter(isDisk).map((n) => n.id));
-  const mountsByDisk = new Map<string, { container: string; path: string }[]>();
+  const mountsByDisk = new Map<string, SyncedMount[]>();
+  /** Tipo del primer enlace válido de cada disco: no se pueden mezclar. */
+  const linkedKind = new Map<string, 'docker' | 'vbox'>();
   const linkedContainers = new Set<string>();
+  const vmDisks = new Set<string>();
   const outEdges: Edge[] = [];
 
   for (const edge of edges) {
@@ -127,16 +150,34 @@ export function syncDiskMounts(
     if (aDisk && bDisk) continue;
 
     const diskId = aDisk ? a.id : b.id;
-    const container = aDisk ? b : a;
-    if (container.data.kind !== 'docker') continue;
-    const pairKey = `${diskId}:${container.id}`;
+    const target = aDisk ? b : a;
+    if (target.data.kind !== 'docker' && target.data.kind !== 'vbox') continue;
+    const kind = target.data.kind;
+    const firstKind = linkedKind.get(diskId);
+    if (firstKind && firstKind !== kind) continue; // mezcla: se descarta el último
+    if (kind === 'vbox' && mountsByDisk.has(diskId)) continue; // una sola VM
+
+    const pairKey = `${diskId}:${target.id}`;
     if (linkedContainers.has(pairKey)) continue;
     linkedContainers.add(pairKey);
+    linkedKind.set(diskId, kind);
 
-    const existing = mountsByDisk.get(diskId)?.find((m) => m.container === container.id);
-    const path = mountPathOf(edge) ?? existing?.path ?? DEFAULT_MOUNT_PATH;
     const list = mountsByDisk.get(diskId) ?? [];
-    mountsByDisk.set(diskId, [...list, { container: container.id, path }]);
+    if (kind === 'vbox') {
+      vmDisks.add(diskId);
+      mountsByDisk.set(diskId, [...list, { container: target.id }]);
+      // La arista no debe arrastrar `data.path` de archivos o enlaces antiguos.
+      const data: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(edge.data ?? {})) {
+        if (key !== 'path') data[key] = value;
+      }
+      outEdges.push({ ...edge, kind: 'mount', data: Object.keys(data).length ? data : undefined });
+      continue;
+    }
+
+    const existing = list.find((m) => m.container === target.id);
+    const path = mountPathOf(edge) ?? existing?.path ?? DEFAULT_MOUNT_PATH;
+    mountsByDisk.set(diskId, [...list, { container: target.id, path }]);
     outEdges.push({ ...edge, kind: 'mount', data: { ...(edge.data ?? {}), path } });
   }
 
@@ -145,10 +186,15 @@ export function syncDiskMounts(
       return node.data.disk === undefined ? node : { ...node, data: { ...node.data, disk: undefined } };
     }
     const mounts = mountsByDisk.get(node.id) ?? [];
-    if (sameMounts(node.data.disk?.mounts, mounts)) return node;
+    const shared = vmDisks.has(node.id) ? false : node.data.disk?.shared ?? false;
+    const sizeMb = node.data.disk?.sizeMb;
+    if (sameMounts(node.data.disk?.mounts, mounts) && (node.data.disk?.shared ?? false) === shared) return node;
     return {
       ...node,
-      data: { ...node.data, disk: { shared: node.data.disk?.shared ?? false, mounts } },
+      data: {
+        ...node.data,
+        disk: { ...(sizeMb === undefined ? {} : { sizeMb }), shared, mounts },
+      },
     };
   });
 

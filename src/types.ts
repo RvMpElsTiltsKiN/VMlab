@@ -87,17 +87,20 @@ export interface ScreenshotInfo {
   path: string;
 }
 
-/** Ruta donde un disco se monta dentro de un contenedor del lienzo. */
+/** Enlace de un disco con un nodo del lienzo (contenedor o máquina virtual). */
 export interface DiskMount {
-  /** `id` del nodo Docker del lienzo (no el nombre del contenedor). */
+  /** `id` del nodo de destino del lienzo (no el nombre real de la máquina). */
   container: string;
-  path: string;
+  /** Ruta dentro del contenedor. Los enlaces con VM no llevan ruta. */
+  path?: string;
 }
 
 /** Configuración de un nodo Disco (camelCase, ver `DiskSpec` de model.rs). */
 export interface DiskSpec {
   shared: boolean;
   mounts: DiskMount[];
+  /** Tamaño en MB del VDI de una VM. Si falta, el backend usa 10240. */
+  sizeMb?: number;
 }
 
 /** Datos que guarda cada nodo del lienzo. */

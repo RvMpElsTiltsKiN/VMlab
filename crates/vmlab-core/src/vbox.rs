@@ -602,6 +602,8 @@ struct StorageController {
     name: String,
     kind: String,
     ports: u32,
+    /// `storagecontrollermaxportcount<N>`; 30 si `showvminfo` no lo informa.
+    max_ports: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,9 +665,13 @@ fn parse_storage(out: &str) -> (Vec<StorageController>, Vec<StorageSlot>) {
                     controllers[idx].ports = n;
                 }
             }
-            "maxportcount" if controllers[idx].ports == 0 => {
+            "maxportcount" => {
                 if let Ok(n) = value.parse::<u32>() {
-                    controllers[idx].ports = n;
+                    controllers[idx].max_ports = n;
+                    // Compatibilidad: si no hay `portcount`, se usaba el máximo.
+                    if controllers[idx].ports == 0 {
+                        controllers[idx].ports = n;
+                    }
                 }
             }
             _ => {}
@@ -874,6 +880,8 @@ pub async fn prepare_guest_additions(tools: &Tools, target: &str) -> Result<Gues
 
 /// Controlador creado por VMLab cuando la VM no tiene ninguno compatible libre.
 pub const VMLAB_VDI_CONTROLLER: &str = "VMLab SATA";
+/// Tope de puertos SATA que admite VirtualBox (y de `storagectl --portcount`).
+pub const MAX_SATA_PORTS: u32 = 30;
 
 /// Controladores de `showvminfo` admitidos para discos duros. Nunca IDE: solo
 /// SATA, SCSI, NVMe y VirtIO. El orden es la preferencia al elegir un hueco.
@@ -893,6 +901,8 @@ pub struct VmStorageController {
     pub name: String,
     pub kind: String,
     pub ports: u32,
+    /// Máximo de puertos del controlador según `showvminfo` (30 por defecto).
+    pub max_ports: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -906,6 +916,8 @@ pub struct VmStorageAttachment {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VmStorageInfo {
     pub running: bool,
+    /// Estado exacto de `VMState` (p. ej. `poweroff`, `saved`, `running`).
+    pub state: String,
     pub controllers: Vec<VmStorageController>,
     pub attachments: Vec<VmStorageAttachment>,
 }
@@ -915,9 +927,15 @@ pub fn parse_vm_storage(info: &str) -> VmStorageInfo {
     let (controllers, attachments) = parse_storage(info);
     VmStorageInfo {
         running: show_vm_on(info),
+        state: vm_field(info, "VMState").unwrap_or_default(),
         controllers: controllers
             .into_iter()
-            .map(|c| VmStorageController { name: c.name, kind: c.kind, ports: c.ports })
+            .map(|c| VmStorageController {
+                name: c.name,
+                kind: c.kind,
+                ports: c.ports,
+                max_ports: if c.max_ports == 0 { MAX_SATA_PORTS } else { c.max_ports },
+            })
             .collect(),
         attachments: attachments
             .into_iter()
@@ -929,6 +947,82 @@ pub fn parse_vm_storage(info: &str) -> VmStorageInfo {
             })
             .collect(),
     }
+}
+
+/// VirtualBox solo permite cambiar el almacenamiento en `poweroff` y `aborted`.
+/// Cualquier otro estado (incluido `saved`) bloquea `storagectl`/`storageattach`.
+pub fn storage_editable(state: &str) -> bool {
+    let state = state.trim();
+    state.eq_ignore_ascii_case("poweroff") || state.eq_ignore_ascii_case("aborted")
+}
+
+/// Aviso cuando el estado de la VM impide tocar el almacenamiento. `None` si se
+/// puede modificar. `action` es `conectar` o `desconectar`.
+fn storage_state_warning(vm: &str, state: &str, action: &str) -> Option<String> {
+    if storage_editable(state) {
+        return None;
+    }
+    let state = state.trim();
+    if state.eq_ignore_ascii_case("saved") {
+        return Some(format!(
+            "«{vm}» tiene un estado guardado. Inicia la máquina y apágala del todo, o descarta el estado guardado desde VirtualBox, y vuelve a aplicar."
+        ));
+    }
+    if state.eq_ignore_ascii_case("running") || state.eq_ignore_ascii_case("paused") {
+        return Some(format!("apaga «{vm}» para {action} el disco"));
+    }
+    Some(format!(
+        "«{vm}» está en estado «{state}»: apágala del todo para cambiar sus discos."
+    ))
+}
+
+/// Los tipos que VirtualBox considera SATA (IntelAhci/AHCI).
+fn is_sata(kind: &str) -> bool {
+    vdi_controller_rank(kind) == Some(0)
+}
+
+/// ¿Hay ya un controlador SATA en la VM? VirtualBox solo admite uno.
+fn has_sata_controller(storage: &VmStorageInfo) -> bool {
+    storage.controllers.iter().any(|c| is_sata(&c.kind))
+}
+
+/// Plan cuando no queda ningún hueco en los controladores compatibles.
+#[derive(Debug, PartialEq, Eq)]
+enum SataPlan {
+    /// Ampliar el controlador SATA real: `(nombre, nuevos puertos)`.
+    Grow(String, u32),
+    /// No hay SATA: crear `VMLab SATA`.
+    Create,
+}
+
+/// Decide cómo obtener un puerto SATA cuando `pick_vdi_free_slot` no encuentra
+/// ninguno. Error si hay SATA pero está en su tope: no se puede crear otro.
+fn sata_plan(storage: &VmStorageInfo) -> Result<SataPlan> {
+    if let Some((name, ports)) = grow_sata_controller(storage) {
+        Ok(SataPlan::Grow(name, ports))
+    } else if has_sata_controller(storage) {
+        Err(CoreError::Message("la VM no tiene puertos SATA libres".into()))
+    } else {
+        Ok(SataPlan::Create)
+    }
+}
+
+/// Plan para ampliar el SATA existente: `(nombre real, nuevos puertos)`.
+/// `None` si no hay SATA o si ya está en su tope (`maxportcount`, máximo 30).
+pub fn grow_sata_controller(storage: &VmStorageInfo) -> Option<(String, u32)> {
+    let mut controllers: Vec<&VmStorageController> = storage
+        .controllers
+        .iter()
+        .filter(|c| is_sata(&c.kind))
+        .collect();
+    controllers.sort_by_key(|c| c.name.clone());
+    for c in controllers {
+        let cap = c.max_ports.min(MAX_SATA_PORTS);
+        if c.ports > 0 && c.ports < cap {
+            return Some((c.name.clone(), c.ports + 1));
+        }
+    }
+    None
 }
 
 /// Primer puerto libre (`device = 0`) de un controlador compatible.
@@ -1020,6 +1114,26 @@ pub fn storagectl_args(vm: &str) -> Result<Vec<String>> {
     ])
 }
 
+/// Construye `storagectl <vm> --name <controlador real> --portcount <puertos>`
+/// para ampliar un controlador SATA existente (VirtualBox solo admite uno).
+pub fn storagectl_portcount_args(vm: &str, controller: &str, ports: u32) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    validate::host_iface(controller)?;
+    if !(1..=MAX_SATA_PORTS).contains(&ports) {
+        return Err(CoreError::Invalid(format!(
+            "el número de puertos SATA debe estar entre 1 y {MAX_SATA_PORTS}"
+        )));
+    }
+    Ok(vec![
+        "storagectl".into(),
+        vm.into(),
+        "--name".into(),
+        controller.into(),
+        "--portcount".into(),
+        ports.to_string(),
+    ])
+}
+
 /// Construye `storageattach`. `medium = None` desconecta sin borrar el fichero.
 pub fn storageattach_args(
     vm: &str,
@@ -1099,6 +1213,18 @@ fn vdi_command_error(action: &str, e: CoreError) -> CoreError {
     CoreError::Message(format!("no se pudo {action}: {e}"))
 }
 
+/// `VBoxManage` devuelve "Too many storage controllers of this type" en inglés;
+/// se traduce para que el aviso lleve contexto y no parezca un fallo de VMLab.
+fn vdi_storagectl_error(action: &str, e: CoreError) -> CoreError {
+    let text = e.to_string().to_ascii_lowercase();
+    if text.contains("too many storage controllers") || text.contains("demasiados controladores") {
+        return CoreError::Message(format!(
+            "la VM ya tiene demasiados controladores de almacenamiento; no se pudo {action}"
+        ));
+    }
+    vdi_command_error(action, e)
+}
+
 fn vdi_attach_error(e: CoreError) -> CoreError {
     let text = e.to_string().to_ascii_lowercase();
     let other_vm = text.contains("already attached")
@@ -1168,7 +1294,7 @@ pub async fn detach_stale_vdis(
     disks_dir: &Path,
     vm: &str,
     wanted: &[PathBuf],
-    running: bool,
+    _running: bool,
 ) -> Result<Vec<String>> {
     validate::vbox_target(vm)?;
     let bin = tools.vbox()?;
@@ -1176,7 +1302,6 @@ pub async fn detach_stale_vdis(
         .await
         .map_err(|e| vdi_command_error("leer la información de la VM", e))?;
     let storage = parse_vm_storage(&info.stdout);
-    let running = running || storage.running;
     let mut stale = Vec::new();
     for a in &storage.attachments {
         if empty_medium(&a.medium) || !disks::vdi_path_allowed(disks_dir, Path::new(&a.medium)) {
@@ -1190,8 +1315,9 @@ pub async fn detach_stale_vdis(
     if stale.is_empty() {
         return Ok(Vec::new());
     }
-    if running {
-        return Ok(vec![format!("apaga «{vm}» para desconectar el disco")]);
+    // Un estado guardado (o cualquier estado no editable) bloquea storageattach.
+    if let Some(warning) = storage_state_warning(vm, &storage.state, "desconectar") {
+        return Ok(vec![warning]);
     }
     for (controller, port, device) in stale {
         let args = storageattach_args(vm, &controller, port, device, None)?;
@@ -1210,7 +1336,7 @@ pub async fn attach_wanted_vdis(
     disks_dir: &Path,
     vm: &str,
     wanted: &[PathBuf],
-    running: bool,
+    _running: bool,
 ) -> Result<Vec<String>> {
     validate::vbox_target(vm)?;
     let bin = tools.vbox()?;
@@ -1218,7 +1344,6 @@ pub async fn attach_wanted_vdis(
         .await
         .map_err(|e| vdi_command_error("leer la información de la VM", e))?;
     let mut storage = parse_vm_storage(&info.stdout);
-    let running = running || storage.running;
     let wanted: Vec<&Path> = wanted
         .iter()
         .map(PathBuf::as_path)
@@ -1228,15 +1353,12 @@ pub async fn attach_wanted_vdis(
         return Ok(Vec::new());
     }
 
-    if running {
-        let mut warnings = Vec::new();
-        for path in &wanted {
-            if !vdi_is_attached(&storage, path) {
-                warnings.push(format!("apaga «{vm}» para conectar el disco"));
-            }
+    // Avisa solo si hay algo que conectar; un estado no editable bloquea
+    // tanto storagectl como storageattach. No se descarta el estado guardado.
+    if wanted.iter().any(|p| !vdi_is_attached(&storage, p)) {
+        if let Some(warning) = storage_state_warning(vm, &storage.state, "conectar") {
+            return Ok(vec![warning]);
         }
-        warnings.dedup();
-        return Ok(warnings);
     }
 
     for path in wanted {
@@ -1246,16 +1368,32 @@ pub async fn attach_wanted_vdis(
         let slot = match pick_vdi_free_slot(&storage) {
             Some(slot) => slot,
             None => {
-                let args = storagectl_args(vm)?;
-                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                run_ok(bin, &argv, SHORT)
-                    .await
-                    .map_err(|e| vdi_command_error("crear el controlador VMLab SATA", e))?;
-                storage.controllers.push(VmStorageController {
-                    name: VMLAB_VDI_CONTROLLER.into(),
-                    kind: "IntelAhci".into(),
-                    ports: 8,
-                });
+                // No crear otro SATA: ampliar el real cuando existe y tiene hueco.
+                match sata_plan(&storage)? {
+                    SataPlan::Grow(name, new_ports) => {
+                        let args = storagectl_portcount_args(vm, &name, new_ports)?;
+                        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                        run_ok(bin, &argv, SHORT)
+                            .await
+                            .map_err(|e| vdi_storagectl_error("ampliar el controlador SATA", e))?;
+                        if let Some(controller) = storage.controllers.iter_mut().find(|c| c.name == name) {
+                            controller.ports = new_ports;
+                        }
+                    }
+                    SataPlan::Create => {
+                        let args = storagectl_args(vm)?;
+                        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                        run_ok(bin, &argv, SHORT)
+                            .await
+                            .map_err(|e| vdi_storagectl_error("crear el controlador VMLab SATA", e))?;
+                        storage.controllers.push(VmStorageController {
+                            name: VMLAB_VDI_CONTROLLER.into(),
+                            kind: "IntelAhci".into(),
+                            ports: 8,
+                            max_ports: MAX_SATA_PORTS,
+                        });
+                    }
+                }
                 pick_vdi_free_slot(&storage)
                     .ok_or_else(|| CoreError::Message("no hay puertos libres para conectar el disco VDI".into()))?
             }
@@ -1870,6 +2008,62 @@ storagecontrollerportcount2="1"
         let slot = pick_vdi_free_slot(&storage).unwrap();
         assert_eq!(slot.controller, "SATA");
         assert_eq!((slot.port, slot.device), (1, 0));
+        assert_eq!(storage.state, "poweroff");
+    }
+
+    #[test]
+    fn storage_editable_only_allows_poweroff_and_aborted() {
+        for state in ["poweroff", "POWEROFF", " aborted ", "Aborted"] {
+            assert!(storage_editable(state), "debería permitir «{state}»");
+        }
+        for state in [
+            "saved",
+            "running",
+            "paused",
+            "starting",
+            "saving",
+            "aborted-saved",
+        ] {
+            assert!(!storage_editable(state), "no debería permitir «{state}»");
+        }
+    }
+
+    #[test]
+    fn storage_warning_depends_on_the_exact_state() {
+        // Editables: ningún aviso, tanto al conectar como al desconectar.
+        assert_eq!(storage_state_warning("Ubuntu", "poweroff", "conectar"), None);
+        assert_eq!(storage_state_warning("Ubuntu", "aborted", "desconectar"), None);
+
+        // Guardado: no se descarta; se explica cómo salir de ese estado.
+        assert_eq!(
+            storage_state_warning("Ubuntu", "saved", "conectar").as_deref(),
+            Some("«Ubuntu» tiene un estado guardado. Inicia la máquina y apágala del todo, o descarta el estado guardado desde VirtualBox, y vuelve a aplicar.")
+        );
+        assert_eq!(
+            storage_state_warning("Ubuntu", "SAVED", "desconectar").as_deref(),
+            Some("«Ubuntu» tiene un estado guardado. Inicia la máquina y apágala del todo, o descarta el estado guardado desde VirtualBox, y vuelve a aplicar.")
+        );
+
+        // En marcha o en pausa: se mantiene el texto de siempre, según la acción.
+        assert_eq!(
+            storage_state_warning("Ubuntu", "running", "conectar").as_deref(),
+            Some("apaga «Ubuntu» para conectar el disco")
+        );
+        assert_eq!(
+            storage_state_warning("Ubuntu", "paused", "desconectar").as_deref(),
+            Some("apaga «Ubuntu» para desconectar el disco")
+        );
+
+        // Cualquier otro estado: se muestra el estado exacto leído de VMState.
+        for state in ["starting", "saving", "aborted-saved"] {
+            assert_eq!(
+                storage_state_warning("Ubuntu", state, "conectar").as_deref(),
+                Some(format!(
+                    "«Ubuntu» está en estado «{state}»: apágala del todo para cambiar sus discos."
+                ))
+                .as_deref()
+            );
+        }
     }
 
     #[test]
@@ -1901,6 +2095,145 @@ storagecontrollerportcount1="1"
         };
         assert!(vdi_is_attached(&storage, path));
         assert!(!vdi_is_attached(&storage, Path::new(r"C:\Users\lab\AppData\Roaming\VMLab\disks\vmlab-disk-otro.vdi")));
+    }
+
+    #[test]
+    fn grows_a_full_sata_controller_instead_of_adding_another() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="SATA"
+storagecontrollertype1="IntelAhci"
+storagecontrollerportcount1="2"
+"IDE-0-0"="none"
+"IDE-1-0"="none"
+"SATA-0-0"="C:\\VMs\\sistema.vdi"
+"SATA-1-0"="C:\\VBox\\VBoxGuestAdditions.iso"
+"#;
+        let mut storage = parse_vm_storage(info);
+        assert!(pick_vdi_free_slot(&storage).is_none());
+        assert_eq!(sata_plan(&storage).unwrap(), SataPlan::Grow("SATA".into(), 3));
+
+        if let Some(controller) = storage.controllers.iter_mut().find(|c| c.name == "SATA") {
+            controller.ports = 3;
+        }
+        let slot = pick_vdi_free_slot(&storage).unwrap();
+        assert_eq!(slot.controller, "SATA");
+        assert_eq!((slot.port, slot.device), (2, 0));
+    }
+
+    #[test]
+    fn a_full_sata_controller_at_its_cap_has_no_room() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="SATA"
+storagecontrollertype0="IntelAhci"
+storagecontrollerportcount0="30"
+storagecontrollermaxportcount0="30"
+"#;
+        let storage = parse_vm_storage(info);
+        assert!(has_sata_controller(&storage));
+        assert_eq!(grow_sata_controller(&storage), None);
+        assert_eq!(
+            sata_plan(&storage).unwrap_err().to_string(),
+            "la VM no tiene puertos SATA libres"
+        );
+    }
+
+    #[test]
+    fn without_a_sata_controller_the_vmlab_one_is_created() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="NVMe"
+storagecontrollertype1="NVMe"
+storagecontrollerportcount1="1"
+"NVMe-0-0"="C:\\VMs\\sistema.vdi"
+"#;
+        let storage = parse_vm_storage(info);
+        assert!(pick_vdi_free_slot(&storage).is_none());
+        assert!(!has_sata_controller(&storage));
+        assert_eq!(sata_plan(&storage).unwrap(), SataPlan::Create);
+    }
+
+    #[test]
+    fn a_free_sata_port_is_used_without_growing() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="SATA"
+storagecontrollertype0="IntelAhci"
+storagecontrollerportcount0="2"
+"SATA-0-0"="C:\\VMs\\sistema.vdi"
+"SATA-1-0"="none"
+"#;
+        let storage = parse_vm_storage(info);
+        let slot = pick_vdi_free_slot(&storage).unwrap();
+        assert_eq!(slot.controller, "SATA");
+        assert_eq!((slot.port, slot.device), (1, 0));
+    }
+
+    #[test]
+    fn maxportcount_is_the_growth_cap_and_defaults_to_thirty() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="SATA"
+storagecontrollertype0="IntelAhci"
+storagecontrollerportcount0="1"
+storagecontrollermaxportcount0="30"
+"SATA-0-0"="C:\\VMs\\sistema.vdi"
+"#;
+        let mut storage = parse_vm_storage(info);
+        assert_eq!(storage.controllers[0].max_ports, 30);
+        assert_eq!(grow_sata_controller(&storage), Some(("SATA".into(), 2)));
+        storage.controllers[0].ports = 2;
+        let slot = pick_vdi_free_slot(&storage).unwrap();
+        assert_eq!((slot.controller.as_str(), slot.port), ("SATA", 1));
+
+        let default_cap = r#"
+VMState="poweroff"
+storagecontrollername0="SATA"
+storagecontrollertype0="IntelAhci"
+storagecontrollerportcount0="1"
+"#;
+        assert_eq!(parse_vm_storage(default_cap).controllers[0].max_ports, MAX_SATA_PORTS);
+
+        let low_cap = r#"
+VMState="poweroff"
+storagecontrollername0="SATA"
+storagecontrollertype0="IntelAhci"
+storagecontrollerportcount0="2"
+storagecontrollermaxportcount0="2"
+"#;
+        let low_cap = parse_vm_storage(low_cap);
+        assert_eq!(grow_sata_controller(&low_cap), None);
+        assert!(sata_plan(&low_cap).is_err());
+    }
+
+    #[test]
+    fn storagectl_portcount_arguments_are_validated() {
+        let expected: Vec<String> = ["storagectl", "Ubuntu", "--name", "SATA", "--portcount", "3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(storagectl_portcount_args("Ubuntu", "SATA", 3).unwrap(), expected);
+        assert!(storagectl_portcount_args("--vm", "SATA", 3).is_err());
+        assert!(storagectl_portcount_args("Ubuntu", "--SATA", 3).is_err());
+        assert!(storagectl_portcount_args("Ubuntu", "SATA", 0).is_err());
+        assert!(storagectl_portcount_args("Ubuntu", "SATA", MAX_SATA_PORTS + 1).is_err());
+    }
+
+    #[test]
+    fn too_many_storage_controllers_is_translated() {
+        let e = CoreError::Message(
+            "VBoxManage: error: Too many storage controllers of this type".into(),
+        );
+        let text = vdi_storagectl_error("crear el controlador VMLab SATA", e).to_string();
+        assert!(text.contains("demasiados controladores de almacenamiento"), "{text}");
+        assert!(text.contains("crear el controlador VMLab SATA"), "{text}");
     }
 
     #[test]

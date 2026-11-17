@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { technicalText, useLocale, useT, type Locale, type Translate } from '../i18n';
 import { groupLive, probeKey } from '../lib/connectivity';
-import { edgeKind, isDisk, mountPathOf, validMountPath, volumeName } from '../lib/disk';
+import {
+  diskSizeLabel,
+  edgeKind,
+  isDisk,
+  MAX_DISK_SIZE_MB,
+  mountPathOf,
+  validMountPath,
+  vdiName,
+  volumeName,
+} from '../lib/disk';
 import { ipc, isTauri } from '../lib/ipc';
 import { charLength, ENV_KEY_RE, hasControlChars, RUN_LIMITS } from '../lib/labFile';
 import { hasLinkConditions, LINK_LIMITS, sameLink } from '../lib/link';
@@ -1139,6 +1148,12 @@ function NetworkSummary() {
   const snapshot = useLab((s) => s.snapshot);
   const { groups } = useMemo(() => computeGroups(nodes, edges), [nodes, edges]);
   const byId = new Map(nodes.map((n) => [n.id, n]));
+  // Los avisos «apaga «X»…» van primero: dicen qué debe hacer el usuario.
+  const warnings = report
+    ? [...report.warnings].sort(
+        (a, b) => Number(/apaga\s+«/.test(b)) - Number(/apaga\s+«/.test(a)),
+      )
+    : [];
 
   return (
     <>
@@ -1182,7 +1197,7 @@ function NetworkSummary() {
         <div className="report">
           <div className="side-title"><span>{t('summary.lastApply')}</span></div>
           <p className="hint">{t('summary.applied', { applied: report.applied, networks: report.networks.length })}</p>
-          {report.warnings.map((w, i) => <p key={`w${i}`} className="hint warn">{w}</p>)}
+          {warnings.map((w, i) => <p key={`w${i}`} className="hint warn">{w}</p>)}
           {report.errors.map((e, i) => <p key={`e${i}`} className="hint err">{technicalText(e)}</p>)}
         </div>
       )}
@@ -1414,7 +1429,7 @@ function RunOptionsPanel({ node }: { node: MachineNode }) {
   );
 }
 
-/** Panel derecho de un nodo Disco: configuración del volumen y de sus montajes. */
+/** Panel derecho de un nodo Disco: tamaño, volumen/VDI y sus enlaces. */
 function DiskPanel({ node }: { node: MachineNode }) {
   const t = useT();
   const nodes = useLab((s) => s.nodes);
@@ -1423,6 +1438,35 @@ function DiskPanel({ node }: { node: MachineNode }) {
   const disk = node.data.disk ?? { shared: false, mounts: [] };
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const volume = volumeName(node.data.target);
+  const linkedVms = disk.mounts
+    .map((mount) => byId.get(mount.container))
+    .filter((n): n is MachineNode => !!n && n.data.kind === 'vbox');
+  const hasVm = linkedVms.length > 0;
+
+  // El tamaño se edita en GB pero se guarda en MB (lo que espera el backend).
+  const sizeFromNode = (): string =>
+    node.data.disk?.sizeMb === undefined ? '' : String(node.data.disk.sizeMb / 1024);
+  const [sizeText, setSizeText] = useState(sizeFromNode);
+  useEffect(() => {
+    setSizeText(sizeFromNode());
+  }, [node.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const mbFromText = (value: string): number | undefined => {
+    const raw = value.trim().replace(',', '.');
+    if (!raw) return undefined;
+    const gb = Number(raw);
+    if (!Number.isFinite(gb) || gb <= 0) return undefined;
+    const mb = Math.round(gb * 1024);
+    return mb >= 1 && mb <= MAX_DISK_SIZE_MB ? mb : undefined;
+  };
+  const sizeInvalid = sizeText.trim() !== '' && mbFromText(sizeText) === undefined;
+
+  const changeSize = (value: string) => {
+    setSizeText(value);
+    const mb = mbFromText(value);
+    if (mb === undefined) return;
+    updateNode(node.id, { disk: { ...disk, sizeMb: mb } });
+  };
 
   return (
     <aside className="inspector disk-panel">
@@ -1430,55 +1474,88 @@ function DiskPanel({ node }: { node: MachineNode }) {
       <label className="field">{t('insp.label')}
         <input value={node.data.label} onChange={(e) => updateNode(node.id, { label: e.target.value })} />
       </label>
-      <label className="field mono">{t('disk.volume', { name: volume })}</label>
-
-      <label className="field check">
-        <input
-          type="checkbox"
-          checked={disk.shared}
-          onChange={(e) => updateNode(node.id, { disk: { ...disk, shared: e.target.checked } })}
-        />
-        <span>{t('disk.shared')}</span>
+      <label className="field mono">
+        {t(hasVm ? 'disk.vdi' : 'disk.volume', { name: hasVm ? vdiName(node.data.target) : volume })}
       </label>
-      <p className="hint warn">{t('disk.sharedHelp')}</p>
 
-      <div className="side-title"><span>{t('disk.mounts')}</span></div>
-      {disk.mounts.length === 0 && <p className="hint">{t('disk.mountsEmpty')}</p>}
-      {disk.mounts.map((mount) => {
-        const edge = edges.find(
-          (e) =>
-            edgeKind(e) === 'mount' &&
-            ((e.source === node.id && e.target === mount.container) ||
-              (e.target === node.id && e.source === mount.container)),
-        );
-        const container = byId.get(mount.container);
-        const invalid = !validMountPath(mount.path);
-        return (
-          <div className="disk-mount" key={mount.container}>
-            <div className="disk-mount-head">
-              <span>{container?.data.label ?? mount.container}</span>
-              {edge && (
-                <button
-                  className="icon-btn sm danger-text"
-                  title={t('disk.mountRemove')}
-                  onClick={() => onEdgesChange([{ type: 'remove', id: edge.id }])}
-                >
-                  <TrashIcon />
-                </button>
-              )}
-            </div>
-            <label className="field">{t('disk.mountPath')}
-              <input
-                className={`mono ${invalid ? 'invalid' : ''}`}
-                value={mount.path}
-                onChange={(e) => edge && setMountPath(edge.id, e.target.value)}
-                spellCheck={false}
-              />
-            </label>
-            {invalid && <p className="hint err">{t('disk.mountInvalid')}</p>}
-          </div>
-        );
-      })}
+      <label className="field">{t('disk.size')}
+        <input
+          type="number"
+          min={0}
+          step="any"
+          className={sizeInvalid ? 'invalid' : ''}
+          value={sizeText}
+          onChange={(e) => changeSize(e.target.value)}
+        />
+      </label>
+      <p className="hint">{t('disk.sizeHelp')}</p>
+      {sizeInvalid && <p className="hint err">{t('disk.sizeInvalid')}</p>}
+
+      {hasVm ? (
+        <>
+          <div className="side-title"><span>{t('disk.linkedVm')}</span></div>
+          {linkedVms.map((vm) => <p key={vm.id} className="hint mono">{vm.data.label}</p>)}
+          <p className="hint warn">{t('disk.sharedVmUnavailable')}</p>
+          <p className="hint warn">{t('disk.vmInit')}</p>
+          <p className="hint warn">{t('disk.vmDetach')}</p>
+        </>
+      ) : (
+        <>
+          <label className="field check">
+            <input
+              type="checkbox"
+              checked={disk.shared}
+              onChange={(e) => updateNode(node.id, { disk: { ...disk, shared: e.target.checked } })}
+            />
+            <span>{t('disk.shared')}</span>
+          </label>
+          <p className="hint warn">{t('disk.sharedHelp')}</p>
+
+          <div className="side-title"><span>{t('disk.mounts')}</span></div>
+          {disk.mounts.length === 0 && (
+            <>
+              <p className="hint">{t('disk.mountsEmpty')}</p>
+              <p className="hint">{t('disk.mountsEmptyVm')}</p>
+            </>
+          )}
+          {disk.mounts.map((mount) => {
+            const edge = edges.find(
+              (e) =>
+                edgeKind(e) === 'mount' &&
+                ((e.source === node.id && e.target === mount.container) ||
+                  (e.target === node.id && e.source === mount.container)),
+            );
+            const target = byId.get(mount.container);
+            const path = mount.path ?? '';
+            const invalid = !validMountPath(path);
+            return (
+              <div className="disk-mount" key={mount.container}>
+                <div className="disk-mount-head">
+                  <span>{target?.data.label ?? mount.container}</span>
+                  {edge && (
+                    <button
+                      className="icon-btn sm danger-text"
+                      title={t('disk.mountRemove')}
+                      onClick={() => onEdgesChange([{ type: 'remove', id: edge.id }])}
+                    >
+                      <TrashIcon />
+                    </button>
+                  )}
+                </div>
+                <label className="field">{t('disk.mountPath')}
+                  <input
+                    className={`mono ${invalid ? 'invalid' : ''}`}
+                    value={path}
+                    onChange={(e) => edge && setMountPath(edge.id, e.target.value)}
+                    spellCheck={false}
+                  />
+                </label>
+                {invalid && <p className="hint err">{t('disk.mountInvalid')}</p>}
+              </div>
+            );
+          })}
+        </>
+      )}
 
       <p className="hint">{t('disk.createHint')}</p>
       <button className="btn ghost danger-text" onClick={() => removeNode(node.id)}><TrashIcon /> {t('insp.remove')}</button>
@@ -1499,6 +1576,7 @@ function CablePanel({ edge }: { edge: Edge }) {
     const container = nodes.find((n) => !isDisk(n) && (n.id === edge.source || n.id === edge.target));
     const path = mountPathOf(edge) ?? '';
     const invalid = !validMountPath(path);
+    const isVm = container?.data.kind === 'vbox';
     return (
       <aside className="inspector mount-panel">
         <div className="side-title"><span>{t('mount.title')}</span></div>
@@ -1509,16 +1587,25 @@ function CablePanel({ edge }: { edge: Edge }) {
               <span aria-hidden="true">→</span>
               <span>{container.data.label}</span>
             </div>
-            <label className="field">{t('mount.path')}
-              <input
-                className={`mono ${invalid ? 'invalid' : ''}`}
-                value={path}
-                onChange={(e) => setMountPath(edge.id, e.target.value)}
-                spellCheck={false}
-              />
-            </label>
-            <p className="hint">{t('mount.pathHint')}</p>
-            {invalid && <p className="hint err">{t('mount.invalid')}</p>}
+            {isVm ? (
+              <>
+                <p className="hint">{t('mount.size')}: <b>{diskSizeLabel(disk.data.disk?.sizeMb)}</b></p>
+                <p className="hint">{t('mount.sizeHint')}</p>
+              </>
+            ) : (
+              <>
+                <label className="field">{t('mount.path')}
+                  <input
+                    className={`mono ${invalid ? 'invalid' : ''}`}
+                    value={path}
+                    onChange={(e) => setMountPath(edge.id, e.target.value)}
+                    spellCheck={false}
+                  />
+                </label>
+                <p className="hint">{t('mount.pathHint')}</p>
+                {invalid && <p className="hint err">{t('mount.invalid')}</p>}
+              </>
+            )}
           </>
         ) : (
           <p className="hint" role="status">{t('cable.checking')}</p>

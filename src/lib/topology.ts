@@ -1,5 +1,5 @@
-import { edgeKind, isDisk } from './disk';
-import type { Edge, MachineNode, TopologyPayload } from '../types';
+import { DEFAULT_MOUNT_PATH, edgeKind, isDisk } from './disk';
+import type { DiskMount, DiskSpec, Edge, MachineNode, TopologyPayload } from '../types';
 
 export interface NetGroup {
   index: number;
@@ -69,7 +69,24 @@ export function uniqueHostSlug(label: string, used: Set<string>): string {
   return candidate;
 }
 
+/** Adaptación del disco al contrato IPC: las VM no reciben ruta y sí tamaño. */
+function toDiskSpec(spec: DiskSpec | undefined, byId: Map<string, MachineNode>): DiskSpec | undefined {
+  if (!spec) return undefined;
+  const mounts: DiskMount[] = spec.mounts.map((mount) => {
+    const target = byId.get(mount.container);
+    if (target?.data.kind === 'vbox') return { container: mount.container };
+    return { container: mount.container, path: mount.path ?? DEFAULT_MOUNT_PATH };
+  });
+  const hasVm = mounts.some((m) => byId.get(m.container)?.data.kind === 'vbox');
+  return {
+    ...(spec.sizeMb === undefined ? {} : { sizeMb: spec.sizeMb }),
+    shared: hasVm ? false : spec.shared,
+    mounts,
+  };
+}
+
 export function toPayload(nodes: MachineNode[], edges: Edge[]): TopologyPayload {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
   return {
     nodes: nodes.map((n) => ({
       id: n.id,
@@ -80,7 +97,7 @@ export function toPayload(nodes: MachineNode[], edges: Edge[]): TopologyPayload 
       net: n.data.kind === 'vbox' ? n.data.net : undefined,
       link: n.data.kind === 'disk' ? undefined : n.data.link,
       options: n.data.kind === 'docker' ? n.data.run : undefined,
-      disk: n.data.kind === 'disk' ? n.data.disk : undefined,
+      disk: n.data.kind === 'disk' ? toDiskSpec(n.data.disk, byId) : undefined,
     })),
     edges: edges.map((e) => ({ from: e.source, to: e.target, kind: edgeKind(e) })),
   };

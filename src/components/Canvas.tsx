@@ -17,7 +17,7 @@ import {
   useReactFlow,
 } from '@xyflow/react';
 import { linkLive } from '../lib/connectivity';
-import { edgeKind, isDisk, mountPathOf } from '../lib/disk';
+import { diskSizeLabel, edgeKind, isDisk, mountPathOf } from '../lib/disk';
 import { resolveState } from '../lib/status';
 import { useT } from '../i18n';
 import { useLab } from '../store/useLab';
@@ -100,12 +100,16 @@ function Flow() {
     return edges.map((e) => {
       if (edgeKind(e) === 'mount') {
         const path = mountPathOf(e);
+        // Un enlace con VM no tiene ruta: se muestra el tamaño del VDI.
+        const diskNode = [byId.get(e.source), byId.get(e.target)].find((n) => n && isDisk(n));
+        const target = byId.get(e.source === diskNode?.id ? e.target : e.source);
+        const label = path ?? (target?.data.kind === 'vbox' ? diskSizeLabel(diskNode?.data.disk?.sizeMb) : undefined);
         return {
           ...e,
           type: 'smoothstep',
           animated: false,
           className: 'edge-mount',
-          label: path,
+          label,
           labelStyle: { fill: 'var(--muted)', fontSize: 10 },
           labelBgStyle: { fill: 'var(--panel)' },
           labelBgPadding: [4, 2] as [number, number],

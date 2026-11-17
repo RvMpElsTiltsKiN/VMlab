@@ -15,7 +15,7 @@ import type {
   NetMode,
   NodeNet,
 } from '../types';
-import { normalizeMountPath, syncDiskMounts, validMountPath } from './disk';
+import { MAX_DISK_SIZE_MB, normalizeMountPath, syncDiskMounts, validMountPath } from './disk';
 import { hasLinkConditions, LINK_LIMITS } from './link';
 
 /** Nodo tal y como viaja dentro de un archivo `.vmlab`. */
@@ -202,20 +202,27 @@ function exportRun(run: DockerRunOptions | undefined): DockerRunOptions | undefi
   return { env, ports };
 }
 
-/** Lista blanca de `disk` para exportar. Solo contenedores y rutas válidas. */
+/** Lista blanca de `disk` para exportar. Los enlaces VM no llevan ruta. */
 function exportDisk(disk: DiskSpec | undefined): DiskSpec | undefined {
   if (!disk) return undefined;
   const mounts: DiskMount[] = [];
   const seen = new Set<string>();
   for (const mount of disk.mounts ?? []) {
-    if (!mount || typeof mount.container !== 'string' || typeof mount.path !== 'string') continue;
-    if (!mount.container || !validMountPath(mount.path)) continue;
-    const key = `${mount.container}|${normalizeMountPath(mount.path)}`;
+    if (!mount || typeof mount.container !== 'string' || !mount.container) continue;
+    // Una ruta ausente es válida: es un enlace con máquina virtual.
+    if (mount.path !== undefined && (typeof mount.path !== 'string' || !validMountPath(mount.path))) continue;
+    const key = `${mount.container}|${mount.path === undefined ? '' : normalizeMountPath(mount.path)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    mounts.push({ container: mount.container, path: mount.path });
+    mounts.push(mount.path === undefined ? { container: mount.container } : { container: mount.container, path: mount.path });
   }
-  return { shared: disk.shared === true, mounts };
+  const sizeMb = disk.sizeMb;
+  const validSize = typeof sizeMb === 'number' && Number.isInteger(sizeMb) && sizeMb >= 1 && sizeMb <= MAX_DISK_SIZE_MB;
+  return {
+    ...(validSize ? { sizeMb } : {}),
+    shared: disk.shared === true,
+    mounts,
+  };
 }
 
 /** Lista blanca de `MachineData` para exportar. La contraseña de invitado nunca se guarda. */
@@ -553,6 +560,20 @@ function parseDisk(value: unknown, label: string, warnings: Message[]): DiskSpec
     warnings.push({ key: 'labFile.warn.diskShared', params: { label } });
   }
 
+  let sizeMb: number | undefined;
+  if (value.sizeMb !== undefined) {
+    if (
+      typeof value.sizeMb === 'number' &&
+      Number.isInteger(value.sizeMb) &&
+      value.sizeMb >= 1 &&
+      value.sizeMb <= MAX_DISK_SIZE_MB
+    ) {
+      sizeMb = value.sizeMb;
+    } else {
+      warnings.push({ key: 'labFile.warn.diskSize', params: { label } });
+    }
+  }
+
   const mounts: DiskMount[] = [];
   const seen = new Set<string>();
   const rawMounts = value.mounts;
@@ -560,30 +581,31 @@ function parseDisk(value: unknown, label: string, warnings: Message[]): DiskSpec
     warnings.push({ key: 'labFile.warn.diskMountsInvalid', params: { label } });
   }
   for (const item of Array.isArray(rawMounts) ? rawMounts : []) {
-    if (
-      !isRecord(item) ||
-      typeof item.container !== 'string' ||
-      typeof item.path !== 'string' ||
-      !item.container ||
-      !validMountPath(item.path)
-    ) {
+    if (!isRecord(item) || typeof item.container !== 'string' || !item.container) {
       warnings.push({ key: 'labFile.warn.diskMountInvalid', params: { label } });
       continue;
     }
-    const key = `${item.container}|${normalizeMountPath(item.path)}`;
+    // `path` ausente = enlace con VM. Presente debe ser una ruta válida.
+    const noPath = item.path === undefined;
+    if (!noPath && (typeof item.path !== 'string' || !validMountPath(item.path))) {
+      warnings.push({ key: 'labFile.warn.diskMountInvalid', params: { label } });
+      continue;
+    }
+    const path = noPath ? undefined : (item.path as string);
+    const key = `${item.container}|${path === undefined ? '' : normalizeMountPath(path)}`;
     if (seen.has(key)) {
       warnings.push({ key: 'labFile.warn.diskMountDup', params: { label } });
       continue;
     }
     seen.add(key);
-    mounts.push({ container: item.container, path: item.path });
+    mounts.push(path === undefined ? { container: item.container } : { container: item.container, path });
   }
 
-  const unknown = Object.keys(value).filter((key) => key !== 'shared' && key !== 'mounts');
+  const unknown = Object.keys(value).filter((key) => key !== 'shared' && key !== 'mounts' && key !== 'sizeMb');
   if (unknown.length) {
     warnings.push({ key: 'labFile.warn.diskUnknown', params: { label, fields: droppedKeys(unknown) } });
   }
-  return { shared, mounts };
+  return { ...(sizeMb === undefined ? {} : { sizeMb }), shared, mounts };
 }
 
 function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Message[]): MachineNode | null {

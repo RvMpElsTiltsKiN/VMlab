@@ -2,7 +2,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { useT } from '../i18n';
 import { probeKey } from '../lib/connectivity';
-import { volumeName } from '../lib/disk';
+import { diskSizeLabel, vdiName, volumeName } from '../lib/disk';
 import { linkSummary } from '../lib/link';
 import { resolveState, stateLabel } from '../lib/status';
 import { useLab } from '../store/useLab';
@@ -40,7 +40,9 @@ function MachineNodeViewInner({ id, data, selected }: NodeProps<MachineNode>) {
 
   // Un disco no es una máquina: no tiene estado, IP, ICMP ni acciones.
   if (data.kind === 'disk') {
-    const volume = volumeName(data.target);
+    // Los enlaces con VM no llevan ruta: ahí el almacenamiento es un VDI.
+    const hasVm = (data.disk?.mounts ?? []).some((mount) => mount.path === undefined);
+    const storage = hasVm ? vdiName(data.target) : volumeName(data.target);
     const mounts = data.disk?.mounts.length ?? 0;
     return (
       <div className={`node disk ${selected ? 'selected' : ''}`}>
@@ -51,11 +53,14 @@ function MachineNodeViewInner({ id, data, selected }: NodeProps<MachineNode>) {
           <span className="node-icon"><DiskIcon /></span>
           <div className="node-titles">
             <div className="node-title" title={data.label}>{data.label}</div>
-            <div className="node-sub mono" title={volume}>{volume}</div>
+            <div className="node-sub mono" title={storage}>{storage}</div>
           </div>
         </div>
         <div className="node-foot">
-          <span className="status">{t('node.diskMounts', { count: mounts })}</span>
+          <span className="status">
+            {t('node.diskMounts', { count: mounts })}
+            {hasVm ? ` · ${diskSizeLabel(data.disk?.sizeMb)}` : ''}
+          </span>
         </div>
       </div>
     );

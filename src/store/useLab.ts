@@ -7,7 +7,16 @@ import {
   type NodeChange,
 } from '@xyflow/react';
 import { probeKey } from '../lib/connectivity';
-import { edgeKind, isDisk, machineKindOf, mountPathOf, nextDiskName, nextMountPath, syncDiskMounts } from '../lib/disk';
+import {
+  DEFAULT_DISK_SIZE_MB,
+  edgeKind,
+  isDisk,
+  machineKindOf,
+  mountPathOf,
+  nextDiskName,
+  nextMountPath,
+  syncDiskMounts,
+} from '../lib/disk';
 import { ipc, setMockNotice } from '../lib/ipc';
 import { parseLab, serializeLab, type LabEdge, type LabNode } from '../lib/labFile';
 import { hasLinkConditions } from '../lib/link';
@@ -20,6 +29,7 @@ import type {
   ApplyReport,
   CaptureFilter,
   CaptureInfo,
+  DiskMount,
   Edge,
   EdgeKind,
   Inventory,
@@ -41,9 +51,9 @@ export interface ToastAction {
 }
 export interface Toast {
   id: number;
-  kind: 'ok' | 'info' | 'error';
+  kind: 'ok' | 'info' | 'error' | 'warning';
   text: string;
-  /** Veces que se ha repetido el mismo mensaje de error consecutivo (empieza en 1). */
+  /** Veces que se ha repetido el mismo mensaje consecutivo (empieza en 1). */
   count: number;
   /** Acción opcional (por ejemplo, abrir una carpeta) en avisos de éxito. */
   action?: ToastAction;
@@ -229,6 +239,12 @@ function toastSummary(line: string, warnings: ToastNote[]): string {
   return lines.join('\n');
 }
 
+/** Los avisos «apaga «X»…» van primero: dicen qué debe hacer el usuario. */
+function orderedWarnings(warnings: string[]): string[] {
+  const isPowerOff = (w: string) => /apaga\s+«/.test(w);
+  return [...warnings.filter(isPowerOff), ...warnings.filter((w) => !isPowerOff(w))];
+}
+
 interface MergeResult {
   nodes: MachineNode[];
   edges: Edge[];
@@ -324,7 +340,7 @@ function mergeLab(
   const incomingDiskIds = new Set(
     incomingNodes.filter((n) => n.data.kind === 'disk').map((n) => n.id),
   );
-  const mountPaths = new Map<string, string>();
+  const mountPaths = new Map<string, string | undefined>();
   for (const input of incomingNodes) {
     if (input.data.kind !== 'disk' || !input.data.disk) continue;
     for (const mount of input.data.disk.mounts) {
@@ -335,7 +351,7 @@ function mergeLab(
     if (node.data.kind !== 'disk' || !node.data.disk) return node;
     const mounts = node.data.disk.mounts
       .map((m) => ({ ...m, container: idMap.get(m.container) }))
-      .filter((m): m is { container: string; path: string } => !!m.container);
+      .filter((m): m is DiskMount => !!m.container);
     return { ...node, data: { ...node.data, disk: { ...node.data.disk, mounts } } };
   });
 
@@ -474,21 +490,46 @@ export const useLab = create<LabState>()((set, get) => ({
         return;
       }
       const disk = aDisk ? a : b;
-      const container = aDisk ? b : a;
-      if (container.data.kind !== 'docker') {
+      const target = aDisk ? b : a;
+      if (target.data.kind !== 'docker' && target.data.kind !== 'vbox') {
         toast('error', t('toast.diskLinkVm'));
         return;
       }
       const links = edges.filter(
         (e) => edgeKind(e) === 'mount' && (e.source === disk.id || e.target === disk.id),
       );
-      if (links.some((e) => e.source === container.id || e.target === container.id)) {
-        toast('info', t('toast.alreadyOnCanvas', { label: container.data.label }));
-        return;
-      }
-      if (disk.data.disk?.shared !== true && links.length > 0) {
-        toast('error', t('toast.diskExclusive'));
-        return;
+      const byId = new Map(nodes.map((n) => [n.id, n]));
+      const kinds = links.map((e) => byId.get(e.source === disk.id ? e.target : e.source)?.data.kind);
+      const hasDocker = kinds.includes('docker');
+      const hasVm = kinds.includes('vbox');
+
+      if (target.data.kind === 'vbox') {
+        // Con VMs el disco es exclusivo: un solo enlace y nunca compartido.
+        if (hasDocker) {
+          toast('error', t('toast.diskMixedTargets'));
+          return;
+        }
+        if (hasVm) {
+          toast('error', t('toast.diskVmSingle'));
+          return;
+        }
+        if (disk.data.disk?.shared === true) {
+          toast('error', t('toast.diskVmShared'));
+          return;
+        }
+      } else {
+        if (hasVm) {
+          toast('error', t('toast.diskMixedTargets'));
+          return;
+        }
+        if (links.some((e) => e.source === target.id || e.target === target.id)) {
+          toast('info', t('toast.alreadyOnCanvas', { label: target.data.label }));
+          return;
+        }
+        if (disk.data.disk?.shared !== true && links.length > 0) {
+          toast('error', t('toast.diskExclusive'));
+          return;
+        }
       }
       const edge: Edge = {
         id: `e_${c.source}_${c.target}_mount`,
@@ -497,7 +538,9 @@ export const useLab = create<LabState>()((set, get) => ({
         sourceHandle: c.sourceHandle,
         targetHandle: c.targetHandle,
         kind: 'mount',
-        data: { path: nextMountPath(container.id, edges, disk.id) },
+        ...(target.data.kind === 'vbox'
+          ? {}
+          : { data: { path: nextMountPath(target.id, edges, disk.id) } }),
       };
       set((s) => syncDiskMounts(s.nodes, [...s.edges, edge]));
       return;
@@ -530,7 +573,7 @@ export const useLab = create<LabState>()((set, get) => ({
         kind: 'disk',
         label: item.label || t('disk.defaultName'),
         target,
-        disk: { shared: false, mounts: [] },
+        disk: { sizeMb: DEFAULT_DISK_SIZE_MB, shared: false, mounts: [] },
       };
     } else {
       if (nodes.some((n) => n.data.kind === item.kind && n.data.target === item.target)) {
@@ -730,6 +773,13 @@ export const useLab = create<LabState>()((set, get) => ({
           'ok',
           report.networks.length ? t('toast.networkApplied', { count: report.applied }) : t('toast.noConnections'),
         );
+      }
+      // Los avisos del backend también se muestran al aplicar. Si hay discos
+      // en el lienzo son persistentes y copiables, como los errores.
+      if (report.warnings.length) {
+        const text = toastSummary(t('toast.applyWarnings'), orderedWarnings(report.warnings));
+        if (nodes.some(isDisk)) get().toast('warning', text);
+        else get().toast('info', text);
       }
       void get().refreshProbes();
     } catch (e) {
@@ -1039,30 +1089,32 @@ export const useLab = create<LabState>()((set, get) => ({
 
   toast(kind, text, action) {
     const id = ++toastSeq;
-    if (kind !== 'error') {
-      // Éxito e información siguen desapareciendo solos; con acción duran algo más.
+    // Errores y avisos de aplicación permanecen hasta que el usuario los
+    // cierre; éxito e información desaparecen solos (con acción duran más).
+    const persistent = kind === 'error' || kind === 'warning';
+    if (!persistent) {
       const item: Toast = { id, kind, text, count: 1, ...(action ? { action } : {}) };
       set((s) => ({
         toasts: [
-          ...s.toasts.filter((t) => t.kind === 'error'),
-          ...[...s.toasts.filter((t) => t.kind !== 'error'), item].slice(-3),
+          ...s.toasts.filter((t) => t.kind === 'error' || t.kind === 'warning'),
+          ...[...s.toasts.filter((t) => t.kind !== 'error' && t.kind !== 'warning'), item].slice(-3),
         ],
       }));
       setTimeout(() => get().dismissToast(id), action ? 8000 : 3500);
       return;
     }
 
-    // Los errores permanecen hasta que el usuario los cierre. Un mensaje
-    // idéntico al último error no se apila: solo incrementa su contador.
+    // Un mensaje idéntico al último aviso persistente no se apila: solo
+    // incrementa su contador.
     set((s) => {
-      const errors = s.toasts.filter((t) => t.kind === 'error');
-      const last = errors[errors.length - 1];
+      const sticky = s.toasts.filter((t) => t.kind === 'error' || t.kind === 'warning');
+      const last = sticky[sticky.length - 1];
       if (last && last.text === text) {
         return { toasts: s.toasts.map((t) => (t.id === last.id ? { ...t, count: t.count + 1 } : t)) };
       }
-      // Máximo 5 errores visibles: se descarta el más antiguo.
-      const next = [...errors, { id, kind, text, count: 1 }].slice(-5);
-      return { toasts: [...s.toasts.filter((t) => t.kind !== 'error'), ...next] };
+      // Máximo 5 avisos persistentes visibles: se descarta el más antiguo.
+      const next = [...sticky, { id, kind, text, count: 1 }].slice(-5);
+      return { toasts: [...s.toasts.filter((t) => t.kind !== 'error' && t.kind !== 'warning'), ...next] };
     });
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
