@@ -3,7 +3,9 @@
 //! Convención de red: VMLab es dueño del **adaptador 2** de cada VM (red interna
 //! `vmlab-xxxxxxxx`). El adaptador 1 (NAT, internet) no se toca.
 use crate::error::{CoreError, Result};
-use crate::model::{Action, GuestAdditionsInfo, GuestAdditionsPrep, LinkInfo, NetMode, NodeNet};
+use crate::model::{
+    Action, GuestAdditionsInfo, GuestAdditionsPrep, LinkInfo, NetMode, NodeIssue, NodeNet,
+};
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
 use crate::validate;
@@ -380,6 +382,7 @@ struct GuestNetProp {
     index: u32,
     mac: Option<String>,
     ipv4: Option<String>,
+    netmask: Option<String>,
 }
 
 fn normalize_mac(s: &str) -> String {
@@ -405,16 +408,28 @@ fn parse_guest_networks(out: &str) -> Vec<GuestNetProp> {
         let slot = match nets.iter_mut().find(|n| n.index == index) {
             Some(slot) => slot,
             None => {
-                nets.push(GuestNetProp { index, mac: None, ipv4: None });
+                nets.push(GuestNetProp { index, mac: None, ipv4: None, netmask: None });
                 nets.last_mut().expect("recién insertado")
             }
         };
         match field.trim() {
             "MAC" => slot.mac = Some(normalize_mac(value)),
             "V4/IP" => {
-                let ip = value.split('/').next().unwrap_or(value).trim();
+                let (ip, prefix) = match value.split_once('/') {
+                    Some((ip, prefix)) => (ip.trim(), prefix.trim().parse::<u8>().ok()),
+                    None => (value.trim(), None),
+                };
                 if ip.parse::<std::net::Ipv4Addr>().is_ok() {
                     slot.ipv4 = Some(ip.to_string());
+                }
+                // Algunos guests publican la máscara solo como prefijo de la IP.
+                if let Some(mask) = prefix.and_then(validate::netmask_from_prefix) {
+                    slot.netmask.get_or_insert(mask);
+                }
+            }
+            "V4/Netmask" => {
+                if let Some(mask) = validate::netmask(value) {
+                    slot.netmask = Some(mask);
                 }
             }
             _ => {}
@@ -433,44 +448,131 @@ pub async fn guest_link(tools: &Tools, target: &str, adapter: u8) -> Result<Link
     }
     let bin = tools.vbox()?;
     let info = run_ok(bin, &["showvminfo", target, "--machinereadable"], SHORT).await?;
-    let mode = vm_field(&info.stdout, &format!("nic{adapter}")).unwrap_or_else(|| "none".into());
-    let note = |text: String| LinkInfo { segment: None, ipv4: None, note: Some(text) };
+    let running = vm_field(&info.stdout, "VMState")
+        .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+    // Si no está en marcha no merece la pena consultar properties: no responderían.
+    let props = if running {
+        run_ok(bin, &["guestproperty", "enumerate", target], SHORT)
+            .await
+            .ok()
+            .map(|out| out.stdout)
+    } else {
+        None
+    };
+    Ok(guest_link_from(adapter, &info.stdout, props.as_deref()))
+}
+
+/// Cálculo puro del enlace a partir de `showvminfo` y, si la VM está en marcha,
+/// de `guestproperty enumerate`. `None` en `props` significa que no se pudieron
+/// leer (sin Guest Additions, máquina parada o error de VirtualBox).
+fn guest_link_from(adapter: u8, info: &str, props: Option<&str>) -> LinkInfo {
+    let state = vm_field(info, "VMState").unwrap_or_default();
+    if !state.eq_ignore_ascii_case("running") {
+        return LinkInfo {
+            segment: None,
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::NotRunning],
+            note: Some(if state.is_empty() {
+                "no se pudo leer el estado de la máquina".into()
+            } else {
+                format!("la máquina no está en marcha ({state})")
+            }),
+        };
+    }
+
+    let mode = vm_field(info, &format!("nic{adapter}")).unwrap_or_else(|| "none".into());
+    let off_segment = |text: String| LinkInfo {
+        segment: None,
+        ipv4: None,
+        netmask: None,
+        issues: vec![NodeIssue::AdapterNotOnSegment],
+        note: Some(text),
+    };
 
     if mode == "none" || mode == "null" {
-        return Ok(note(format!("adaptador {adapter} desconectado")));
+        return off_segment(format!("adaptador {adapter} desconectado"));
     }
     if mode == "nat" {
-        return Ok(note("NAT aísla la VM: no comparte el segmento del lienzo".into()));
+        return off_segment("NAT aísla la VM: no comparte el segmento del lienzo".into());
     }
-    if vm_field(&info.stdout, &format!("cableconnected{adapter}")).as_deref() == Some("off") {
-        return Ok(note(format!("cable del adaptador {adapter} desconectado")));
+    if vm_field(info, &format!("cableconnected{adapter}")).as_deref() == Some("off") {
+        return off_segment(format!("cable del adaptador {adapter} desconectado"));
     }
 
-    let field = |suffix: &str| vm_field(&info.stdout, &format!("{suffix}{adapter}"));
+    let field = |suffix: &str| vm_field(info, &format!("{suffix}{adapter}"));
     let segment = match mode.as_str() {
         "intnet" => Some(format!("intnet:{}", field("intnet").unwrap_or_else(|| "default".into()))),
         "hostonly" => field("hostonlyadapter").map(|n| format!("hostonly:{n}")),
         "bridged" => field("bridgeadapter").map(|n| format!("bridged:{n}")),
         "natnetwork" => field("nat-network").map(|n| format!("natnetwork:{n}")),
-        other => return Ok(note(format!("modo de red no reconocido: {other}"))),
+        other => return off_segment(format!("modo de red no reconocido: {other}")),
     };
     let Some(segment) = segment else {
-        return Ok(note(format!("no se pudo leer la red del adaptador {adapter}")));
+        return off_segment(format!("no se pudo leer la red del adaptador {adapter}"));
     };
     let Some(mac) = field("macaddress") else {
-        return Ok(LinkInfo { segment: Some(segment), ipv4: None, note: Some("el adaptador no tiene MAC".into()) });
+        return LinkInfo {
+            segment: Some(segment),
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::AdapterNotOnSegment],
+            note: Some("el adaptador no tiene MAC".into()),
+        };
     };
 
-    let props = run_ok(bin, &["guestproperty", "enumerate", target], SHORT).await?;
+    let on_segment = mode == "intnet"
+        && segment
+            .strip_prefix("intnet:")
+            .is_some_and(validate::managed_network);
+    let Some(props) = props else {
+        return LinkInfo {
+            segment: Some(segment),
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::NoGuestAdditions],
+            note: Some(
+                "sin respuesta de propiedades: ¿Guest Additions instaladas y en marcha?".into(),
+            ),
+        };
+    };
+    if !props.contains("/VirtualBox/GuestAdd/Version") {
+        return LinkInfo {
+            segment: Some(segment),
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::NoGuestAdditions],
+            note: Some("sin Guest Additions: no se puede leer la IP del guest".into()),
+        };
+    }
+
     let wanted = normalize_mac(&mac);
-    let ipv4 = parse_guest_networks(&props.stdout)
+    let net = parse_guest_networks(props)
         .into_iter()
-        .find(|n| n.mac.as_deref() == Some(wanted.as_str()))
-        .and_then(|n| n.ipv4);
-    let note = ipv4.is_none().then(|| {
-        "sin IPv4 en ese adaptador (¿Guest Additions activas y DHCP/estática configurada?)".to_string()
-    });
-    Ok(LinkInfo { segment: Some(segment), ipv4, note })
+        .find(|n| n.mac.as_deref() == Some(wanted.as_str()));
+    let ipv4 = net.as_ref().and_then(|n| n.ipv4.clone());
+    let netmask = net.as_ref().and_then(|n| n.netmask.clone());
+    let mut issues = Vec::new();
+    if !on_segment {
+        issues.push(NodeIssue::AdapterNotOnSegment);
+    }
+    if ipv4.is_none() {
+        issues.push(NodeIssue::NoIpv4);
+    }
+    let note = match (ipv4.is_none(), on_segment) {
+        (true, true) => Some(
+            "sin IPv4 en ese adaptador (¿Guest Additions activas y DHCP/estática configurada?)"
+                .into(),
+        ),
+        (true, false) => Some(format!(
+            "el adaptador {adapter} no está en una red interna de VMLab y no tiene IPv4"
+        )),
+        (false, false) => {
+            Some(format!("el adaptador {adapter} no está en una red interna de VMLab"))
+        }
+        (false, true) => None,
+    };
+    LinkInfo { segment: Some(segment), ipv4, netmask, issues, note }
 }
 
 /// Ruta de la ISO de Guest Additions que acompaña a la instalación de VirtualBox.
@@ -1116,6 +1218,7 @@ Enabled:        Yes
 /VirtualBox/GuestInfo/Net/0/V4/IP   = '10.0.2.15'                    @ 2026-11-04T16:00:00.000Z
 /VirtualBox/GuestInfo/Net/1/MAC     = '08:00:27:aa:bb:cc'            @ 2026-11-04T16:00:01.000Z
 /VirtualBox/GuestInfo/Net/1/V4/IP   = '10.77.9.10/24'                @ 2026-11-04T16:00:01.000Z
+/VirtualBox/GuestInfo/Net/1/V4/Netmask = '255.255.255.0'              @ 2026-11-04T16:00:01.000Z
 "#;
         let nets = parse_guest_networks(out);
         assert_eq!(nets.len(), 2);
@@ -1123,7 +1226,53 @@ Enabled:        Yes
         assert_eq!(nets[0].ipv4.as_deref(), Some("10.0.2.15"));
         assert_eq!(nets[1].mac.as_deref(), Some("080027AABBCC"));
         assert_eq!(nets[1].ipv4.as_deref(), Some("10.77.9.10"));
+        assert_eq!(nets[1].netmask.as_deref(), Some("255.255.255.0"));
         assert!(parse_guest_networks("/VirtualBox/GuestAdd/Version = '7.2.22' @ x").is_empty());
+    }
+
+    #[test]
+    fn maps_vbox_states_to_structured_issues() {
+        let show = |state: &str, mode: &str| {
+            format!(
+                "VMState=\"{state}\"\nnic2=\"{mode}\"\ncableconnected2=\"on\"\n\
+                 intnet2=\"vmlab-0a1b2c3d\"\nbridgeadapter2=\"eth0\"\nmacaddress2=\"080027AABBCC\"\n"
+            )
+        };
+        let ga = "/VirtualBox/GuestAdd/Version = '7.2.22' @ x\n";
+        let props_ok = format!(
+            "{ga}/VirtualBox/GuestInfo/Net/0/MAC = '080027aabbcc' @ x\n\
+             /VirtualBox/GuestInfo/Net/0/V4/IP = '10.77.9.10' @ x\n\
+             /VirtualBox/GuestInfo/Net/0/V4/Netmask = '255.255.255.0' @ x\n"
+        );
+
+        let off = guest_link_from(2, &show("poweroff", "intnet"), None);
+        assert_eq!(off.issues, vec![NodeIssue::NotRunning]);
+        assert_eq!(off.segment, None);
+
+        let no_ga = guest_link_from(2, &show("running", "intnet"), None);
+        assert_eq!(no_ga.issues, vec![NodeIssue::NoGuestAdditions]);
+        assert_eq!(no_ga.segment.as_deref(), Some("intnet:vmlab-0a1b2c3d"));
+
+        let no_ip = guest_link_from(
+            2,
+            &show("running", "intnet"),
+            Some("/VirtualBox/GuestAdd/Version = '7.2.22' @ x\n\
+                  /VirtualBox/GuestInfo/Net/0/MAC = '080027aabbcc' @ x\n"),
+        );
+        assert_eq!(no_ip.issues, vec![NodeIssue::NoIpv4]);
+        assert_eq!(no_ip.ipv4, None);
+
+        let ok = guest_link_from(2, &show("running", "intnet"), Some(&props_ok));
+        assert!(ok.issues.is_empty());
+        assert_eq!(ok.ipv4.as_deref(), Some("10.77.9.10"));
+        assert_eq!(ok.netmask.as_deref(), Some("255.255.255.0"));
+
+        let nat = guest_link_from(2, &show("running", "nat"), Some(&props_ok));
+        assert_eq!(nat.issues, vec![NodeIssue::AdapterNotOnSegment]);
+
+        let bridged = guest_link_from(2, &show("running", "bridged"), Some(&props_ok));
+        assert_eq!(bridged.issues, vec![NodeIssue::AdapterNotOnSegment]);
+        assert_eq!(bridged.segment.as_deref(), Some("bridged:eth0"));
     }
 
     #[test]

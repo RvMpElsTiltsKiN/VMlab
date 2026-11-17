@@ -94,6 +94,26 @@ pub fn hosts_ipv4(s: &str) -> Result<Ipv4Addr> {
     Ok(addr)
 }
 
+/// Máscara decimal con puntos a partir de un prefijo CIDR (`24` → `255.255.255.0`).
+///
+/// Se usa con datos que llegan de VirtualBox o Docker, no de la UI; por eso un
+/// prefijo fuera de rango simplemente devuelve `None` en vez de un error.
+pub fn netmask_from_prefix(prefix: u8) -> Option<String> {
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) };
+    Some(Ipv4Addr::from(mask).to_string())
+}
+
+/// Normaliza una máscara decimal y comprueba que sea contigua (`/24`, `/16`…).
+pub fn netmask(s: &str) -> Option<String> {
+    let addr = s.trim().parse::<Ipv4Addr>().ok()?;
+    let mask = u32::from(addr);
+    let inverted = !mask;
+    (inverted & inverted.wrapping_add(1) == 0).then(|| addr.to_string())
+}
+
 /// Redes gestionadas por VMLab: `vmlab-` + [a-z0-9-].
 pub fn network_name(s: &str) -> Result<&str> {
     let ok = s.len() <= 40
@@ -406,6 +426,21 @@ mod tests {
         for s in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "127.0.0.1", "10.77.9", "10.77.9.999", "::1"] {
             assert!(hosts_ipv4(s).is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn derives_and_validates_netmasks() {
+        assert_eq!(netmask_from_prefix(24).as_deref(), Some("255.255.255.0"));
+        assert_eq!(netmask_from_prefix(16).as_deref(), Some("255.255.0.0"));
+        assert_eq!(netmask_from_prefix(0).as_deref(), Some("0.0.0.0"));
+        assert_eq!(netmask_from_prefix(32).as_deref(), Some("255.255.255.255"));
+        assert_eq!(netmask_from_prefix(33), None);
+
+        assert_eq!(netmask("255.255.255.0").as_deref(), Some("255.255.255.0"));
+        assert_eq!(netmask(" 255.255.0.0 ").as_deref(), Some("255.255.0.0"));
+        assert_eq!(netmask("255.0.255.0"), None);
+        assert_eq!(netmask("24"), None);
+        assert_eq!(netmask(""), None);
     }
 
     #[test]

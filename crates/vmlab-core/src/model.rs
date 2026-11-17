@@ -359,13 +359,40 @@ pub struct ProbeNode {
     pub adapter: Option<u8>,
 }
 
+/// Motivo estructurado por el que un extremo del cable todavía no está listo.
+///
+/// Se serializa como un objeto con `code` en camelCase (`{"code":"notRunning"}`)
+/// porque el frontend usará ese valor como clave de traducción. `probeFailed`
+/// puede incluir un `detail` legible con el error original.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "camelCase")]
+pub enum NodeIssue {
+    /// La máquina o el contenedor está apagado, parado o pausado.
+    NotRunning,
+    /// VirtualBox: sin Guest Additions o sin respuesta de sus propiedades.
+    NoGuestAdditions,
+    /// El adaptador no está en el modo/red de VMLab esperado.
+    AdapterNotOnSegment,
+    /// Todavía no hay dirección IPv4 en el adaptador del segmento.
+    NoIpv4,
+    /// El sondeo falló; el detalle es el error original, si se conoce.
+    ProbeFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
 /// Enlace observado dentro de una máquina o contenedor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkInfo {
     /// Red concreta: `intnet:<nombre>`, `bridged:<interfaz>`, `docker:<red>`…
     pub segment: Option<String>,
     pub ipv4: Option<String>,
-    /// Motivo cuando todavía no se puede afirmar que haya comunicación.
+    /// Máscara decimal en formato con puntos (`255.255.255.0`).
+    pub netmask: Option<String>,
+    /// Lista vacía = el extremo está listo para comunicarse.
+    pub issues: Vec<NodeIssue>,
+    /// Motivo legible cuando todavía no se puede afirmar que haya comunicación.
     pub note: Option<String>,
 }
 
@@ -377,6 +404,9 @@ pub struct NodeProbe {
     pub target: String,
     pub segment: Option<String>,
     pub ipv4: Option<String>,
+    pub netmask: Option<String>,
+    /// Lista vacía = el extremo está listo para comunicarse.
+    pub issues: Vec<NodeIssue>,
     pub note: Option<String>,
 }
 
@@ -532,4 +562,29 @@ pub struct GuestHostsRequest {
     pub password: String,
     #[serde(default)]
     pub entries: Vec<GuestHostEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_issue_serializes_with_stable_camel_case_codes() {
+        let cases = [
+            (NodeIssue::NotRunning, "notRunning"),
+            (NodeIssue::NoGuestAdditions, "noGuestAdditions"),
+            (NodeIssue::AdapterNotOnSegment, "adapterNotOnSegment"),
+            (NodeIssue::NoIpv4, "noIpv4"),
+            (NodeIssue::ProbeFailed { detail: None }, "probeFailed"),
+        ];
+        for (issue, code) in cases {
+            let json = serde_json::to_value(&issue).unwrap();
+            assert_eq!(json["code"], code, "{issue:?}");
+        }
+        let detail = NodeIssue::ProbeFailed { detail: Some("sin respuesta".into()) };
+        assert_eq!(
+            serde_json::to_value(&detail).unwrap(),
+            serde_json::json!({ "code": "probeFailed", "detail": "sin respuesta" })
+        );
+    }
 }

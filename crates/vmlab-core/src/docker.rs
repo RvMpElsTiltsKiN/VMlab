@@ -1,7 +1,7 @@
 //! Control de contenedores con la CLI de Docker.
 //! Cada segmento de red de VMLab es una red *bridge* de Docker llamada `vmlab-xxxxxxxx`.
 use crate::error::{CoreError, Result};
-use crate::model::{Action, DockerRunOptions, LinkInfo, PowerState};
+use crate::model::{Action, DockerRunOptions, LinkInfo, NodeIssue, PowerState};
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
 use crate::validate;
@@ -60,26 +60,102 @@ pub async fn list(tools: &Tools) -> Result<Vec<ContainerInfo>> {
     Ok(parse_ps(&out.stdout))
 }
 
-/// Pares `red=IP` de `docker inspect` (separados por `;`).
-fn parse_networks(out: &str) -> Vec<(String, String)> {
-    out.split(';')
+/// Una red del contenedor según `docker inspect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerNet {
+    name: String,
+    ipv4: Option<String>,
+    /// Prefijo CIDR (`IPPrefixLen`) si Docker lo publica.
+    prefix: Option<u8>,
+}
+
+/// Separa `estado|red=IP/prefijo;...` de `docker inspect`.
+fn parse_link_inspect(out: &str) -> (PowerState, Vec<DockerNet>) {
+    let (state, nets) = out.split_once('|').unwrap_or(("", out));
+    let nets = nets
+        .split(';')
         .filter_map(|pair| {
-            let (name, ip) = pair.trim().split_once('=')?;
-            (!name.is_empty()).then(|| (name.to_string(), ip.trim().to_string()))
+            let (name, addr) = pair.trim().split_once('=')?;
+            if name.is_empty() {
+                return None;
+            }
+            let (ip, prefix) = match addr.trim().split_once('/') {
+                Some((ip, prefix)) => (ip.trim(), prefix.trim().parse::<u8>().ok()),
+                None => (addr.trim(), None),
+            };
+            Some(DockerNet {
+                name: name.to_string(),
+                ipv4: (!ip.is_empty()).then(|| ip.to_string()),
+                prefix: prefix.filter(|p| *p <= 32),
+            })
         })
-        .collect()
+        .collect();
+    (map_state(state), nets)
 }
 
-fn vmlab_of(nets: &[(String, String)]) -> Option<(String, String)> {
-    // Durante la migración puede haber redes antiguas `lablab-*`; se prefieren las nuevas.
-    let pick = nets
-        .iter()
-        .find(|(net, ip)| net.starts_with("vmlab-") && !ip.is_empty())
-        .or_else(|| nets.iter().find(|(net, ip)| net.starts_with("lablab-") && !ip.is_empty()))?;
-    Some((format!("docker:{}", pick.0), pick.1.clone()))
+/// Red gestionada del contenedor. Durante la migración puede haber redes
+/// antiguas `lablab-*`; se prefieren las nuevas y, dentro de cada tipo, las que
+/// ya tienen IP.
+fn managed_net(nets: &[DockerNet]) -> Option<&DockerNet> {
+    nets.iter()
+        .find(|n| n.name.starts_with("vmlab-") && n.ipv4.is_some())
+        .or_else(|| nets.iter().find(|n| n.name.starts_with("vmlab-")))
+        .or_else(|| nets.iter().find(|n| n.name.starts_with("lablab-") && n.ipv4.is_some()))
+        .or_else(|| nets.iter().find(|n| n.name.starts_with("lablab-")))
 }
 
-/// Red `vmlab-*` e IPv4 del contenedor. Sin credenciales: solo consulta Docker.
+/// Cálculo puro del enlace a partir de la salida de `docker inspect`.
+fn link_from_inspect(out: &str) -> LinkInfo {
+    let (state, nets) = parse_link_inspect(out);
+    let net = managed_net(&nets);
+    let segment = net.map(|n| format!("docker:{}", n.name));
+
+    if state != PowerState::Running {
+        return LinkInfo {
+            segment,
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::NotRunning],
+            note: Some(
+                match state {
+                    PowerState::Missing => "el contenedor no existe",
+                    PowerState::Unknown => "no se pudo leer el estado del contenedor",
+                    _ => "el contenedor no está en marcha",
+                }
+                .into(),
+            ),
+        };
+    }
+
+    let Some(net) = net else {
+        return LinkInfo {
+            segment: None,
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::AdapterNotOnSegment],
+            note: Some("el contenedor no está en una red de VMLab".into()),
+        };
+    };
+    if net.ipv4.is_none() {
+        return LinkInfo {
+            segment,
+            ipv4: None,
+            netmask: None,
+            issues: vec![NodeIssue::NoIpv4],
+            note: Some("sin IPv4 asignada en la red del segmento".into()),
+        };
+    }
+    LinkInfo {
+        segment,
+        ipv4: net.ipv4.clone(),
+        netmask: net.prefix.and_then(validate::netmask_from_prefix),
+        issues: Vec::new(),
+        note: None,
+    }
+}
+
+/// Red `vmlab-*`, estado e IPv4/máscara del contenedor. Sin credenciales: solo
+/// consulta Docker.
 pub async fn vmlab_link(tools: &Tools, name: &str) -> Result<LinkInfo> {
     validate::container_name(name)?;
     let out = run_ok(
@@ -87,20 +163,13 @@ pub async fn vmlab_link(tools: &Tools, name: &str) -> Result<LinkInfo> {
         &[
             "inspect",
             "-f",
-            "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}};{{end}}",
+            "{{.State.Status}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}}/{{$v.IPPrefixLen}};{{end}}",
             name,
         ],
         SHORT,
     )
     .await?;
-    Ok(match vmlab_of(&parse_networks(&out.stdout)) {
-        Some((segment, ipv4)) => LinkInfo { segment: Some(segment), ipv4: Some(ipv4), note: None },
-        None => LinkInfo {
-            segment: None,
-            ipv4: None,
-            note: Some("sin red VMLab o sin IP asignada".into()),
-        },
-    })
+    Ok(link_from_inspect(&out.stdout))
 }
 
 /// Argumentos `-e`/`-p` compartidos por `docker run` y `docker create`.
@@ -709,28 +778,59 @@ mod tests {
 
     #[test]
     fn picks_the_vmlab_network_and_ignores_the_default_bridge() {
-        let nets = parse_networks("bridge=172.17.0.2;vmlab-0a1b2c3d=172.18.0.2;");
+        let (_, nets) =
+            parse_link_inspect("running|bridge=172.17.0.2/16;vmlab-0a1b2c3d=172.18.0.2/24;");
         assert_eq!(nets.len(), 2);
         assert_eq!(
-            vmlab_of(&nets),
-            Some(("docker:vmlab-0a1b2c3d".into(), "172.18.0.2".into()))
+            managed_net(&nets).map(|n| (n.name.as_str(), n.ipv4.as_deref(), n.prefix)),
+            Some(("vmlab-0a1b2c3d", Some("172.18.0.2"), Some(24)))
         );
-        assert_eq!(vmlab_of(&parse_networks("bridge=172.17.0.2;")), None);
-        assert_eq!(vmlab_of(&parse_networks("vmlab-empty=;")), None);
+        assert_eq!(managed_net(&parse_link_inspect("running|bridge=172.17.0.2/16;").1), None);
+        // Una red gestionada sin IP sigue siendo el segmento del contenedor:
+        // se informa como `NoIpv4`, no como adaptador fuera de la red.
+        assert_eq!(
+            managed_net(&parse_link_inspect("running|vmlab-empty=/;").1)
+                .map(|n| (n.name.as_str(), n.ipv4.as_deref())),
+            Some(("vmlab-empty", None))
+        );
     }
 
     #[test]
     fn recognizes_legacy_networks_during_migration_but_prefers_new_ones() {
-        let legacy = parse_networks("bridge=172.17.0.2;lablab-0a1b2c3d=172.18.0.2;");
+        let legacy =
+            parse_link_inspect("running|bridge=172.17.0.2/16;lablab-0a1b2c3d=172.18.0.2/24;").1;
         assert_eq!(
-            vmlab_of(&legacy),
-            Some(("docker:lablab-0a1b2c3d".into(), "172.18.0.2".into()))
+            managed_net(&legacy).map(|n| (n.name.as_str(), n.ipv4.as_deref())),
+            Some(("lablab-0a1b2c3d", Some("172.18.0.2")))
         );
-        let both = parse_networks("lablab-0a1b2c3d=172.18.0.2;vmlab-0a1b2c3d=172.19.0.2;");
+        let both = parse_link_inspect(
+            "running|lablab-0a1b2c3d=172.18.0.2/24;vmlab-0a1b2c3d=172.19.0.2/24;",
+        )
+        .1;
         assert_eq!(
-            vmlab_of(&both),
-            Some(("docker:vmlab-0a1b2c3d".into(), "172.19.0.2".into()))
+            managed_net(&both).map(|n| (n.name.as_str(), n.ipv4.as_deref())),
+            Some(("vmlab-0a1b2c3d", Some("172.19.0.2")))
         );
+    }
+
+    #[test]
+    fn maps_docker_states_to_structured_issues() {
+        let stopped = link_from_inspect("exited|bridge=172.17.0.2/16;vmlab-0a1b2c3d=/0;");
+        assert_eq!(stopped.issues, vec![NodeIssue::NotRunning]);
+        assert_eq!(stopped.segment.as_deref(), Some("docker:vmlab-0a1b2c3d"));
+
+        let wrong = link_from_inspect("running|bridge=172.17.0.2/16;");
+        assert_eq!(wrong.issues, vec![NodeIssue::AdapterNotOnSegment]);
+        assert_eq!(wrong.segment, None);
+
+        let no_ip = link_from_inspect("running|vmlab-0a1b2c3d=/0;");
+        assert_eq!(no_ip.issues, vec![NodeIssue::NoIpv4]);
+        assert_eq!(no_ip.segment.as_deref(), Some("docker:vmlab-0a1b2c3d"));
+
+        let ok = link_from_inspect("running|vmlab-0a1b2c3d=172.18.0.2/24;");
+        assert!(ok.issues.is_empty());
+        assert_eq!(ok.ipv4.as_deref(), Some("172.18.0.2"));
+        assert_eq!(ok.netmask.as_deref(), Some("255.255.255.0"));
     }
 
     #[test]
