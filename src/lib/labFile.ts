@@ -1,18 +1,21 @@
-import type { Edge } from '@xyflow/react';
 import type { Message } from '../i18n';
 import type {
+  DiskMount,
+  DiskSpec,
   DockerEnvVar,
   DockerPortMap,
   DockerRunOptions,
+  Edge,
+  EdgeKind,
   GuestIpMode,
   GuestSystem,
   LinkConditions,
   MachineData,
-  MachineKind,
   MachineNode,
   NetMode,
   NodeNet,
 } from '../types';
+import { normalizeMountPath, syncDiskMounts, validMountPath } from './disk';
 import { hasLinkConditions, LINK_LIMITS } from './link';
 
 /** Nodo tal y como viaja dentro de un archivo `.vmlab`. */
@@ -22,10 +25,13 @@ export interface LabNode {
   data: MachineData;
 }
 
-/** Arista tal y como viaja dentro de un archivo `.vmlab`. */
+/** Arista tal y como viaja dentro de un archivo `.vmlab`. `kind` es opcional en archivos antiguos. */
 export interface LabEdge {
   source: string;
   target: string;
+  kind?: EdgeKind;
+  /** Ruta del enlace de montaje (el dato canónico viaja en `disk.mounts`). */
+  path?: string;
 }
 
 export type ParseLabResult =
@@ -102,6 +108,7 @@ const ALL_DATA_KEYS = new Set<string>([
   'net',
   'link',
   'slot',
+  'disk',
   ...GUEST_STRING_KEYS,
   'guestSystem',
   'guestMode',
@@ -195,9 +202,31 @@ function exportRun(run: DockerRunOptions | undefined): DockerRunOptions | undefi
   return { env, ports };
 }
 
+/** Lista blanca de `disk` para exportar. Solo contenedores y rutas válidas. */
+function exportDisk(disk: DiskSpec | undefined): DiskSpec | undefined {
+  if (!disk) return undefined;
+  const mounts: DiskMount[] = [];
+  const seen = new Set<string>();
+  for (const mount of disk.mounts ?? []) {
+    if (!mount || typeof mount.container !== 'string' || typeof mount.path !== 'string') continue;
+    if (!mount.container || !validMountPath(mount.path)) continue;
+    const key = `${mount.container}|${normalizeMountPath(mount.path)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    mounts.push({ container: mount.container, path: mount.path });
+  }
+  return { shared: disk.shared === true, mounts };
+}
+
 /** Lista blanca de `MachineData` para exportar. La contraseña de invitado nunca se guarda. */
 function exportData(data: MachineData): Record<string, unknown> {
   const out: Record<string, unknown> = { kind: data.kind, label: data.label, target: data.target };
+
+  if (data.kind === 'disk') {
+    const disk = exportDisk(data.disk);
+    if (disk) out.disk = disk;
+    return out;
+  }
 
   const link = exportLink(data.link);
   if (link) out.link = link;
@@ -246,7 +275,13 @@ export function serializeLab(nodes: readonly LabNode[], edges: readonly LabEdge[
     const key = edge.source < edge.target ? `${edge.source}|${edge.target}` : `${edge.target}|${edge.source}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    outEdges.push({ source: edge.source, target: edge.target });
+    const kind: EdgeKind = edge.kind === 'mount' ? 'mount' : 'network';
+    outEdges.push({
+      source: edge.source,
+      target: edge.target,
+      kind,
+      ...(kind === 'mount' && edge.path ? { path: edge.path } : {}),
+    });
   }
 
   return JSON.stringify(
@@ -506,6 +541,51 @@ function parseGuestFields(data: Record<string, unknown>, out: MachineData, label
   }
 }
 
+/** Lista blanca de la configuración de disco importada. */
+function parseDisk(value: unknown, label: string, warnings: Message[]): DiskSpec | undefined {
+  if (!isRecord(value)) {
+    warnings.push({ key: 'labFile.warn.diskInvalid', params: { label } });
+    return undefined;
+  }
+
+  const shared = value.shared === true;
+  if (value.shared !== undefined && typeof value.shared !== 'boolean') {
+    warnings.push({ key: 'labFile.warn.diskShared', params: { label } });
+  }
+
+  const mounts: DiskMount[] = [];
+  const seen = new Set<string>();
+  const rawMounts = value.mounts;
+  if (rawMounts !== undefined && !Array.isArray(rawMounts)) {
+    warnings.push({ key: 'labFile.warn.diskMountsInvalid', params: { label } });
+  }
+  for (const item of Array.isArray(rawMounts) ? rawMounts : []) {
+    if (
+      !isRecord(item) ||
+      typeof item.container !== 'string' ||
+      typeof item.path !== 'string' ||
+      !item.container ||
+      !validMountPath(item.path)
+    ) {
+      warnings.push({ key: 'labFile.warn.diskMountInvalid', params: { label } });
+      continue;
+    }
+    const key = `${item.container}|${normalizeMountPath(item.path)}`;
+    if (seen.has(key)) {
+      warnings.push({ key: 'labFile.warn.diskMountDup', params: { label } });
+      continue;
+    }
+    seen.add(key);
+    mounts.push({ container: item.container, path: item.path });
+  }
+
+  const unknown = Object.keys(value).filter((key) => key !== 'shared' && key !== 'mounts');
+  if (unknown.length) {
+    warnings.push({ key: 'labFile.warn.diskUnknown', params: { label, fields: droppedKeys(unknown) } });
+  }
+  return { shared, mounts };
+}
+
 function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Message[]): MachineNode | null {
   if (!isRecord(raw)) {
     warnings.push({ key: 'labFile.warn.nodeNotObject', params: { index: index + 1 } });
@@ -543,7 +623,7 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Mes
   }
 
   const kind = data.kind;
-  if (kind !== 'vbox' && kind !== 'docker') {
+  if (kind !== 'vbox' && kind !== 'docker' && kind !== 'disk') {
     const kindLabel = kindName(kind);
     warnings.push(
       kindLabel
@@ -566,16 +646,30 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Mes
   }
 
   const display = nameOf(label, id);
-  const out: MachineData = { kind: kind as MachineKind, label, target };
+  const out: MachineData = { kind: kind as MachineData['kind'], label, target };
 
   const unknown = Object.keys(data).filter((key) => !ALL_DATA_KEYS.has(key));
   if (unknown.length) {
     warnings.push({ key: 'labFile.warn.nodeUnknown', params: { label: display, fields: droppedKeys(unknown) } });
   }
 
-  if (data.link !== undefined) {
+  if (kind !== 'disk' && data.link !== undefined) {
     const link = parseLink(data.link, display, warnings);
     if (link) out.link = link;
+  }
+
+  if (kind === 'disk') {
+    if (data.disk !== undefined) {
+      const disk = parseDisk(data.disk, display, warnings);
+      if (disk) out.disk = disk;
+    }
+    const extra = ['image', 'run', 'net', 'slot', 'link', ...GUEST_KEYS].filter(
+      (key) => data[key] !== undefined,
+    );
+    if (extra.length) {
+      warnings.push({ key: 'labFile.warn.diskFields', params: { label: display, fields: droppedKeys(extra) } });
+    }
+    return { id, type: 'machine', position: { x: position.x, y: position.y }, data: out };
   }
 
   if (kind === 'docker') {
@@ -682,6 +776,7 @@ export function parseLab(text: string): ParseLabResult {
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  const nodeKinds = new Map(nodes.map((n) => [n.id, n.data.kind]));
 
   raw.edges.forEach((item, index) => {
     if (!isRecord(item) || typeof item.source !== 'string' || typeof item.target !== 'string') {
@@ -697,14 +792,26 @@ export function parseLab(text: string): ParseLabResult {
       warnings.push({ key: 'labFile.warn.edgeSelf', params: { source } });
       return;
     }
-    const key = source < target ? `${source}|${target}` : `${target}|${source}`;
+    const kind: EdgeKind = item.kind === 'mount' ? 'mount' : 'network';
+    if (kind === 'mount' && (nodeKinds.get(source) === 'disk') === (nodeKinds.get(target) === 'disk')) {
+      warnings.push({ key: 'labFile.warn.edgeMountInvalid', params: { source, target } });
+      return;
+    }
+    const key = `${kind}|${source < target ? `${source}|${target}` : `${target}|${source}`}`;
     if (seen.has(key)) {
       warnings.push({ key: 'labFile.warn.edgeDup', params: { source, target } });
       return;
     }
     seen.add(key);
-    edges.push({ id: `e_${source}_${target}`, source, target });
+    edges.push({
+      id: `e_${source}_${target}${kind === 'mount' ? '_mount' : ''}`,
+      source,
+      target,
+      kind,
+      ...(kind === 'mount' && typeof item.path === 'string' ? { data: { path: item.path } } : {}),
+    });
   });
 
-  return { ok: true, nodes, edges, warnings };
+  const synced = syncDiskMounts(nodes, edges);
+  return { ok: true, nodes: synced.nodes, edges: synced.edges, warnings };
 }

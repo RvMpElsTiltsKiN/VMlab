@@ -3,11 +3,11 @@ import {
   applyEdgeChanges,
   applyNodeChanges,
   type Connection,
-  type Edge,
   type EdgeChange,
   type NodeChange,
 } from '@xyflow/react';
 import { probeKey } from '../lib/connectivity';
+import { edgeKind, isDisk, machineKindOf, mountPathOf, nextDiskName, nextMountPath, syncDiskMounts } from '../lib/disk';
 import { ipc, setMockNotice } from '../lib/ipc';
 import { parseLab, serializeLab, type LabEdge, type LabNode } from '../lib/labFile';
 import { hasLinkConditions } from '../lib/link';
@@ -20,6 +20,8 @@ import type {
   ApplyReport,
   CaptureFilter,
   CaptureInfo,
+  Edge,
+  EdgeKind,
   Inventory,
   LabSnapInfo,
   LabSnapNode,
@@ -85,6 +87,8 @@ interface LabState {
   onConnect: (c: Connection) => void;
   addMachine: (item: PaletteItem, position?: { x: number; y: number }) => void;
   updateNode: (id: string, patch: Partial<MachineData>) => void;
+  /** Cambia la ruta de un enlace de montaje y mantiene `disk.mounts` alineado. */
+  setMountPath: (edgeId: string, path: string) => void;
   removeNode: (id: string) => void;
   exportLab: () => void;
   importLab: (text: string, mode: LabMode) => Promise<void>;
@@ -193,14 +197,14 @@ const newId = () => `n_${Date.now().toString(36)}${Math.random().toString(36).sl
 
 /** Nodos que todavía no apuntan a una máquina real (huecos de plantilla o destino vacío). */
 function unassignedNodes(nodes: MachineNode[]): MachineNode[] {
-  return nodes.filter((n) => n.data.slot === true || n.data.target.trim() === '');
+  return nodes.filter((n) => !isDisk(n) && (n.data.slot === true || n.data.target.trim() === ''));
 }
 
-/** Nodos que viajan al backend de instantáneas: nunca incluye huecos de plantilla. */
+/** Nodos que viajan al backend de instantáneas: ni huecos ni discos. */
 function labsnapNodes(nodes: MachineNode[]): LabSnapNode[] {
   return nodes
-    .filter((n) => n.data.slot !== true && n.data.target.trim() !== '')
-    .map((n) => ({ kind: n.data.kind, target: n.data.target, label: n.data.label }));
+    .filter((n) => !isDisk(n) && n.data.slot !== true && n.data.target.trim() !== '')
+    .map((n) => ({ kind: n.data.kind as LabSnapNode['kind'], target: n.data.target, label: n.data.label }));
 }
 
 /** Adaptador de VirtualBox para el límite de ancho de banda (Docker no lo usa). */
@@ -282,10 +286,10 @@ function mergeLab(
     if (data.target) {
       const key = `${data.kind}:${data.target}`;
       if (taken.has(key)) {
-        if (template && data.kind === 'docker') {
+        if (template && (data.kind === 'docker' || data.kind === 'disk')) {
           let suffix = 2;
           let candidate = `${data.target}-${suffix}`;
-          while (taken.has(`docker:${candidate}`)) {
+          while (taken.has(`${data.kind}:${candidate}`)) {
             suffix += 1;
             candidate = `${data.target}-${suffix}`;
           }
@@ -314,19 +318,56 @@ function mergeLab(
     });
   });
 
+  // Los `mounts[].container` del archivo usan los ids originales. Después de
+  // reasignar ids hay que traducirlos para que el disco apunte al contenedor
+  // que realmente está ahora en el lienzo.
+  const incomingDiskIds = new Set(
+    incomingNodes.filter((n) => n.data.kind === 'disk').map((n) => n.id),
+  );
+  const mountPaths = new Map<string, string>();
+  for (const input of incomingNodes) {
+    if (input.data.kind !== 'disk' || !input.data.disk) continue;
+    for (const mount of input.data.disk.mounts) {
+      mountPaths.set(`${input.id}:${mount.container}`, mount.path);
+    }
+  }
+  const remapped = kept.map((node) => {
+    if (node.data.kind !== 'disk' || !node.data.disk) return node;
+    const mounts = node.data.disk.mounts
+      .map((m) => ({ ...m, container: idMap.get(m.container) }))
+      .filter((m): m is { container: string; path: string } => !!m.container);
+    return { ...node, data: { ...node.data, disk: { ...node.data.disk, mounts } } };
+  });
+
   const edges: Edge[] = [];
   const seenEdges = new Set<string>();
   for (const input of incomingEdges) {
     const source = idMap.get(input.source);
     const target = idMap.get(input.target);
     if (!source || !target || source === target) continue;
-    const key = source < target ? `${source}|${target}` : `${target}|${source}`;
+    // Los archivos antiguos no tenían `kind`: una arista que toca un disco es de montaje.
+    const mount =
+      input.kind === 'mount' ||
+      (!input.kind && (incomingDiskIds.has(input.source) || incomingDiskIds.has(input.target)));
+    const kind: EdgeKind = mount ? 'mount' : 'network';
+    const key = `${kind}|${source < target ? `${source}|${target}` : `${target}|${source}`}`;
     if (seenEdges.has(key)) continue;
     seenEdges.add(key);
-    edges.push({ id: `e_${source}_${target}`, source, target });
+    const path =
+      (kind === 'mount' && input.path) ||
+      mountPaths.get(`${input.source}:${input.target}`) ||
+      mountPaths.get(`${input.target}:${input.source}`);
+    edges.push({
+      id: `e_${source}_${target}${kind === 'mount' ? '_mount' : ''}`,
+      source,
+      target,
+      kind,
+      ...(kind === 'mount' && path ? { data: { path } } : {}),
+    });
   }
 
-  return { nodes: [...baseNodes, ...kept], edges: [...baseEdges, ...edges], added: kept.length };
+  const synced = syncDiskMounts([...baseNodes, ...remapped], [...baseEdges, ...edges]);
+  return { nodes: synced.nodes, edges: synced.edges, added: kept.length };
 }
 
 export const useLab = create<LabState>()((set, get) => ({
@@ -360,7 +401,10 @@ export const useLab = create<LabState>()((set, get) => ({
       const raw = await ipc.loadWorkspace();
       if (raw) {
         const ws = JSON.parse(raw) as { nodes?: MachineNode[]; edges?: Edge[] };
-        if (Array.isArray(ws.nodes) && Array.isArray(ws.edges)) set({ nodes: ws.nodes, edges: ws.edges });
+        if (Array.isArray(ws.nodes) && Array.isArray(ws.edges)) {
+          const synced = syncDiskMounts(ws.nodes, ws.edges);
+          set(synced);
+        }
       }
     } catch (e) {
       get().toast('error', technicalText(t('toast.workspaceLoad', { detail: errText(e) })));
@@ -410,13 +454,60 @@ export const useLab = create<LabState>()((set, get) => ({
     }
   },
 
-  onNodesChange: (c) => set((s) => ({ nodes: applyNodeChanges(c, s.nodes) })),
-  onEdgesChange: (c) => set((s) => ({ edges: applyEdgeChanges(c, s.edges) })),
+  onNodesChange: (c) =>
+    set((s) => syncDiskMounts(applyNodeChanges(c, s.nodes), s.edges)),
+  onEdgesChange: (c) =>
+    set((s) => syncDiskMounts(s.nodes, applyEdgeChanges(c, s.edges))),
 
   onConnect(c) {
     if (!c.source || !c.target || c.source === c.target) return;
-    const exists = get().edges.some(
-      (e) => (e.source === c.source && e.target === c.target) || (e.source === c.target && e.target === c.source),
+    const { nodes, edges, toast } = get();
+    const a = nodes.find((n) => n.id === c.source);
+    const b = nodes.find((n) => n.id === c.target);
+    if (!a || !b) return;
+    const aDisk = isDisk(a);
+    const bDisk = isDisk(b);
+
+    if (aDisk || bDisk) {
+      if (aDisk && bDisk) {
+        toast('error', t('toast.diskLinkDisk'));
+        return;
+      }
+      const disk = aDisk ? a : b;
+      const container = aDisk ? b : a;
+      if (container.data.kind !== 'docker') {
+        toast('error', t('toast.diskLinkVm'));
+        return;
+      }
+      const links = edges.filter(
+        (e) => edgeKind(e) === 'mount' && (e.source === disk.id || e.target === disk.id),
+      );
+      if (links.some((e) => e.source === container.id || e.target === container.id)) {
+        toast('info', t('toast.alreadyOnCanvas', { label: container.data.label }));
+        return;
+      }
+      if (disk.data.disk?.shared !== true && links.length > 0) {
+        toast('error', t('toast.diskExclusive'));
+        return;
+      }
+      const edge: Edge = {
+        id: `e_${c.source}_${c.target}_mount`,
+        source: c.source,
+        target: c.target,
+        sourceHandle: c.sourceHandle,
+        targetHandle: c.targetHandle,
+        kind: 'mount',
+        data: { path: nextMountPath(container.id, edges, disk.id) },
+      };
+      set((s) => syncDiskMounts(s.nodes, [...s.edges, edge]));
+      return;
+    }
+
+    // Sin discos: solo cables de red. Nunca se crea un enlace de montaje entre dos no-discos.
+    const exists = edges.some(
+      (e) =>
+        edgeKind(e) === 'network' &&
+        ((e.source === c.source && e.target === c.target) || (e.source === c.target && e.target === c.source)),
     );
     if (exists) return;
     const edge: Edge = {
@@ -425,34 +516,59 @@ export const useLab = create<LabState>()((set, get) => ({
       target: c.target,
       sourceHandle: c.sourceHandle,
       targetHandle: c.targetHandle,
+      kind: 'network',
     };
-    set((s) => ({ edges: [...s.edges, edge] }));
+    set((s) => syncDiskMounts(s.nodes, [...s.edges, edge]));
   },
 
   addMachine(item, position) {
     const { nodes, toast } = get();
-    if (nodes.some((n) => n.data.kind === item.kind && n.data.target === item.target)) {
-      toast('info', t('toast.alreadyOnCanvas', { label: item.label }));
-      return;
+    let data: MachineData;
+    if (item.kind === 'disk') {
+      const target = nextDiskName(nodes);
+      data = {
+        kind: 'disk',
+        label: item.label || t('disk.defaultName'),
+        target,
+        disk: { shared: false, mounts: [] },
+      };
+    } else {
+      if (nodes.some((n) => n.data.kind === item.kind && n.data.target === item.target)) {
+        toast('info', t('toast.alreadyOnCanvas', { label: item.label }));
+        return;
+      }
+      data = { kind: item.kind, label: item.label, target: item.target, image: item.image };
     }
     const n = nodes.length;
     const node: MachineNode = {
       id: newId(),
       type: 'machine',
       position: position ?? { x: 80 + (n % 4) * 230, y: 80 + Math.floor(n / 4) * 150 },
-      data: { kind: item.kind, label: item.label, target: item.target, image: item.image },
+      data,
     };
     set((s) => ({ nodes: [...s.nodes, node] }));
   },
 
   updateNode: (id, patch) =>
-    set((s) => ({ nodes: s.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)) })),
+    set((s) => {
+      const nodes = s.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n));
+      return syncDiskMounts(nodes, s.edges);
+    }),
+
+  setMountPath: (edgeId, path) =>
+    set((s) => {
+      const edges = s.edges.map((e) =>
+        e.id === edgeId ? { ...e, data: { ...(e.data ?? {}), path } } : e,
+      );
+      return syncDiskMounts(s.nodes, edges);
+    }),
 
   removeNode: (id) =>
-    set((s) => ({
-      nodes: s.nodes.filter((n) => n.id !== id),
-      edges: s.edges.filter((e) => e.source !== id && e.target !== id),
-    })),
+    set((s) => {
+      const nodes = s.nodes.filter((n) => n.id !== id);
+      const edges = s.edges.filter((e) => e.source !== id && e.target !== id);
+      return syncDiskMounts(nodes, edges);
+    }),
 
   exportLab() {
     const { nodes, edges, toast } = get();
@@ -461,7 +577,13 @@ export const useLab = create<LabState>()((set, get) => ({
       return;
     }
     try {
-      const blob = new Blob([serializeLab(nodes, edges)], { type: 'application/json' });
+      // La ruta canónica del montaje viaja en `edge.data.path`; `LabEdge` la espera en `path`.
+      const labEdges: LabEdge[] = edges.map((e) => {
+        const kind = edgeKind(e);
+        const path = kind === 'mount' ? mountPathOf(e) : undefined;
+        return { source: e.source, target: e.target, kind, ...(path ? { path } : {}) };
+      });
+      const blob = new Blob([serializeLab(nodes, labEdges)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -511,12 +633,14 @@ export const useLab = create<LabState>()((set, get) => ({
   async act(id, action) {
     if (get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    const kind = machineKindOf(node.data.kind);
+    if (!kind) return;
     set((s) => ({ busy: { ...s.busy, [id]: true } }));
     try {
       // `run` solo se envía para contenedores y solo se usa si hay que crearlos.
-      const options = node.data.kind === 'docker' ? node.data.run : undefined;
-      await ipc.machineAction(node.data.kind, node.data.target, node.data.image, options, action);
+      const options = kind === 'docker' ? node.data.run : undefined;
+      await ipc.machineAction(kind, node.data.target, node.data.image, options, action);
     } catch (e) {
       if (node.data.kind === 'docker' && dockerDown(e)) {
         get().toast('error', t('toast.dockerDown', { label: node.data.label }));
@@ -537,6 +661,9 @@ export const useLab = create<LabState>()((set, get) => ({
     const node = get().nodes.find((n) => n.id === id);
     if (!node) return;
     const { data } = node;
+    if (isDisk(node)) return;
+    const kind = machineKindOf(data.kind);
+    if (!kind) return;
     if (data.slot === true || !data.target.trim()) {
       get().toast('info', t('toast.slotTerminal'));
       return;
@@ -573,7 +700,7 @@ export const useLab = create<LabState>()((set, get) => ({
       get().toast('error', error);
       return;
     }
-    await Promise.allSettled(get().nodes.map((n) => get().act(n.id, action)));
+    await Promise.allSettled(get().nodes.filter((n) => !isDisk(n)).map((n) => get().act(n.id, action)));
   },
 
   async applyNetwork() {
@@ -589,8 +716,16 @@ export const useLab = create<LabState>()((set, get) => ({
       const { nodes, edges } = get();
       const report = await ipc.applyTopology(toPayload(nodes, edges));
       set({ report });
-      if (report.errors.length) get().toast('error', t('toast.applyNetworkErrors', { count: report.errors.length }));
-      else {
+      if (report.errors.length) {
+        // Los errores son persistentes (kind='error'). Si hay discos en el
+        // lienzo se añade el detalle del backend para poder diagnosticar el
+        // volumen o la ruta que ha fallado.
+        const summary = t('toast.applyNetworkErrors', { count: report.errors.length });
+        const text = nodes.some(isDisk)
+          ? toastSummary(t('toast.applyDiskErrors'), report.errors)
+          : summary;
+        get().toast('error', text);
+      } else {
         get().toast(
           'ok',
           report.networks.length ? t('toast.networkApplied', { count: report.applied }) : t('toast.noConnections'),
@@ -607,7 +742,9 @@ export const useLab = create<LabState>()((set, get) => ({
   async applyLink(id) {
     if (get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    const kind = machineKindOf(node.data.kind);
+    if (!kind) return;
     const conditions = node.data.link;
     if (!hasLinkConditions(conditions)) {
       get().toast('info', t('toast.noLinkConditions'));
@@ -617,7 +754,7 @@ export const useLab = create<LabState>()((set, get) => ({
     set((s) => ({ busy: { ...s.busy, [id]: true } }));
     try {
       const report = await ipc.linkApply(
-        node.data.kind,
+        kind,
         node.data.target,
         linkAdapter(node),
         conditions,
@@ -642,11 +779,13 @@ export const useLab = create<LabState>()((set, get) => ({
   async clearLink(id) {
     if (get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    const kind = machineKindOf(node.data.kind);
+    if (!kind) return;
 
     set((s) => ({ busy: { ...s.busy, [id]: true } }));
     try {
-      const report = await ipc.linkClear(node.data.kind, node.data.target, linkAdapter(node));
+      const report = await ipc.linkClear(kind, node.data.target, linkAdapter(node));
       get().updateNode(id, { link: undefined });
       const warnings = report.warnings ?? [];
       get().toast(
@@ -678,7 +817,9 @@ export const useLab = create<LabState>()((set, get) => ({
   async startCapture(id, filter) {
     if (get().captureBusy || get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || node.data.slot === true || !node.data.target.trim()) return;
+    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim()) return;
+    const kind = machineKindOf(node.data.kind);
+    if (!kind) return;
     if (resolveState(node.data, get().snapshot) !== 'running') {
       get().toast(
         'error',
@@ -689,7 +830,7 @@ export const useLab = create<LabState>()((set, get) => ({
 
     set({ captureBusy: true });
     try {
-      const info = await ipc.captureStart(node.data.kind, node.data.target, linkAdapter(node), filter);
+      const info = await ipc.captureStart(kind, node.data.target, linkAdapter(node), filter);
       set((s) => ({ captures: [info, ...s.captures.filter((c) => c.id !== info.id)] }));
       syncCapturePolling(true);
       get().toast(
@@ -837,9 +978,17 @@ export const useLab = create<LabState>()((set, get) => ({
 
   async refreshProbes() {
     const { nodes, edges, snapshot } = get();
-    const linked = new Set(edges.flatMap((e) => [e.source, e.target]));
+    // Los enlaces de montaje no son red: solo sondeamos máquinas con cables de red.
+    const linked = new Set(
+      edges.filter((e) => edgeKind(e) === 'network').flatMap((e) => [e.source, e.target]),
+    );
     const targets = nodes.filter(
-      (n) => linked.has(n.id) && n.data.slot !== true && !!n.data.target && resolveState(n.data, snapshot) === 'running',
+      (n) =>
+        !isDisk(n) &&
+        linked.has(n.id) &&
+        n.data.slot !== true &&
+        !!n.data.target &&
+        resolveState(n.data, snapshot) === 'running',
     );
     if (targets.length === 0) {
       if (Object.keys(get().probes).length > 0) set({ probes: {} });
@@ -850,7 +999,7 @@ export const useLab = create<LabState>()((set, get) => ({
     try {
       const list = await ipc.networkProbe(
         targets.map((n) => ({
-          kind: n.data.kind,
+          kind: machineKindOf(n.data.kind)!,
           target: n.data.target,
           adapter: n.data.kind === 'vbox' ? (n.data.net?.adapter ?? 2) : null,
         })),

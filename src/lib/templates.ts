@@ -18,6 +18,11 @@ function edge(source: string, target: string): LabEdge {
   return { source, target };
 }
 
+/** Enlace de montaje: el disco es `source` y la ruta se guarda también en `disk.mounts`. */
+function mountEdge(source: string, target: string, path: string): LabEdge {
+  return { source, target, kind: 'mount', path };
+}
+
 const webDatabase: LabTemplate = {
   id: 'web-database',
   get name() { return t('template.web.name'); },
@@ -101,4 +106,26 @@ const attackerTarget: LabTemplate = {
   edges: [edge('attacker', 'target')],
 };
 
-export const TEMPLATES: LabTemplate[] = [webDatabase, internalVms, containers, attackerTarget];
+const serverWithDisk: LabTemplate = {
+  id: 'server-disk',
+  get name() { return t('template.serverDisk.name'); },
+  get description() { return t('template.serverDisk.description'); },
+  nodes: [
+    node('web', 80, 100, {
+      kind: 'docker',
+      get label() { return t('template.serverDisk.webLabel'); },
+      target: 'vmlab-web',
+      image: 'nginx:alpine',
+      run: { env: [], ports: [{ host: 8080, container: 80, proto: 'tcp' }] },
+    }),
+    node('datos', 300, 100, {
+      kind: 'disk',
+      get label() { return t('template.serverDisk.diskLabel'); },
+      target: 'datos',
+      disk: { shared: false, mounts: [{ container: 'web', path: '/usr/share/nginx/html' }] },
+    }),
+  ],
+  edges: [mountEdge('datos', 'web', '/usr/share/nginx/html')],
+};
+
+export const TEMPLATES: LabTemplate[] = [webDatabase, internalVms, containers, attackerTarget, serverWithDisk];

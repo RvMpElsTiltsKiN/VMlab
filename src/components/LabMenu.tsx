@@ -63,7 +63,7 @@ export function LabMenu() {
   const labsnapTake = useLab((s) => s.labsnapTake);
   const labsnapRestore = useLab((s) => s.labsnapRestore);
   const labsnapDelete = useLab((s) => s.labsnapDelete);
-  const hasAssigned = useLab((s) => s.nodes.some((n) => n.data.slot !== true && n.data.target.trim() !== ''));
+  const hasAssigned = useLab((s) => s.nodes.some((n) => n.data.kind !== 'disk' && n.data.slot !== true && n.data.target.trim() !== ''));
   const hasNodes = nodeCount > 0;
 
   const rootRef = useRef<HTMLDivElement>(null);

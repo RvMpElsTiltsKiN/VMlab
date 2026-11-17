@@ -5,7 +5,7 @@ import { stateLabel } from '../lib/status';
 import { useLab } from '../store/useLab';
 import type { GuestAdditionsPrep, MachineInfo, PaletteItem } from '../types';
 import { DRAG_MIME } from './Canvas';
-import { CheckIcon, ContainerIcon, CubeIcon, PlayIcon, PlusIcon, RefreshIcon, WarnIcon } from './icons';
+import { CheckIcon, ContainerIcon, CubeIcon, DiskIcon, PlayIcon, PlusIcon, RefreshIcon, WarnIcon } from './icons';
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,199}$/;
@@ -136,6 +136,30 @@ function Item({ m, used }: { m: MachineInfo; used: boolean }) {
   );
 }
 
+/** Paleta de discos: se arrastra al lienzo o se añade con doble clic. */
+function DiskItem() {
+  const t = useT();
+  const addMachine = useLab((s) => s.addMachine);
+  const item: PaletteItem = { kind: 'disk', label: t('sidebar.disk'), target: '' };
+  const onDragStart = (e: DragEvent) => {
+    const payload = JSON.stringify(item);
+    e.dataTransfer.setData(DRAG_MIME, payload);
+    e.dataTransfer.setData('text/plain', `vmlab:${payload}`);
+    e.dataTransfer.effectAllowed = 'copy';
+  };
+
+  return (
+    <li className="pal-item disk" draggable onDragStart={onDragStart}
+      onDoubleClick={() => addMachine(item)} title={t('sidebar.dragItemHint')}>
+      <span className="pal-icon"><DiskIcon /></span>
+      <span className="pal-text">
+        <span className="pal-name">{t('sidebar.disk')}</span>
+        <span className="pal-sub">{t('sidebar.diskHint')}</span>
+      </span>
+    </li>
+  );
+}
+
 export function Sidebar() {
   const t = useT();
   const tools = useLab((s) => s.tools);
@@ -222,6 +246,11 @@ export function Sidebar() {
             <button className="btn" onClick={addContainer}><PlusIcon /> {t('sidebar.add')}</button>
           </div>
           <p className="hint">{t('sidebar.runHintStart')} <code>docker run</code> {t('sidebar.runHintEnd')}</p>
+        </div>
+
+        <div className="side-section">
+          <div className="side-title"><span>{t('sidebar.disks')}</span></div>
+          <ul className="pal-list"><DiskItem /></ul>
         </div>
       </div>
     </aside>

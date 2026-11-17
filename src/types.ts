@@ -1,6 +1,13 @@
-import type { Node } from '@xyflow/react';
+import type { Edge as FlowEdge, Node } from '@xyflow/react';
 
+/** Tipos que viajan a las acciones IPC de máquina. Los discos no son máquinas. */
 export type MachineKind = 'vbox' | 'docker';
+/** Tipos que pueden aparecer en el lienzo. */
+export type NodeKind = MachineKind | 'disk';
+/** Los cables de red y los enlaces de montaje de un disco. */
+export type EdgeKind = 'network' | 'mount';
+/** Arista del lienzo. `kind` ausente equivale a red (archivos antiguos). */
+export type Edge = FlowEdge & { kind?: EdgeKind };
 export type PowerState = 'running' | 'stopped' | 'paused' | 'missing' | 'unknown';
 export type Action = 'start' | 'startGui' | 'stop' | 'forceStop' | 'restart' | 'pause' | 'resume';
 
@@ -80,9 +87,22 @@ export interface ScreenshotInfo {
   path: string;
 }
 
+/** Ruta donde un disco se monta dentro de un contenedor del lienzo. */
+export interface DiskMount {
+  /** `id` del nodo Docker del lienzo (no el nombre del contenedor). */
+  container: string;
+  path: string;
+}
+
+/** Configuración de un nodo Disco (camelCase, ver `DiskSpec` de model.rs). */
+export interface DiskSpec {
+  shared: boolean;
+  mounts: DiskMount[];
+}
+
 /** Datos que guarda cada nodo del lienzo. */
 export interface MachineData extends Record<string, unknown> {
-  kind: MachineKind;
+  kind: NodeKind;
   label: string;
   /** VirtualBox: UUID de la VM. Docker: nombre del contenedor. */
   target: string;
@@ -96,6 +116,8 @@ export interface MachineData extends Record<string, unknown> {
   link?: LinkConditions;
   /** Hueco de VM de una plantilla: todavía no tiene una máquina asignada. */
   slot?: boolean;
+  /** Solo Disco: modo de uso y rutas de montaje en los contenedores enlazados. */
+  disk?: DiskSpec;
   /** Solo VirtualBox/Linux: usuario para Guest Additions (la contraseña nunca se guarda). */
   guestUser?: string;
   guestSystem?: GuestSystem;
@@ -176,7 +198,7 @@ export interface Snapshot {
 /** Nodo de la topología que se envía a `apply_topology` (camelCase, ver model.rs). */
 export interface NodeSpec {
   id: string;
-  kind: MachineKind;
+  kind: NodeKind;
   target: string;
   image?: string;
   label?: string;
@@ -184,11 +206,13 @@ export interface NodeSpec {
   link?: LinkConditions;
   /** Solo Docker: opciones con las que crear el contenedor si no existe. */
   options?: DockerRunOptions;
+  /** Solo Disco: modo de uso y rutas de montaje en los contenedores enlazados. */
+  disk?: DiskSpec;
 }
 
 export interface TopologyPayload {
   nodes: NodeSpec[];
-  edges: { from: string; to: string }[];
+  edges: { from: string; to: string; kind?: EdgeKind }[];
 }
 
 export interface ApplyReport {
@@ -346,7 +370,7 @@ export interface GuestHostsRequest {
 
 /** Elemento arrastrable de la paleta. */
 export interface PaletteItem {
-  kind: MachineKind;
+  kind: NodeKind;
   label: string;
   target: string;
   image?: string;

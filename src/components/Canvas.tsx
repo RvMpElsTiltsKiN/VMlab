@@ -15,13 +15,13 @@ import {
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
-  type Edge,
 } from '@xyflow/react';
 import { linkLive } from '../lib/connectivity';
+import { edgeKind, isDisk, mountPathOf } from '../lib/disk';
 import { resolveState } from '../lib/status';
 import { useT } from '../i18n';
 import { useLab } from '../store/useLab';
-import type { MachineNode, PaletteItem } from '../types';
+import type { Edge, MachineNode, PaletteItem } from '../types';
 import { CableChecks } from './CableChecks';
 import { LockIcon } from './icons';
 import { MachineNodeView } from './MachineNodeView';
@@ -76,26 +76,43 @@ function Flow() {
 
   // Sonda periódica: el cable pasa a verde en cuanto ambos extremos se ven en la
   // misma red. Se relanza al arrancar/parar VMs y al cambiar adaptador o modo.
-  const runningKey = nodes
+  const machines = nodes.filter((n) => !isDisk(n));
+  const runningKey = machines
     .filter((n) => resolveState(n.data, snapshot) === 'running')
     .map((n) => n.id)
     .sort()
     .join(',');
-  const netKey = nodes
+  const netKey = machines
     .map((n) => `${n.id}:${n.data.net?.mode ?? 'intnet'}:${n.data.net?.adapter ?? 2}`)
     .join('|');
-  const edgeKey = edges.map((e) => e.id).sort().join(',');
+  const edgeKey = edges.filter((e) => edgeKind(e) === 'network').map((e) => e.id).sort().join(',');
   useEffect(() => {
-    if (edges.length === 0) return;
+    if (!edgeKey) return;
     void refreshProbes();
     const timer = setInterval(() => void refreshProbes(), 5000);
     return () => clearInterval(timer);
-  }, [edgeKey, edges.length, runningKey, netKey, refreshProbes]);
+  }, [edgeKey, runningKey, netKey, refreshProbes]);
 
   // Verde animado: comunicación detectada. Rojo: apagadas, sin IP o red sin aplicar.
+  // Los enlaces de montaje son neutros y discontinuos: no se sondean.
   const styledEdges = useMemo<Edge[]>(() => {
     const byId = new Map(nodes.map((n) => [n.id, n]));
     return edges.map((e) => {
+      if (edgeKind(e) === 'mount') {
+        const path = mountPathOf(e);
+        return {
+          ...e,
+          type: 'smoothstep',
+          animated: false,
+          className: 'edge-mount',
+          label: path,
+          labelStyle: { fill: 'var(--muted)', fontSize: 10 },
+          labelBgStyle: { fill: 'var(--panel)' },
+          labelBgPadding: [4, 2] as [number, number],
+          labelBgBorderRadius: 4,
+          style: { stroke: 'var(--mount)', strokeWidth: 2, strokeDasharray: '6 4' },
+        };
+      }
       const source = byId.get(e.source);
       const target = byId.get(e.target);
       const live = !!(source && target && linkLive(source, target, probes, snapshot));
@@ -110,6 +127,7 @@ function Flow() {
   }, [nodes, edges, snapshot, probes]);
 
   const onEdgeMouseEnter = useCallback((event: ReactMouseEvent, edge: Edge) => {
+    if (edgeKind(edge) === 'mount') return;
     setHover({
       sourceId: edge.source,
       targetId: edge.target,
@@ -120,6 +138,7 @@ function Flow() {
   }, []);
 
   const onEdgeMouseMove = useCallback((event: ReactMouseEvent, edge: Edge) => {
+    if (edgeKind(edge) === 'mount') return;
     setHover((current) => {
       if (!current || current.sourceId !== edge.source || current.targetId !== edge.target) return current;
       // Evita re-renderizar el lienzo por cada píxel del ratón.
@@ -216,7 +235,13 @@ function Flow() {
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1.4} />
         {!canvasLocked && <Controls showInteractive={false} />}
-        <MiniMap pannable={!canvasLocked} zoomable={!canvasLocked} nodeColor={(n) => (n.data?.kind === 'vbox' ? '#8b7cf6' : '#38a8f0')} />
+        <MiniMap
+          pannable={!canvasLocked}
+          zoomable={!canvasLocked}
+          nodeColor={(n) =>
+            n.data?.kind === 'disk' ? '#d6a24a' : n.data?.kind === 'vbox' ? '#8b7cf6' : '#38a8f0'
+          }
+        />
       </ReactFlow>
       {hoverNodes && hover && (
         <div

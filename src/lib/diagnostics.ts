@@ -2,12 +2,13 @@
 import { probeKey } from './connectivity';
 import { ipc } from './ipc';
 import { resolveState } from './status';
-import type { LinkDiagnostics, MachineNode, NodeProbe, Snapshot } from '../types';
+import type { LinkDiagnostics, MachineKind, MachineNode, NodeProbe, Snapshot } from '../types';
 
 /** Sondeo sintético de un nodo que no está en marcha. */
 function notRunningProbe(node: MachineNode): NodeProbe {
   return {
-    kind: node.data.kind,
+    // Los discos nunca llegan aquí (no se sondean), pero el tipo del lienzo los incluye.
+    kind: node.data.kind as MachineKind,
     target: node.data.target,
     segment: null,
     ipv4: null,

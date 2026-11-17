@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { Edge } from '@xyflow/react';
 import { technicalText, useLocale, useT, type Locale, type Translate } from '../i18n';
 import { groupLive, probeKey } from '../lib/connectivity';
+import { edgeKind, isDisk, mountPathOf, validMountPath, volumeName } from '../lib/disk';
 import { ipc, isTauri } from '../lib/ipc';
 import { charLength, ENV_KEY_RE, hasControlChars, RUN_LIMITS } from '../lib/labFile';
 import { hasLinkConditions, LINK_LIMITS, sameLink } from '../lib/link';
@@ -12,6 +12,7 @@ import type {
   CaptureFilter,
   DockerPortProto,
   DockerRunOptions,
+  Edge,
   GuestConfigRequest,
   GuestHostsRequest,
   GuestIpMode,
@@ -1413,12 +1414,118 @@ function RunOptionsPanel({ node }: { node: MachineNode }) {
   );
 }
 
+/** Panel derecho de un nodo Disco: configuración del volumen y de sus montajes. */
+function DiskPanel({ node }: { node: MachineNode }) {
+  const t = useT();
+  const nodes = useLab((s) => s.nodes);
+  const edges = useLab((s) => s.edges);
+  const { updateNode, removeNode, setMountPath, onEdgesChange } = useLab.getState();
+  const disk = node.data.disk ?? { shared: false, mounts: [] };
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const volume = volumeName(node.data.target);
+
+  return (
+    <aside className="inspector disk-panel">
+      <div className="side-title"><span>{t('disk.title')}</span></div>
+      <label className="field">{t('insp.label')}
+        <input value={node.data.label} onChange={(e) => updateNode(node.id, { label: e.target.value })} />
+      </label>
+      <label className="field mono">{t('disk.volume', { name: volume })}</label>
+
+      <label className="field check">
+        <input
+          type="checkbox"
+          checked={disk.shared}
+          onChange={(e) => updateNode(node.id, { disk: { ...disk, shared: e.target.checked } })}
+        />
+        <span>{t('disk.shared')}</span>
+      </label>
+      <p className="hint warn">{t('disk.sharedHelp')}</p>
+
+      <div className="side-title"><span>{t('disk.mounts')}</span></div>
+      {disk.mounts.length === 0 && <p className="hint">{t('disk.mountsEmpty')}</p>}
+      {disk.mounts.map((mount) => {
+        const edge = edges.find(
+          (e) =>
+            edgeKind(e) === 'mount' &&
+            ((e.source === node.id && e.target === mount.container) ||
+              (e.target === node.id && e.source === mount.container)),
+        );
+        const container = byId.get(mount.container);
+        const invalid = !validMountPath(mount.path);
+        return (
+          <div className="disk-mount" key={mount.container}>
+            <div className="disk-mount-head">
+              <span>{container?.data.label ?? mount.container}</span>
+              {edge && (
+                <button
+                  className="icon-btn sm danger-text"
+                  title={t('disk.mountRemove')}
+                  onClick={() => onEdgesChange([{ type: 'remove', id: edge.id }])}
+                >
+                  <TrashIcon />
+                </button>
+              )}
+            </div>
+            <label className="field">{t('disk.mountPath')}
+              <input
+                className={`mono ${invalid ? 'invalid' : ''}`}
+                value={mount.path}
+                onChange={(e) => edge && setMountPath(edge.id, e.target.value)}
+                spellCheck={false}
+              />
+            </label>
+            {invalid && <p className="hint err">{t('disk.mountInvalid')}</p>}
+          </div>
+        );
+      })}
+
+      <p className="hint">{t('disk.createHint')}</p>
+      <button className="btn ghost danger-text" onClick={() => removeNode(node.id)}><TrashIcon /> {t('insp.remove')}</button>
+    </aside>
+  );
+}
+
 /** Panel derecho cuando hay un cable seleccionado. */
 function CablePanel({ edge }: { edge: Edge }) {
   const t = useT();
   const nodes = useLab((s) => s.nodes);
+  const setMountPath = useLab((s) => s.setMountPath);
   const a = nodes.find((n) => n.id === edge.source);
   const b = nodes.find((n) => n.id === edge.target);
+
+  if (edgeKind(edge) === 'mount') {
+    const disk = nodes.find((n) => isDisk(n) && (n.id === edge.source || n.id === edge.target));
+    const container = nodes.find((n) => !isDisk(n) && (n.id === edge.source || n.id === edge.target));
+    const path = mountPathOf(edge) ?? '';
+    const invalid = !validMountPath(path);
+    return (
+      <aside className="inspector mount-panel">
+        <div className="side-title"><span>{t('mount.title')}</span></div>
+        {disk && container ? (
+          <>
+            <div className="cable-endpoints">
+              <span>{disk.data.label}</span>
+              <span aria-hidden="true">→</span>
+              <span>{container.data.label}</span>
+            </div>
+            <label className="field">{t('mount.path')}
+              <input
+                className={`mono ${invalid ? 'invalid' : ''}`}
+                value={path}
+                onChange={(e) => setMountPath(edge.id, e.target.value)}
+                spellCheck={false}
+              />
+            </label>
+            <p className="hint">{t('mount.pathHint')}</p>
+            {invalid && <p className="hint err">{t('mount.invalid')}</p>}
+          </>
+        ) : (
+          <p className="hint" role="status">{t('cable.checking')}</p>
+        )}
+      </aside>
+    );
+  }
 
   return (
     <aside className="inspector">
@@ -1452,6 +1559,7 @@ export function Inspector() {
   const isSlot = node?.data.kind === 'vbox' && node.data.slot === true;
 
   if (edge) return <CablePanel edge={edge} />;
+  if (node && isDisk(node)) return <DiskPanel node={node} />;
 
   return (
     <aside className="inspector">

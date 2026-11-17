@@ -1,5 +1,5 @@
-import type { Edge } from '@xyflow/react';
-import type { MachineNode, TopologyPayload } from '../types';
+import { edgeKind, isDisk } from './disk';
+import type { Edge, MachineNode, TopologyPayload } from '../types';
 
 export interface NetGroup {
   index: number;
@@ -12,7 +12,9 @@ export interface NetGroup {
  * es una red local. Sirve para colorear aristas y mostrar el resumen sin ir al backend.
  */
 export function computeGroups(nodes: MachineNode[], edges: Edge[]) {
-  const parent = new Map<string, string>(nodes.map((n) => [n.id, n.id]));
+  // Los discos no son máquinas: no forman segmentos de red ni se sondean.
+  const machines = nodes.filter((n) => !isDisk(n));
+  const parent = new Map<string, string>(machines.map((n) => [n.id, n.id]));
   const find = (x: string): string => {
     let r = x;
     while (parent.get(r) !== r) r = parent.get(r)!;
@@ -20,14 +22,15 @@ export function computeGroups(nodes: MachineNode[], edges: Edge[]) {
     return r;
   };
   for (const e of edges) {
+    if (edgeKind(e) !== 'network') continue;
     if (parent.has(e.source) && parent.has(e.target)) parent.set(find(e.source), find(e.target));
   }
   const buckets = new Map<string, string[]>();
-  for (const n of nodes) {
+  for (const n of machines) {
     const r = find(n.id);
     buckets.set(r, [...(buckets.get(r) ?? []), n.id]);
   }
-  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const byId = new Map(machines.map((n) => [n.id, n]));
   const groups: NetGroup[] = [];
   const nodeGroup = new Map<string, number>();
   for (const ids of buckets.values()) {
@@ -75,10 +78,11 @@ export function toPayload(nodes: MachineNode[], edges: Edge[]): TopologyPayload 
       image: n.data.image || undefined,
       label: n.data.label,
       net: n.data.kind === 'vbox' ? n.data.net : undefined,
-      link: n.data.link,
+      link: n.data.kind === 'disk' ? undefined : n.data.link,
       options: n.data.kind === 'docker' ? n.data.run : undefined,
+      disk: n.data.kind === 'disk' ? n.data.disk : undefined,
     })),
-    edges: edges.map((e) => ({ from: e.source, to: e.target })),
+    edges: edges.map((e) => ({ from: e.source, to: e.target, kind: edgeKind(e) })),
   };
 }
 
