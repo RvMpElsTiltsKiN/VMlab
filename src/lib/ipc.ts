@@ -20,6 +20,7 @@ import type {
   LabSnapNode,
   LabSnapReport,
   LinkConditions,
+  LinkDiagnostics,
   LinkReport,
   MachineKind,
   NodeProbe,
@@ -77,6 +78,7 @@ const real = {
   labsnapDelete: (nodes: LabSnapNode[], id: string) =>
     invoke<LabSnapReport>('labsnap_delete', { nodes, id }),
   networkProbe: (nodes: ProbeNode[]) => invoke<NodeProbe[]>('network_probe', { nodes }),
+  diagnoseLink: (a: NodeProbe, b: NodeProbe) => invoke<LinkDiagnostics>('diagnose_link', { a, b }),
   guestProbe: (target: string, username: string, password: string) =>
     invoke<GuestProfile>('guest_probe', { target, username, password }),
   guestApply: (request: GuestConfigRequest) => invoke<GuestReport>('guest_apply', { request }),
@@ -102,6 +104,27 @@ const mockStates: Snapshot['states'] = {
 };
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const mockKey = (kind: MachineKind, target: string) => `${kind}:${target}`;
+
+/** IPv4 a entero sin signo, o `null` si el texto no tiene cuatro octetos válidos. */
+function mockIpv4(text: string): number | null {
+  const parts = text.split('.');
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = (value << 8) | octet;
+  }
+  return value >>> 0;
+}
+
+/** Misma regla visible que `same_slash_24` del núcleo: los tres primeros octetos. */
+function mockSame24(a: string, b: string): boolean {
+  const pa = a.split('.');
+  const pb = b.split('.');
+  return pa.length === 4 && pb.length === 4 && pa[0] === pb[0] && pa[1] === pb[1] && pa[2] === pb[2];
+}
 
 interface MockSnap {
   id: string;
@@ -375,6 +398,8 @@ const mock: typeof real = {
             target: n.target,
             segment: 'intnet:vmlab-demo0001',
             ipv4: `10.77.9.${host}`,
+            netmask: '255.255.255.0',
+            issues: [],
             note: null,
           }
         : {
@@ -382,9 +407,32 @@ const mock: typeof real = {
             target: n.target,
             segment: 'docker:vmlab-demo0001',
             ipv4: `172.18.0.${host}`,
+            netmask: '255.255.255.0',
+            issues: [],
             note: null,
           };
     });
+  },
+  diagnoseLink: async (a, b) => {
+    const live = !!(
+      a.segment &&
+      b.segment &&
+      a.segment === b.segment &&
+      a.ipv4 &&
+      b.ipv4 &&
+      mockSame24(a.ipv4, b.ipv4)
+    );
+    let differentSubnet = false;
+    if (a.ipv4 && a.netmask && b.ipv4 && b.netmask) {
+      const ipA = mockIpv4(a.ipv4);
+      const ipB = mockIpv4(b.ipv4);
+      const maskA = mockIpv4(a.netmask);
+      const maskB = mockIpv4(b.netmask);
+      if (ipA !== null && ipB !== null && maskA !== null && maskB !== null) {
+        differentSubnet = maskA !== maskB || ((ipA & maskA) >>> 0) !== ((ipB & maskB) >>> 0);
+      }
+    }
+    return { live, issues: [...a.issues, ...b.issues], differentSubnet };
   },
   guestProbe: async (_target, _username, _password) => {
     await delay(500);

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { Edge } from '@xyflow/react';
 import { technicalText, useLocale, useT, type Locale, type Translate } from '../i18n';
 import { groupLive, probeKey } from '../lib/connectivity';
 import { ipc, isTauri } from '../lib/ipc';
@@ -23,6 +24,7 @@ import type {
   NetMode,
   NodeNet,
 } from '../types';
+import { CableChecks } from './CableChecks';
 import { CameraIcon, TrashIcon } from './icons';
 
 const DEFAULT_NET: NodeNet = { mode: 'intnet', adapter: 2 };
@@ -1411,15 +1413,45 @@ function RunOptionsPanel({ node }: { node: MachineNode }) {
   );
 }
 
+/** Panel derecho cuando hay un cable seleccionado. */
+function CablePanel({ edge }: { edge: Edge }) {
+  const t = useT();
+  const nodes = useLab((s) => s.nodes);
+  const a = nodes.find((n) => n.id === edge.source);
+  const b = nodes.find((n) => n.id === edge.target);
+
+  return (
+    <aside className="inspector">
+      <div className="side-title"><span>{t('cable.title')}</span></div>
+      {a && b ? (
+        <>
+          <div className="cable-endpoints">
+            <span>{a.data.label}</span>
+            <span aria-hidden="true">↔</span>
+            <span>{b.data.label}</span>
+          </div>
+          <CableChecks a={a} b={b} />
+          <p className="hint foot">{t('cable.hint')}</p>
+        </>
+      ) : (
+        <p className="hint" role="status">{t('cable.checking')}</p>
+      )}
+    </aside>
+  );
+}
+
 export function Inspector() {
   const t = useT();
   const node = useLab((s) => s.nodes.find((n) => n.selected));
+  const edge = useLab((s) => s.edges.find((e) => e.selected));
   const state = useLab((s) => (node ? resolveState(node.data, s.snapshot) : 'unknown'));
   const busy = useLab((s) => (node ? !!s.busy[node.id] : false));
   const labsnapBusy = useLab((s) => s.labsnapBusy);
   const hasLinks = useLab((s) => (node ? s.edges.some((e) => e.source === node.id || e.target === node.id) : false));
   const { updateNode, removeNode, act } = useLab.getState();
   const isSlot = node?.data.kind === 'vbox' && node.data.slot === true;
+
+  if (edge) return <CablePanel edge={edge} />;
 
   return (
     <aside className="inspector">

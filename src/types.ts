@@ -230,6 +230,14 @@ export interface ProbeNode {
   adapter: number | null;
 }
 
+/** Problema detectado en un extremo del cable (mismo contrato que `NodeIssue`). */
+export type NodeIssue =
+  | { code: 'notRunning' }
+  | { code: 'noGuestAdditions' }
+  | { code: 'adapterNotOnSegment' }
+  | { code: 'noIpv4' }
+  | { code: 'probeFailed'; detail?: string };
+
 /** Enlace observado dentro de una máquina o contenedor. */
 export interface NodeProbe {
   kind: MachineKind;
@@ -237,8 +245,21 @@ export interface NodeProbe {
   /** Red concreta: `intnet:<nombre>`, `hostonly:<interfaz>`, `docker:<red>`… */
   segment: string | null;
   ipv4: string | null;
+  /** Máscara decimal con puntos (`255.255.255.0`). */
+  netmask: string | null;
+  /** Lista vacía = el extremo está listo para comunicarse. */
+  issues: NodeIssue[];
   /** Motivo cuando todavía no hay comunicación. */
   note: string | null;
+}
+
+/** Resultado de `diagnose_link`: mismo color visible y problemas de ambos extremos. */
+export interface LinkDiagnostics {
+  live: boolean;
+  /** Primero los de `a` y después los de `b`. */
+  issues: NodeIssue[];
+  /** Ambos tienen IPv4 y máscara, pero no comparten subred. */
+  differentSubnet: boolean;
 }
 
 // ---- Configuración dentro de la VM Linux (Guest Additions) ----

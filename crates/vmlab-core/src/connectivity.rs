@@ -7,6 +7,7 @@
 use crate::model::{LinkInfo, NodeIssue, NodeKind, NodeProbe, ProbeNode};
 use crate::tools::Tools;
 use crate::{docker, validate, vbox};
+use serde::Serialize;
 use std::net::Ipv4Addr;
 
 const DEFAULT_ADAPTER: u8 = 2;
@@ -44,7 +45,8 @@ async fn probe_one(tools: &Tools, node: ProbeNode) -> NodeProbe {
 }
 
 /// Diagnóstico de un cable a partir de la sonda de sus dos extremos.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LinkDiagnostics {
     /// Equivale al color actual del cable: mismo segmento, ambos con IPv4 y en
     /// los mismos tres primeros octetos.
@@ -205,5 +207,38 @@ mod tests {
             diag.issues,
             vec![NodeIssue::NoGuestAdditions, NodeIssue::NotRunning]
         );
+    }
+
+    #[test]
+    fn diagnostics_serialize_with_camel_case_keys() {
+        let diag = LinkDiagnostics {
+            live: false,
+            issues: vec![
+                NodeIssue::NoIpv4,
+                NodeIssue::ProbeFailed { detail: Some("sin respuesta".into()) },
+            ],
+            different_subnet: true,
+        };
+        let json = serde_json::to_value(&diag).unwrap();
+        assert_eq!(json["live"], serde_json::json!(false));
+        assert_eq!(json["differentSubnet"], serde_json::json!(true));
+        assert_eq!(json["issues"][0]["code"], serde_json::json!("noIpv4"));
+        assert_eq!(json["issues"][1]["code"], serde_json::json!("probeFailed"));
+        assert_eq!(json["issues"][1]["detail"], serde_json::json!("sin respuesta"));
+        assert!(json.get("different_subnet").is_none());
+    }
+
+    #[test]
+    fn node_probe_accepts_payloads_without_the_new_fields() {
+        let json = serde_json::json!({
+            "kind": "vbox",
+            "target": "vm",
+            "segment": null,
+            "ipv4": null,
+            "note": null
+        });
+        let probe: NodeProbe = serde_json::from_value(json).unwrap();
+        assert_eq!(probe.netmask, None);
+        assert!(probe.issues.is_empty());
     }
 }

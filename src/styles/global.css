@@ -327,6 +327,47 @@ button:disabled { cursor: default; opacity: 0.45; }
 }
 .report { margin-top: 14px; }
 
+/* Comprobaciones del cable (tooltip y panel derecho) */
+.cable-tooltip {
+  position: fixed; z-index: 45; max-width: 330px; padding: 10px 12px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38); pointer-events: none;
+  font-size: 12px;
+}
+.cable-checks { display: grid; gap: 10px; }
+.cable-head { display: flex; align-items: center; }
+.cable-summary { margin: 0; }
+.cable-endpoints {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px; font-weight: 600; overflow-wrap: anywhere;
+}
+.cable-endpoints span:nth-child(2) { color: var(--muted); font-weight: 400; }
+.cable-end { display: grid; gap: 3px; }
+.cable-end-name {
+  color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; overflow-wrap: anywhere;
+}
+.cable-rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.cable-row {
+  display: grid; grid-template-columns: 15px minmax(0, 1fr) auto; align-items: center;
+  gap: 7px; color: var(--text); font-size: 12px;
+}
+.cable-row-label { min-width: 0; overflow-wrap: anywhere; }
+.cable-row-value { color: var(--muted); }
+.cable-mark { text-align: center; font-weight: 700; line-height: 1; }
+.cable-row.ok .cable-mark { color: var(--running); }
+.cable-row.fail .cable-mark { color: var(--danger); }
+.cable-row.info .cable-mark { color: var(--busy); }
+.cable-row.unknown { color: var(--muted); }
+.cable-row.unknown .cable-mark { color: var(--muted); }
+.cable-shared { border-top: 1px dashed var(--border); padding-top: 8px; }
+.cable-detail { margin: 2px 0 0; font-size: 11px; }
+.cable-wait { margin: 0; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
 /* ───────── Estado ───────── */
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
 .status.big { font-size: 12.5px; margin-top: 4px; }

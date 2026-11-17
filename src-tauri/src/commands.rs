@@ -10,8 +10,9 @@ use vmlab_core::model::{
     NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology,
 };
 use vmlab_core::capture::{self, CaptureFilter, CaptureInfo};
+use vmlab_core::connectivity::LinkDiagnostics;
 use vmlab_core::tools::Tools;
-use vmlab_core::{compose, engine, labsnap, netem, terminal, vbox};
+use vmlab_core::{compose, connectivity, engine, labsnap, netem, terminal, vbox};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tauri::{AppHandle, Manager, State};
@@ -376,6 +377,12 @@ pub async fn network_probe(
     nodes: Vec<ProbeNode>,
 ) -> Result<Vec<NodeProbe>, String> {
     Ok(engine::network_probe(&state.tools().await, nodes).await)
+}
+
+/// Diagnóstico puro del cable: no ejecuta nada externo, solo compara los dos sondeos.
+#[tauri::command]
+pub async fn diagnose_link(a: NodeProbe, b: NodeProbe) -> Result<LinkDiagnostics, String> {
+    Ok(connectivity::diagnose_link(&a, &b))
 }
 
 /// Arranca Docker Desktop en segundo plano (sin abrir su panel) y espera al motor.

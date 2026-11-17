@@ -41,6 +41,7 @@ pub fn run() {
             commands::guest_hosts_apply,
             commands::guest_additions_prepare,
             commands::network_probe,
+            commands::diagnose_link,
             commands::docker_start,
             commands::refresh_status,
             commands::save_workspace,

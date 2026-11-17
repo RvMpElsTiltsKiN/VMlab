@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, type DragEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type DragEvent,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import {
   Background,
   BackgroundVariant,
@@ -15,11 +22,21 @@ import { resolveState } from '../lib/status';
 import { useT } from '../i18n';
 import { useLab } from '../store/useLab';
 import type { MachineNode, PaletteItem } from '../types';
+import { CableChecks } from './CableChecks';
 import { LockIcon } from './icons';
 import { MachineNodeView } from './MachineNodeView';
 
 const nodeTypes = { machine: MachineNodeView };
 export const DRAG_MIME = 'application/vmlab';
+
+/** Tooltip del cable: se ancla al puntero y se voltea si no cabe abajo. */
+interface EdgeHover {
+  sourceId: string;
+  targetId: string;
+  x: number;
+  y: number;
+  flipY: boolean;
+}
 
 /** Punto del puntero, tanto para ratón como para pantalla táctil. */
 function pointerPoint(e: MouseEvent | TouchEvent): { x: number; y: number } | null {
@@ -48,6 +65,7 @@ function Flow() {
   const theme = useLab((s) => s.theme);
   const canvasLocked = useLab((s) => s.canvasLocked);
   const refreshProbes = useLab((s) => s.refreshProbes);
+  const [hover, setHover] = useState<EdgeHover | null>(null);
   const { onNodesChange, onEdgesChange, onConnect, addMachine } = useLab.getState();
   const setOverSidebar = useLab((s) => s.setOverSidebar);
   const removeNode = useLab((s) => s.removeNode);
@@ -90,6 +108,39 @@ function Flow() {
       };
     });
   }, [nodes, edges, snapshot, probes]);
+
+  const onEdgeMouseEnter = useCallback((event: ReactMouseEvent, edge: Edge) => {
+    setHover({
+      sourceId: edge.source,
+      targetId: edge.target,
+      x: event.clientX,
+      y: event.clientY,
+      flipY: event.clientY > window.innerHeight * 0.62,
+    });
+  }, []);
+
+  const onEdgeMouseMove = useCallback((event: ReactMouseEvent, edge: Edge) => {
+    setHover((current) => {
+      if (!current || current.sourceId !== edge.source || current.targetId !== edge.target) return current;
+      // Evita re-renderizar el lienzo por cada píxel del ratón.
+      if (Math.abs(current.x - event.clientX) < 4 && Math.abs(current.y - event.clientY) < 4) return current;
+      return {
+        ...current,
+        x: event.clientX,
+        y: event.clientY,
+        flipY: event.clientY > window.innerHeight * 0.62,
+      };
+    });
+  }, []);
+
+  const onEdgeMouseLeave = useCallback(() => setHover(null), []);
+
+  const hoverNodes = useMemo(() => {
+    if (!hover) return null;
+    const a = nodes.find((n) => n.id === hover.sourceId);
+    const b = nodes.find((n) => n.id === hover.targetId);
+    return a && b ? { a, b } : null;
+  }, [hover, nodes]);
 
   const onDragOver = useCallback((e: DragEvent) => {
     const types = e.dataTransfer.types;
@@ -145,6 +196,9 @@ function Flow() {
         onNodeDragStart={() => setOverSidebar(false)}
         onNodeDrag={onNodeDrag}
         onNodeDragStop={onNodeDragStop}
+        onEdgeMouseEnter={onEdgeMouseEnter}
+        onEdgeMouseMove={onEdgeMouseMove}
+        onEdgeMouseLeave={onEdgeMouseLeave}
         connectionMode={ConnectionMode.Loose}
         colorMode={theme}
         deleteKeyCode={['Backspace', 'Delete']}
@@ -164,6 +218,19 @@ function Flow() {
         {!canvasLocked && <Controls showInteractive={false} />}
         <MiniMap pannable={!canvasLocked} zoomable={!canvasLocked} nodeColor={(n) => (n.data?.kind === 'vbox' ? '#8b7cf6' : '#38a8f0')} />
       </ReactFlow>
+      {hoverNodes && hover && (
+        <div
+          className="cable-tooltip"
+          role="tooltip"
+          style={{
+            left: Math.max(8, Math.min(hover.x + 16, window.innerWidth - 340)),
+            top: hover.flipY ? hover.y - 14 : hover.y + 18,
+            transform: hover.flipY ? 'translateY(-100%)' : undefined,
+          }}
+        >
+          <CableChecks a={hoverNodes.a} b={hoverNodes.b} />
+        </div>
+      )}
       {canvasLocked && (
         <div className="canvas-lock-badge" role="status">
           <LockIcon /> {t('canvas.locked')}

@@ -397,15 +397,17 @@ pub struct LinkInfo {
 }
 
 /// Resultado de la sonda para un nodo del lienzo.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeProbe {
     pub kind: NodeKind,
     pub target: String,
     pub segment: Option<String>,
     pub ipv4: Option<String>,
+    #[serde(default)]
     pub netmask: Option<String>,
     /// Lista vacía = el extremo está listo para comunicarse.
+    #[serde(default)]
     pub issues: Vec<NodeIssue>,
     pub note: Option<String>,
 }
