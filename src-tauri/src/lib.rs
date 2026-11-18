@@ -17,6 +17,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::detect_tools,
             commands::list_machines,
+            commands::vm_os_catalog,
+            commands::vm_list_ostypes,
+            commands::vm_create,
             commands::labsnap_list,
             commands::labsnap_take,
             commands::labsnap_restore,
@@ -53,7 +56,8 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_clipboard_manager::init());
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init());
 
     let app = builder
         .build(tauri::generate_context!())

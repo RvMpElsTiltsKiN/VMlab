@@ -8,6 +8,8 @@ import type {
   ApplyReport,
   CaptureFilter,
   CaptureInfo,
+  CreateVmRequest,
+  CreatedVm,
   DockerRunOptions,
   DockerStartResult,
   GuestAdditionsPrep,
@@ -22,6 +24,7 @@ import type {
   LinkConditions,
   LinkDiagnostics,
   LinkReport,
+  MachineInfo,
   MachineKind,
   NodeProbe,
   ProbeNode,
@@ -29,6 +32,8 @@ import type {
   Snapshot,
   ToolsInfo,
   TopologyPayload,
+  VmOsEntry,
+  VmOsType,
 } from '../types';
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -45,6 +50,9 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 const real = {
   detectTools: () => invoke<ToolsInfo>('detect_tools'),
   listMachines: () => invoke<Inventory>('list_machines'),
+  vmOsCatalog: () => invoke<VmOsEntry[]>('vm_os_catalog'),
+  vmListOstypes: () => invoke<VmOsType[]>('vm_list_ostypes'),
+  vmCreate: (request: CreateVmRequest) => invoke<CreatedVm>('vm_create', { request }),
   startDocker: () => invoke<DockerStartResult>('docker_start'),
   refreshStatus: () => invoke<Snapshot>('refresh_status'),
   machineAction: (kind: MachineKind, target: string, image: string | undefined, options: DockerRunOptions | undefined, action: Action) =>
@@ -104,6 +112,37 @@ const mockStates: Snapshot['states'] = {
 };
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const mockKey = (kind: MachineKind, target: string) => `${kind}:${target}`;
+
+/** Catálogo de ejemplo para desarrollar el formulario sin VirtualBox. */
+const MOCK_VM_OS_CATALOG: VmOsEntry[] = [
+  { id: 'WindowsXP', label: 'Windows XP', group: 'windows', defaults: { memoryMb: 1024, cpus: 1, diskGb: 20, vramMb: 16, firmware: 'bios', tpm: false, graphics: 'vboxvga', diskBus: 'ide' } },
+  { id: 'Windows7_64', label: 'Windows 7 (64 bits)', group: 'windows', defaults: { memoryMb: 2048, cpus: 2, diskGb: 40, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vboxvga', diskBus: 'sata' } },
+  { id: 'Windows10_64', label: 'Windows 10 (64 bits)', group: 'windows', defaults: { memoryMb: 4096, cpus: 2, diskGb: 50, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vboxsvga', diskBus: 'sata' } },
+  { id: 'Windows11_64', label: 'Windows 11 (64 bits)', group: 'windows', defaults: { memoryMb: 4096, cpus: 2, diskGb: 64, vramMb: 128, firmware: 'efi', tpm: true, graphics: 'vboxsvga', diskBus: 'sata' } },
+  { id: 'Ubuntu_64', label: 'Ubuntu', group: 'linux', defaults: { memoryMb: 4096, cpus: 2, diskGb: 25, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vmsvga', diskBus: 'sata' } },
+  { id: 'Ubuntu_64', label: 'Pop!_OS', group: 'linux', defaults: { memoryMb: 4096, cpus: 2, diskGb: 25, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vmsvga', diskBus: 'sata' } },
+  { id: 'Debian_64', label: 'Debian', group: 'linux', defaults: { memoryMb: 2048, cpus: 2, diskGb: 20, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vmsvga', diskBus: 'sata' } },
+  { id: 'ArchLinux_64', label: 'Arch Linux', group: 'linux', defaults: { memoryMb: 4096, cpus: 2, diskGb: 25, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vmsvga', diskBus: 'sata' } },
+  { id: 'Linux26_64', label: 'Linux genérico', group: 'linux', defaults: { memoryMb: 2048, cpus: 2, diskGb: 20, vramMb: 128, firmware: 'bios', tpm: false, graphics: 'vmsvga', diskBus: 'sata' } },
+];
+
+const MOCK_VM_OSTYPES: VmOsType[] = [
+  ...Array.from(new Set(MOCK_VM_OS_CATALOG.map((e) => e.id))).map((id) => ({
+    id,
+    description: MOCK_VM_OS_CATALOG.find((e) => e.id === id)!.label,
+    family: MOCK_VM_OS_CATALOG.find((e) => e.id === id)!.group,
+  })),
+  { id: 'Windows2019_64', description: 'Windows Server 2019 (64-bit)', family: 'windows' },
+  { id: 'FreeBSD_64', description: 'FreeBSD (64-bit)', family: 'other' },
+  { id: 'DOS', description: 'DOS', family: 'other' },
+];
+
+const mockBaseVms: MachineInfo[] = [
+  { kind: 'vbox', target: '11111111-aaaa', label: 'Kali Linux', state: mockStates['vbox:11111111-aaaa'], image: null, guestAdditions: { version: '7.2.22', known: true } },
+  { kind: 'vbox', target: '22222222-bbbb', label: 'Windows Server 2022', state: mockStates['vbox:22222222-bbbb'], image: null, guestAdditions: { version: null, known: true } },
+];
+const mockCreatedVms: MachineInfo[] = [];
+let mockVmSeq = 0;
 
 /** IPv4 a entero sin signo, o `null` si el texto no tiene cuatro octetos válidos. */
 function mockIpv4(text: string): number | null {
@@ -183,10 +222,7 @@ const MOCK_SCREENSHOT_PNG = Uint8Array.from(
 const mock: typeof real = {
   detectTools: async () => ({ vboxmanage: 'C:/Program Files/Oracle/VirtualBox/VBoxManage.exe', docker: 'docker' }),
   listMachines: async () => ({
-    vbox: [
-      { kind: 'vbox', target: '11111111-aaaa', label: 'Kali Linux', state: mockStates['vbox:11111111-aaaa'], image: null, guestAdditions: { version: '7.2.22', known: true } },
-      { kind: 'vbox', target: '22222222-bbbb', label: 'Windows Server 2022', state: mockStates['vbox:22222222-bbbb'], image: null, guestAdditions: { version: null, known: true } },
-    ],
+    vbox: [...mockBaseVms, ...mockCreatedVms],
     docker: [
       { kind: 'docker', target: 'web', label: 'web', state: mockStates['docker:web'], image: 'nginx:latest', guestAdditions: null },
       { kind: 'docker', target: 'db', label: 'db', state: mockStates['docker:db'], image: 'postgres:16', guestAdditions: null },
@@ -196,6 +232,39 @@ const mock: typeof real = {
     dockerEngineOff: false,
     dockerErrorDetail: null,
   }),
+  vmOsCatalog: async () => {
+    await delay(120);
+    return MOCK_VM_OS_CATALOG.map((entry) => ({ ...entry, defaults: { ...entry.defaults } }));
+  },
+  vmListOstypes: async () => {
+    await delay(150);
+    return MOCK_VM_OSTYPES.map((entry) => ({ ...entry }));
+  },
+  vmCreate: async (request) => {
+    await delay(900);
+    const name = request.name.trim();
+    const existing = [...mockBaseVms, ...mockCreatedVms].map((vm) => vm.label.toLowerCase());
+    if (existing.includes(name.toLowerCase())) {
+      throw new Error(t('mock.vmAlreadyExists', { name }));
+    }
+    const uuid = `00000000-0000-4000-8000-${String(++mockVmSeq).padStart(12, '0')}`;
+    const folder = `C:/Users/demo/VirtualBox VMs/${name}`;
+    mockStates[mockKey('vbox', uuid)] = 'stopped';
+    mockCreatedVms.push({
+      kind: 'vbox',
+      target: uuid,
+      label: name,
+      state: 'stopped',
+      image: null,
+      guestAdditions: { version: null, known: true },
+    });
+    return {
+      uuid,
+      name,
+      cfgFile: `${folder}/${name}.vbox`,
+      vdiPath: `${folder}/${name}.vdi`,
+    };
+  },
   startDocker: async () => {
     await delay(900);
     return {

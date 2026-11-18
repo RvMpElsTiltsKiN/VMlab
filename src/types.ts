@@ -192,6 +192,63 @@ export interface Inventory {
   dockerErrorDetail: string | null;
 }
 
+// ---- Creación de máquinas virtuales (ver model.rs) ----
+
+export type VmOsGroup = 'windows' | 'linux';
+export type VmFirmware = 'bios' | 'efi';
+export type VmGraphics = 'vboxvga' | 'vboxsvga' | 'vmsvga';
+export type VmDiskBus = 'ide' | 'sata';
+
+/** Valores iniciales que se aplican al elegir un sistema operativo. */
+export interface VmOsDefaults {
+  memoryMb: number;
+  cpus: number;
+  diskGb: number;
+  vramMb: number;
+  firmware: VmFirmware;
+  tpm: boolean;
+  graphics: VmGraphics;
+  diskBus: VmDiskBus;
+}
+
+/** Entrada del catálogo. `id` es el `ostype` exacto de VirtualBox. */
+export interface VmOsEntry {
+  id: string;
+  label: string;
+  group: VmOsGroup;
+  defaults: VmOsDefaults;
+}
+
+/** Tipo de sistema ofrecido por la versión instalada de VirtualBox. */
+export interface VmOsType {
+  id: string;
+  description: string;
+  family: 'windows' | 'linux' | 'other';
+}
+
+/** Petición enviada a `vm_create`. La ISO es una ruta absoluta elegida por el usuario. */
+export interface CreateVmRequest {
+  name: string;
+  ostype: string;
+  memoryMb: number;
+  cpus: number;
+  diskGb: number;
+  vramMb?: number;
+  firmware: VmFirmware;
+  tpm: boolean;
+  graphics: VmGraphics;
+  diskBus: VmDiskBus;
+  iso?: string;
+}
+
+/** Resultado de `vm_create`: rutas reales leídas del backend. */
+export interface CreatedVm {
+  uuid: string;
+  name: string;
+  cfgFile: string;
+  vdiPath: string;
+}
+
 export interface Snapshot {
   states: Record<string, PowerState>;
   vboxOk: boolean;

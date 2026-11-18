@@ -4,10 +4,10 @@
 //! solo enviar datos (tipos cerrados) que `vmlab-core` valida antes de ejecutar.
 use crate::state::AppState;
 use vmlab_core::model::{
-    default_adapter, Action, ApplyReport, DockerRunOptions, DockerStartInfo, GuestAdditionsPrep, GuestConfigRequest,
-    GuestHostsRequest,
+    default_adapter, Action, ApplyReport, CreateVmRequest, CreatedVm, DockerRunOptions, DockerStartInfo,
+    GuestAdditionsPrep, GuestConfigRequest, GuestHostsRequest,
     GuestProfile, GuestReport, Inventory, LabSnapInfo, LabSnapNode, LabSnapReport, LinkConditions, LinkReport, NodeKind,
-    NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology,
+    NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology, VmOsEntry, VmOsType,
 };
 use vmlab_core::capture::{self, CaptureFilter, CaptureInfo};
 use vmlab_core::connectivity::LinkDiagnostics;
@@ -38,6 +38,29 @@ pub async fn list_machines(state: State<'_, AppState>) -> Result<Inventory, Stri
 #[tauri::command]
 pub async fn refresh_status(state: State<'_, AppState>) -> Result<Snapshot, String> {
     Ok(engine::snapshot(&state.tools().await).await)
+}
+
+// ───────────────────── Creación de VMs ─────────────────────
+
+/// Catálogo filtrado con los `ostype` de la versión instalada de VirtualBox.
+#[tauri::command]
+pub async fn vm_os_catalog(state: State<'_, AppState>) -> Result<Vec<VmOsEntry>, String> {
+    vbox::available_vm_os_catalog(&state.tools().await).await.map_err(s)
+}
+
+/// Lista completa de `ostypes` para el selector «Otro…».
+#[tauri::command]
+pub async fn vm_list_ostypes(state: State<'_, AppState>) -> Result<Vec<VmOsType>, String> {
+    vbox::list_ostypes(&state.tools().await).await.map_err(s)
+}
+
+/// Crea una VM vacía con VDI nuevo e ISO opcional; sin instalación desatendida.
+#[tauri::command]
+pub async fn vm_create(
+    state: State<'_, AppState>,
+    request: CreateVmRequest,
+) -> Result<CreatedVm, String> {
+    vbox::create_vm(&state.tools().await, request).await.map_err(s)
 }
 
 #[tauri::command]

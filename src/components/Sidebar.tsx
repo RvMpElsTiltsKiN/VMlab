@@ -5,6 +5,7 @@ import { stateLabel } from '../lib/status';
 import { useLab } from '../store/useLab';
 import type { GuestAdditionsPrep, MachineInfo, PaletteItem } from '../types';
 import { DRAG_MIME } from './Canvas';
+import { NewVmDialog } from './NewVmDialog';
 import { CheckIcon, ContainerIcon, CubeIcon, DiskIcon, PlayIcon, PlusIcon, RefreshIcon, WarnIcon } from './icons';
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
@@ -173,6 +174,7 @@ export function Sidebar() {
   const overSidebar = useLab((s) => s.overSidebar);
   const [name, setName] = useState('');
   const [image, setImage] = useState('');
+  const [newVmOpen, setNewVmOpen] = useState(false);
 
   const used = (m: MachineInfo) => nodes.some((n) => n.data.kind === m.kind && n.data.target === m.target);
 
@@ -203,6 +205,16 @@ export function Sidebar() {
       <div className="side-scroll">
         <div className="side-section">
           <div className="side-title"><span>{t('sidebar.vms')}</span></div>
+          <span className="new-vm-btn-wrap" title={tools?.vboxmanage ? t('newvm.button') : t('newvm.disabledHint')}>
+            <button
+              className="btn new-vm-btn"
+              onClick={() => setNewVmOpen(true)}
+              disabled={!tools?.vboxmanage}
+              aria-label={t('newvm.button')}
+            >
+              <PlusIcon /> {t('newvm.button')}
+            </button>
+          </span>
           {inventory?.vboxError && <p className="hint err">{inventory.vboxError}</p>}
           <ul className="pal-list">
             {inventory?.vbox.map((m) => <Item key={m.target} m={m} used={used(m)} />)}
@@ -253,6 +265,7 @@ export function Sidebar() {
           <ul className="pal-list"><DiskItem /></ul>
         </div>
       </div>
+      {newVmOpen && <NewVmDialog onClose={() => setNewVmOpen(false)} />}
     </aside>
   );
 }

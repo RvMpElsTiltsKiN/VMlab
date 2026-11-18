@@ -5,7 +5,8 @@
 use crate::disks;
 use crate::error::{CoreError, Result};
 use crate::model::{
-    Action, GuestAdditionsInfo, GuestAdditionsPrep, LinkInfo, NetMode, NodeIssue, NodeNet,
+    available_os_catalog, Action, CreateVmRequest, CreatedVm, GuestAdditionsInfo, GuestAdditionsPrep,
+    LinkInfo, NetMode, NodeIssue, NodeNet, VmCreateParams, VmOsEntry, VmOsType,
 };
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
@@ -35,6 +36,54 @@ pub fn parse_vm_list(out: &str) -> Vec<(String, String)> {
             Some((rest[..end].to_string(), uuid.to_string()))
         })
         .collect()
+}
+
+/// Parsea `VBoxManage list ostypes`: bloques `ID:  <id>` / `Description: <texto>`.
+/// La familia no viene en la salida; se deriva del id y la descripción.
+pub fn parse_ostypes(out: &str) -> Vec<VmOsType> {
+    let mut result = Vec::new();
+    let mut current: Option<VmOsType> = None;
+    for line in out.lines() {
+        let line = line.trim_end();
+        if let Some(id) = line.strip_prefix("ID:") {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(previous) = current.take() {
+                result.push(previous);
+            }
+            current = Some(VmOsType {
+                id: id.to_string(),
+                description: String::new(),
+                family: crate::model::os_family(id, ""),
+            });
+        } else if let Some(description) = line.strip_prefix("Description:") {
+            if let Some(entry) = current.as_mut() {
+                entry.description = description.trim().to_string();
+                entry.family = crate::model::os_family(&entry.id, &entry.description);
+            }
+        }
+    }
+    if let Some(entry) = current {
+        result.push(entry);
+    }
+    result
+}
+
+/// Lista completa de tipos de sistema ofrecidos por la versión instalada.
+pub async fn list_ostypes(tools: &Tools) -> Result<Vec<VmOsType>> {
+    let bin = tools.vbox()?;
+    let out = run_ok(bin, &["list", "ostypes"], SHORT)
+        .await
+        .map_err(|e| create_vm_error("consultar los tipos de sistema operativo", e))?;
+    Ok(parse_ostypes(&out.stdout))
+}
+
+/// Catálogo filtrado con los `ostype` que existen en esta instalación.
+pub async fn available_vm_os_catalog(tools: &Tools) -> Result<Vec<VmOsEntry>> {
+    let ids: Vec<String> = list_ostypes(tools).await?.into_iter().map(|o| o.id).collect();
+    Ok(available_os_catalog(&ids))
 }
 
 /// Listado rápido: solo `list vms` + `list runningvms`, sin consultar Guest Additions.
@@ -1093,6 +1142,25 @@ pub fn createmedium_args(path: &Path, size_mb: u32) -> Result<Vec<String>> {
     ])
 }
 
+/// Construye `closemedium disk <vdi> --delete` para borrar el VDI creado por
+/// una VM que se está deshaciendo. Solo acepta ficheros `.vdi` dentro de la
+/// carpeta de esa VM (la que se lee de `CfgFile`).
+pub fn closemedium_delete_args(path: &Path, vm_dir: &Path) -> Result<Vec<String>> {
+    let value = vdi_path_arg(path)?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if file_name.starts_with('-') {
+        return Err(CoreError::Invalid("la ruta del disco VDI no es válida".into()));
+    }
+    let extension = path.extension().and_then(|e| e.to_str());
+    if !extension.is_some_and(|e| e.eq_ignore_ascii_case("vdi")) {
+        return Err(CoreError::Invalid("el disco debe tener extensión .vdi".into()));
+    }
+    if !path.starts_with(vm_dir) {
+        return Err(CoreError::Invalid("el disco está fuera de la carpeta de la VM".into()));
+    }
+    Ok(vec!["closemedium".into(), "disk".into(), value, "--delete".into()])
+}
+
 pub fn showmediuminfo_args(path: &Path) -> Result<Vec<String>> {
     Ok(vec!["showmediuminfo".into(), "disk".into(), vdi_path_arg(path)?])
 }
@@ -1162,6 +1230,335 @@ pub fn storageattach_args(
         "--medium".into(),
         medium,
     ])
+}
+
+// ───────────────────── Creación de VMs ─────────────────────
+
+/// Lee UUID y fichero de configuración de `showvminfo --machinereadable`.
+pub fn parse_created_vm_info(info: &str) -> Option<(String, String)> {
+    let uuid = vm_field(info, "UUID")?;
+    let cfg = vm_field(info, "CfgFile")?;
+    if uuid.is_empty() || cfg.is_empty() {
+        return None;
+    }
+    Some((uuid, cfg))
+}
+
+pub fn createvm_args(name: &str, ostype: &str) -> Result<Vec<String>> {
+    validate::vbox_target(name)?;
+    let valid_ostype = !ostype.is_empty()
+        && ostype.chars().count() <= 128
+        && !ostype.starts_with('-')
+        && ostype.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '!'))
+        && !ostype.chars().any(|c| c.is_control());
+    if !valid_ostype {
+        return Err(CoreError::Invalid("tipo de sistema operativo no válido".into()));
+    }
+    Ok(vec![
+        "createvm".into(),
+        "--name".into(),
+        name.into(),
+        "--ostype".into(),
+        ostype.into(),
+        "--register".into(),
+    ])
+}
+
+/// Configuración inicial de la VM nueva, sintaxis de VirtualBox 7.x.
+pub fn modifyvm_args(
+    name: &str,
+    memory_mb: u32,
+    cpus: u32,
+    vram_mb: u32,
+    graphics: &str,
+    firmware: &str,
+    tpm: bool,
+) -> Result<Vec<String>> {
+    validate::vbox_target(name)?;
+    validate::vm_memory_mb(memory_mb)?;
+    validate::vm_cpus(cpus)?;
+    validate::vm_vram_mb(vram_mb)?;
+    let graphics = validate::vm_graphics(graphics)?;
+    let firmware = validate::vm_firmware(firmware)?;
+    if tpm && firmware != "efi" {
+        return Err(CoreError::Invalid("TPM 2.0 solo se puede usar con firmware EFI".into()));
+    }
+    let mut args = vec![
+        "modifyvm".into(),
+        name.into(),
+        "--memory".into(),
+        memory_mb.to_string(),
+        "--cpus".into(),
+        cpus.to_string(),
+        "--vram".into(),
+        vram_mb.to_string(),
+        "--graphicscontroller".into(),
+        graphics.into(),
+        "--firmware".into(),
+        firmware.into(),
+        "--ioapic".into(),
+        "on".into(),
+        "--nic1".into(),
+        "nat".into(),
+        "--boot1".into(),
+        "dvd".into(),
+        "--boot2".into(),
+        "disk".into(),
+        "--boot3".into(),
+        "none".into(),
+        "--boot4".into(),
+        "none".into(),
+    ];
+    if tpm {
+        args.extend(["--tpm-type".into(), "2.0".into()]);
+    }
+    Ok(args)
+}
+
+/// Crea el controlador inicial de la VM nueva. `portcount` solo aplica a SATA.
+pub fn storagectl_create_args(
+    vm: &str,
+    controller: &str,
+    kind: &str,
+    portcount: Option<u32>,
+) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    validate::host_iface(controller)?;
+    let mut args = vec![
+        "storagectl".into(),
+        vm.into(),
+        "--name".into(),
+        controller.into(),
+        "--add".into(),
+    ];
+    if kind.eq_ignore_ascii_case("sata") {
+        let ports = portcount.unwrap_or(2);
+        if !(1..=MAX_SATA_PORTS).contains(&ports) {
+            return Err(CoreError::Invalid(format!(
+                "el número de puertos SATA debe estar entre 1 y {MAX_SATA_PORTS}"
+            )));
+        }
+        args.extend([
+            "sata".into(),
+            "--controller".into(),
+            "IntelAhci".into(),
+            "--portcount".into(),
+            ports.to_string(),
+        ]);
+    } else if kind.eq_ignore_ascii_case("ide") {
+        args.extend(["ide".into(), "--controller".into(), "PIIX4".into()]);
+    } else {
+        return Err(CoreError::Invalid("el controlador debe ser ide o sata".into()));
+    }
+    Ok(args)
+}
+
+/// Conecta la ISO en una unidad óptica (`dvddrive`), sin copiar el fichero.
+pub fn storageattach_iso_args(
+    vm: &str,
+    controller: &str,
+    port: u32,
+    device: u32,
+    iso: &Path,
+) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    validate::host_iface(controller)?;
+    Ok(vec![
+        "storageattach".into(),
+        vm.into(),
+        "--storagectl".into(),
+        controller.into(),
+        "--port".into(),
+        port.to_string(),
+        "--device".into(),
+        device.to_string(),
+        "--type".into(),
+        "dvddrive".into(),
+        "--medium".into(),
+        vdi_path_arg(iso)?,
+    ])
+}
+
+pub fn unregistervm_args(target: &str) -> Result<Vec<String>> {
+    validate::vbox_target(target)?;
+    Ok(vec!["unregistervm".into(), target.into(), "--delete".into()])
+}
+
+/// Plan puro de los pasos de almacenamiento de una VM recién creada: devuelve
+/// los `argv` de cada comando sin ejecutar nada. XP usa IDE (disco en 0:0 e ISO
+/// en 1:0 del mismo controlador); los demás usan SATA para el disco y crean un
+/// controlador IDE aparte para la ISO.
+pub fn create_vm_steps(params: &VmCreateParams, vdi: &Path, ide_present: bool) -> Result<Vec<Vec<String>>> {
+    let mut steps = Vec::new();
+    steps.push(createmedium_args(vdi, params.disk_mb)?);
+
+    let disk_on_ide = params.disk_bus == "ide";
+    let disk_controller = if disk_on_ide { "IDE" } else { "SATA" };
+    if disk_on_ide {
+        steps.push(storagectl_create_args(&params.name, "IDE", "ide", None)?);
+    } else {
+        steps.push(storagectl_create_args(&params.name, "SATA", "sata", Some(2))?);
+    }
+    steps.push(storageattach_args(&params.name, disk_controller, 0, 0, Some(vdi))?);
+
+    if let Some(iso) = params.iso.as_deref() {
+        if !disk_on_ide && !ide_present {
+            steps.push(storagectl_create_args(&params.name, "IDE", "ide", None)?);
+        }
+        steps.push(storageattach_iso_args(&params.name, "IDE", 1, 0, Path::new(iso))?);
+    }
+    Ok(steps)
+}
+
+fn create_vm_error(action: &str, e: CoreError) -> CoreError {
+    vdi_command_error(action, e)
+}
+
+fn create_step_error(step: &[String], e: CoreError) -> CoreError {
+    let action = match step.first().map(String::as_str) {
+        Some("createmedium") => "crear el disco VDI",
+        Some("storagectl") => "configurar el controlador de almacenamiento",
+        Some("storageattach") => "conectar el medio",
+        _ => "crear la máquina virtual",
+    };
+    create_vm_error(action, e)
+}
+
+/// Deshace solo la VM que acabamos de crear, identificada por su UUID (o por
+/// su nombre antes de conocer el UUID). Si `createmedium` llegó a crear el VDI,
+/// también se cierra y se borra ese fichero. El error original se conserva
+/// siempre; los fallos del rollback se añaden como mensajes secundarios.
+async fn rollback_create_vm(
+    bin: &Path,
+    target: &str,
+    original: CoreError,
+    vdi: Option<&Path>,
+    vm_dir: Option<&Path>,
+) -> CoreError {
+    let mut message = original.to_string();
+
+    // El unregister se intenta siempre, incluso si luego falla cerrar el medio.
+    match unregistervm_args(target) {
+        Ok(args) => {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            match run_ok(bin, &argv, SHORT).await {
+                Ok(_) => message.push_str("; se ha eliminado la VM creada para deshacer los cambios"),
+                Err(e) => message.push_str(&format!("; además no se pudo revertir la creación: {e}")),
+            }
+        }
+        Err(e) => message.push_str(&format!("; no se pudo revertir la creación: {e}")),
+    }
+
+    if let (Some(vdi), Some(vm_dir)) = (vdi, vm_dir) {
+        match closemedium_delete_args(vdi, vm_dir) {
+            Ok(args) => {
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                match run_ok(bin, &argv, SHORT).await {
+                    Ok(_) => message.push_str("; se ha eliminado el disco VDI creado"),
+                    Err(e) => message.push_str(&format!("; además no se pudo eliminar el disco VDI: {e}")),
+                }
+            }
+            Err(e) => message.push_str(&format!("; además no se pudo preparar la eliminación del disco VDI: {e}")),
+        }
+    }
+
+    CoreError::Message(message)
+}
+
+/// Crea una VM vacía, con un VDI nuevo y una ISO opcional ya conectada.
+/// No instala nada dentro del invitado y no toca VMs existentes.
+pub async fn create_vm(tools: &Tools, req: CreateVmRequest) -> Result<CreatedVm> {
+    let bin = tools.vbox()?;
+
+    // 1. Consultar el conjunto cerrado de ostypes y los nombres existentes.
+    let types = list_ostypes(tools).await?;
+    let ids: Vec<String> = types.into_iter().map(|o| o.id).collect();
+    let out = run_ok(bin, &["list", "vms"], SHORT)
+        .await
+        .map_err(|e| create_vm_error("listar las máquinas virtuales", e))?;
+    let names: Vec<String> = parse_vm_list(&out.stdout).into_iter().map(|(name, _)| name).collect();
+
+    // 2. Validar todo antes de crear nada.
+    let params = validate::validate_create_request(&req, &ids, &names)?;
+    let create_args = createvm_args(&params.name, &params.ostype)?;
+    let modify_args = modifyvm_args(
+        &params.name,
+        params.memory_mb,
+        params.cpus,
+        params.vram_mb,
+        &params.graphics,
+        &params.firmware,
+        params.tpm,
+    )?;
+
+    // 3. Registrar la VM. Hasta aquí no hay nada que deshacer.
+    let argv: Vec<&str> = create_args.iter().map(String::as_str).collect();
+    run_ok(bin, &argv, SHORT)
+        .await
+        .map_err(|e| create_vm_error("crear la máquina virtual", e))?;
+
+    // 4. Leer UUID y CfgFile de la VM recién creada (para rollback y VDI).
+    let info = run_ok(bin, &["showvminfo", &params.name, "--machinereadable"], SHORT).await;
+    let info = match info {
+        Ok(o) => o,
+        Err(e) => {
+            let e = create_vm_error("leer la información de la VM creada", e);
+            // Aquí todavía no se conoce el UUID. El nombre se ha validado como
+            // único justo antes (sin distinguir mayúsculas) y esta es la única
+            // VM con ese nombre, así que usarlo como objetivo del rollback no
+            // puede afectar a ninguna otra máquina. Tampoco hay VDI que borrar.
+            return Err(rollback_create_vm(bin, &params.name, e, None, None).await);
+        }
+    };
+    let (uuid, cfg_file) = match parse_created_vm_info(&info.stdout) {
+        Some(v) => v,
+        None => {
+            let e = CoreError::Message("no se pudo leer el UUID o la configuración de la VM creada".into());
+            // Mismo motivo que arriba: el nombre es único y aún no hay VDI.
+            return Err(rollback_create_vm(bin, &params.name, e, None, None).await);
+        }
+    };
+
+    // 5. Configurar, crear el VDI y conectarlo todo. Cualquier fallo deshace
+    //    únicamente esta VM, usando su UUID.
+    let argv: Vec<&str> = modify_args.iter().map(String::as_str).collect();
+    if let Err(e) = run_ok(bin, &argv, SHORT).await {
+        return Err(rollback_create_vm(bin, &uuid, create_vm_error("configurar la máquina virtual", e), None, None).await);
+    }
+
+    let vm_dir = match Path::new(&cfg_file).parent() {
+        Some(parent) => parent,
+        None => {
+            let e = CoreError::Message("la ruta de configuración de la VM no tiene carpeta".into());
+            return Err(rollback_create_vm(bin, &uuid, e, None, None).await);
+        }
+    };
+    let vdi = vm_dir.join(format!("{}.vdi", params.name));
+    let steps = match create_vm_steps(&params, &vdi, false) {
+        Ok(s) => s,
+        Err(e) => return Err(rollback_create_vm(bin, &uuid, e, None, None).await),
+    };
+    // Solo se cerrará y borrará el VDI si `createmedium` terminó con éxito.
+    let mut vdi_created = false;
+    for step in &steps {
+        let is_medium = step.first().map(String::as_str) == Some("createmedium");
+        let argv: Vec<&str> = step.iter().map(String::as_str).collect();
+        let limit = if is_medium { LONG } else { SHORT };
+        if let Err(e) = run_ok(bin, &argv, limit).await {
+            let created = vdi_created.then_some(vdi.as_path());
+            return Err(rollback_create_vm(bin, &uuid, create_step_error(step, e), created, Some(vm_dir)).await);
+        }
+        if is_medium {
+            vdi_created = true;
+        }
+    }
+
+    Ok(CreatedVm {
+        uuid,
+        name: params.name,
+        cfg_file,
+        vdi_path: vdi.to_string_lossy().into_owned(),
+    })
 }
 
 fn vm_field_ci(info: &str, field: &str) -> Option<String> {
@@ -2302,5 +2699,240 @@ storagecontrollermaxportcount0="2"
             None
         );
         assert_eq!(parse_medium_size_mb("otro=1\n"), None);
+    }
+
+    // ── C1: creación de VMs ──
+
+    #[test]
+    fn parses_a_real_trimmed_ostypes_list() {
+        let out = r#"ID:          WindowsXP
+Description: Windows XP
+ID:          Windows7_64
+Description: Windows 7 (64-bit)
+ID:          Windows11_64
+Description: Windows 11 (64-bit)
+ID:          Ubuntu_64
+Description: Ubuntu (64-bit)
+ID:          Debian_64
+Description: Debian (64-bit)
+ID:          Other
+Description: Other/Unknown
+"#;
+        let types = parse_ostypes(out);
+        assert_eq!(types.len(), 6);
+        assert_eq!(types[0].id, "WindowsXP");
+        assert_eq!(types[0].description, "Windows XP");
+        assert_eq!(types[0].family, "windows");
+        assert_eq!(types[2].id, "Windows11_64");
+        assert_eq!(types[3].family, "linux");
+        assert_eq!(types[5].id, "Other");
+        assert_eq!(types[5].family, "other");
+        assert!(parse_ostypes("").is_empty());
+        assert!(parse_ostypes("Description: huérfana\n").is_empty());
+    }
+
+    #[test]
+    fn reads_uuid_and_cfgfile_from_machine_readable_info() {
+        let info = r#"
+UUID="c0ffee00-1111-2222-3333-444455556666"
+CfgFile="C:\\Users\\marc\\VirtualBox VMs\\Mi VM\\Mi VM.vbox"
+VMState="poweroff"
+"#;
+        assert_eq!(
+            parse_created_vm_info(info),
+            Some((
+                "c0ffee00-1111-2222-3333-444455556666".into(),
+                "C:\\Users\\marc\\VirtualBox VMs\\Mi VM\\Mi VM.vbox".into()
+            ))
+        );
+        assert_eq!(parse_created_vm_info("VMState=\"poweroff\"\n"), None);
+    }
+
+    #[test]
+    fn createvm_arguments_are_separate_and_validated() {
+        let args = createvm_args("Mi VM (lab)", "Windows10_64").unwrap();
+        assert_eq!(
+            args,
+            ["createvm", "--name", "Mi VM (lab)", "--ostype", "Windows10_64", "--register"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        );
+        assert!(createvm_args("-mal", "Windows10_64").is_err());
+        assert!(createvm_args("Mi VM", "--mal").is_err());
+        assert!(createvm_args("Mi VM", "").is_err());
+    }
+
+    #[test]
+    fn modifyvm_arguments_follow_virtualbox_7_syntax() {
+        let args = modifyvm_args("Mi VM", 4096, 2, 128, "vboxsvga", "efi", true).unwrap();
+        let expected = [
+            "modifyvm", "Mi VM", "--memory", "4096", "--cpus", "2", "--vram", "128",
+            "--graphicscontroller", "vboxsvga", "--firmware", "efi", "--ioapic", "on",
+            "--nic1", "nat", "--boot1", "dvd", "--boot2", "disk", "--boot3", "none",
+            "--boot4", "none", "--tpm-type", "2.0",
+        ];
+        assert_eq!(args, expected.iter().map(|s| s.to_string()).collect::<Vec<String>>());
+
+        let no_tpm = modifyvm_args("Mi VM", 1024, 1, 16, "vboxvga", "bios", false).unwrap();
+        assert!(!no_tpm.iter().any(|a| a.contains("tpm")));
+        assert!(no_tpm.iter().any(|a| a == "bios"));
+
+        assert!(modifyvm_args("Mi VM", 4096, 2, 128, "vboxsvga", "bios", true).is_err());
+        assert!(modifyvm_args("-Mi VM", 4096, 2, 128, "vboxsvga", "efi", true).is_err());
+        assert!(modifyvm_args("Mi VM", 63, 2, 128, "vboxsvga", "efi", false).is_err());
+    }
+
+    #[test]
+    fn new_controller_and_iso_arguments_are_validated() {
+        let sata = storagectl_create_args("Mi VM", "SATA", "sata", Some(2)).unwrap();
+        assert_eq!(
+            sata,
+            ["storagectl", "Mi VM", "--name", "SATA", "--add", "sata", "--controller", "IntelAhci", "--portcount", "2"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        );
+        let ide = storagectl_create_args("Mi VM", "IDE", "ide", None).unwrap();
+        assert_eq!(
+            ide,
+            ["storagectl", "Mi VM", "--name", "IDE", "--add", "ide", "--controller", "PIIX4"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        );
+        assert!(storagectl_create_args("Mi VM", "-IDE", "ide", None).is_err());
+        assert!(storagectl_create_args("Mi VM", "SATA", "sata", Some(0)).is_err());
+        assert!(storagectl_create_args("Mi VM", "SCSI", "scsi", None).is_err());
+
+        let iso = Path::new("C:\\ISOs\\windows xp.iso");
+        let attach = storageattach_iso_args("Mi VM", "IDE", 1, 0, iso).unwrap();
+        assert_eq!(
+            attach,
+            [
+                "storageattach", "Mi VM", "--storagectl", "IDE", "--port", "1", "--device", "0",
+                "--type", "dvddrive", "--medium", "C:\\ISOs\\windows xp.iso"
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>()
+        );
+        assert!(storageattach_iso_args("Mi VM", "IDE", 1, 0, Path::new("-mal.iso")).is_err());
+        assert!(storageattach_iso_args("-Mi VM", "IDE", 1, 0, iso).is_err());
+
+        assert_eq!(
+            unregistervm_args("c0ffee00-1111-2222-3333-444455556666").unwrap(),
+            ["unregistervm", "c0ffee00-1111-2222-3333-444455556666", "--delete"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        );
+        assert!(unregistervm_args("--otra-vm").is_err());
+    }
+
+    #[test]
+    fn closemedium_arguments_are_restricted_to_the_vm_folder() {
+        let dir = Path::new("C:\\VMs\\Mi VM");
+        let vdi = dir.join("Mi VM.vdi");
+        assert_eq!(
+            closemedium_delete_args(&vdi, dir).unwrap(),
+            ["closemedium", "disk", "C:\\VMs\\Mi VM\\Mi VM.vdi", "--delete"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        );
+
+        // Extensión incorrecta.
+        assert!(closemedium_delete_args(&dir.join("Mi VM.iso"), dir).is_err());
+        // Nombre de fichero que empieza por '-': sería interpretado como opción.
+        assert!(closemedium_delete_args(&dir.join("-mal.vdi"), dir).is_err());
+        // Otra carpeta: nunca se borra un VDI ajeno.
+        assert!(closemedium_delete_args(&Path::new("C:\\VMs\\Otra VM\\Mi VM.vdi"), dir).is_err());
+        assert!(closemedium_delete_args(Path::new("-mal.vdi"), dir).is_err());
+    }
+
+    fn c1_params(bus: &str, iso: Option<&str>) -> VmCreateParams {
+        VmCreateParams {
+            name: "Mi VM".into(),
+            ostype: "Windows10_64".into(),
+            memory_mb: 4096,
+            cpus: 2,
+            disk_mb: 51_200,
+            vram_mb: 128,
+            firmware: "bios".into(),
+            tpm: false,
+            graphics: "vboxsvga".into(),
+            disk_bus: bus.into(),
+            iso: iso.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn xp_plan_uses_ide_and_win10_plan_uses_sata() {
+        let vdi = Path::new("C:\\VMs\\Mi VM\\Mi VM.vdi");
+        let iso = Path::new("C:\\ISOs\\instalador.iso");
+
+        let mut xp = c1_params("ide", Some(iso.to_str().unwrap()));
+        xp.ostype = "WindowsXP".into();
+        xp.memory_mb = 1024;
+        xp.cpus = 1;
+        xp.disk_mb = 20 * 1024;
+        xp.vram_mb = 16;
+        xp.graphics = "vboxvga".into();
+        let xp_steps = create_vm_steps(&xp, vdi, false).unwrap();
+        assert_eq!(xp_steps.len(), 4);
+        assert_eq!(xp_steps[0][0], "createmedium");
+        assert_eq!(&xp_steps[1][..5], ["storagectl", "Mi VM", "--name", "IDE", "--add"]);
+        assert_eq!(&xp_steps[2][..4], ["storageattach", "Mi VM", "--storagectl", "IDE"]);
+        assert!(xp_steps[2].iter().any(|a| a == "hdd"));
+        assert_eq!(&xp_steps[3][..4], ["storageattach", "Mi VM", "--storagectl", "IDE"]);
+        assert!(xp_steps[3].iter().any(|a| a == "dvddrive"));
+        assert_eq!(xp_steps[3][5], "1"); // puerto 1, mismo controlador IDE
+        // El nombre y la ISO viajan como argumentos separados, sin interpolar.
+        assert!(xp_steps.iter().flatten().any(|a| a == "C:\\ISOs\\instalador.iso"));
+        assert!(xp_steps.iter().flatten().any(|a| a == vdi.to_str().unwrap()));
+
+        let win = c1_params("sata", Some(iso.to_str().unwrap()));
+        let win_steps = create_vm_steps(&win, vdi, false).unwrap();
+        assert_eq!(win_steps.len(), 5);
+        assert_eq!(&win_steps[1][..5], ["storagectl", "Mi VM", "--name", "SATA", "--add"]);
+        assert!(win_steps[1].iter().any(|a| a == "IntelAhci"));
+        assert_eq!(&win_steps[2][..4], ["storageattach", "Mi VM", "--storagectl", "SATA"]);
+        assert_eq!(&win_steps[3][..5], ["storagectl", "Mi VM", "--name", "IDE", "--add"]);
+        assert_eq!(&win_steps[4][..4], ["storageattach", "Mi VM", "--storagectl", "IDE"]);
+        assert_eq!(win_steps[4][5], "1");
+
+        // Con ISO y controlador IDE ya presente, no se crea otro.
+        let win_ide = create_vm_steps(&win, vdi, true).unwrap();
+        assert_eq!(win_ide.len(), 4);
+
+        // Sin ISO: solo disco, sin unidad óptica conectada.
+        let no_iso = create_vm_steps(&c1_params("sata", None), vdi, false).unwrap();
+        assert_eq!(no_iso.len(), 3);
+    }
+
+    #[test]
+    fn create_request_uses_camel_case_fields() {
+        let json = serde_json::json!({
+            "name": "Win11 (lab)",
+            "ostype": "Windows11_64",
+            "memoryMb": 4096,
+            "cpus": 2,
+            "diskGb": 64,
+            "vramMb": 128,
+            "firmware": "efi",
+            "tpm": true,
+            "graphics": "vboxsvga",
+            "diskBus": "sata",
+            "iso": "C:\\ISOs\\windows11.iso"
+        });
+        let req: CreateVmRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.name, "Win11 (lab)");
+        assert_eq!(req.memory_mb, 4096);
+        assert_eq!(req.disk_gb, Some(64));
+        assert_eq!(req.vram_mb, Some(128));
+        assert!(req.tpm);
+        assert_eq!(req.disk_bus, "sata");
+        assert!(req.iso.is_some());
     }
 }

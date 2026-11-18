@@ -2,9 +2,13 @@
 //! Como no hay shell, el riesgo real es la *inyección de opciones* (un valor que
 //! empieza por `-` y se interpreta como flag), por eso todos los validadores lo prohíben.
 use crate::error::{CoreError, Result};
-use crate::model::{DockerRunOptions, EdgeKind, LinkConditions, NodeKind, NodeSpec, Topology};
+use crate::model::{
+    vm_os_catalog, CreateVmRequest, DockerRunOptions, EdgeKind, LinkConditions, NodeKind, NodeSpec,
+    Topology, VmCreateParams,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::path::Path;
 
 /// Tamaño usado al crear un VDI cuando el lienzo no indica uno.
 pub const DEFAULT_VDI_SIZE_MB: u32 = 10_240;
@@ -650,6 +654,211 @@ pub fn docker_run_options(o: &DockerRunOptions) -> Result<()> {
     Ok(())
 }
 
+// ───────────────────── Creación de VMs ─────────────────────
+
+pub const MIN_VM_MEMORY_MB: u32 = 64;
+pub const MAX_VM_MEMORY_MB: u32 = 131_072;
+pub const MAX_VM_CPUS: u32 = 64;
+pub const MAX_VM_VRAM_MB: u32 = 256;
+
+/// `true` para nombres con forma de UUID (`8-4-4-4-12` hexadecimales), que se
+/// reservan para los identificadores internos de VirtualBox.
+fn looks_like_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [parts[0].len(), parts[1].len(), parts[2].len(), parts[3].len(), parts[4].len()]
+            == [8, 4, 4, 4, 12]
+        && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Nombre de la VM: 1..=64 caracteres ASCII de `[A-Za-z0-9 ._-()]`. No puede
+/// empezar por `-`, espacio o punto, ni terminar en espacio o punto; tampoco
+/// contener separadores de ruta, `..`, ni tener forma de UUID.
+pub fn vm_name(s: &str) -> Result<&str> {
+    let count = s.chars().count();
+    let ok = count >= 1
+        && count <= 64
+        && !s.starts_with('-')
+        && !s.starts_with(' ')
+        && !s.starts_with('.')
+        && !s.ends_with(' ')
+        && !s.ends_with('.')
+        && !s.contains("..")
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !looks_like_uuid(s)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')'));
+    if ok { Ok(s) } else { bad("nombre de máquina virtual no válido", s) }
+}
+
+/// Unicidad contra `VBoxManage list vms`, sin distinguir mayúsculas.
+pub fn vm_name_unique<'a>(name: &'a str, existing: &[String]) -> Result<&'a str> {
+    vm_name(name)?;
+    if existing.iter().any(|e| e.eq_ignore_ascii_case(name)) {
+        return Err(CoreError::Invalid(format!("ya existe una máquina virtual llamada «{name}»")));
+    }
+    Ok(name)
+}
+
+/// El `ostype` debe estar entre los que ofrece la versión instalada.
+pub fn vm_ostype<'a>(id: &'a str, available: &[String]) -> Result<&'a str> {
+    if available.iter().any(|a| a == id) {
+        Ok(id)
+    } else {
+        bad("tipo de sistema operativo no disponible", id)
+    }
+}
+
+pub fn vm_memory_mb(v: u32) -> Result<u32> {
+    if (MIN_VM_MEMORY_MB..=MAX_VM_MEMORY_MB).contains(&v) {
+        Ok(v)
+    } else {
+        Err(CoreError::Invalid(format!(
+            "la memoria debe estar entre {MIN_VM_MEMORY_MB} y {MAX_VM_MEMORY_MB} MB"
+        )))
+    }
+}
+
+pub fn vm_cpus(v: u32) -> Result<u32> {
+    if (1..=MAX_VM_CPUS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(CoreError::Invalid(format!("el número de CPU debe estar entre 1 y {MAX_VM_CPUS}")))
+    }
+}
+
+pub fn vm_disk_mb(v: u32) -> Result<u32> {
+    if (1..=MAX_VDI_SIZE_MB).contains(&v) {
+        Ok(v)
+    } else {
+        Err(CoreError::Invalid(format!(
+            "el tamaño del disco debe estar entre 1 y {MAX_VDI_SIZE_MB} MB"
+        )))
+    }
+}
+
+pub fn vm_vram_mb(v: u32) -> Result<u32> {
+    if (1..=MAX_VM_VRAM_MB).contains(&v) {
+        Ok(v)
+    } else {
+        Err(CoreError::Invalid(format!("la VRAM debe estar entre 1 y {MAX_VM_VRAM_MB} MB")))
+    }
+}
+
+/// Devuelve el valor canónico en minúsculas.
+pub fn vm_firmware(s: &str) -> Result<&'static str> {
+    if s.eq_ignore_ascii_case("bios") {
+        Ok("bios")
+    } else if s.eq_ignore_ascii_case("efi") {
+        Ok("efi")
+    } else {
+        bad("firmware no válido", s)
+    }
+}
+
+/// Devuelve el valor canónico en minúsculas.
+pub fn vm_graphics(s: &str) -> Result<&'static str> {
+    for value in ["vboxvga", "vboxsvga", "vmsvga"] {
+        if s.eq_ignore_ascii_case(value) {
+            return Ok(value);
+        }
+    }
+    bad("controlador gráfico no válido", s)
+}
+
+/// Devuelve el valor canónico en minúsculas.
+pub fn vm_disk_bus(s: &str) -> Result<&'static str> {
+    if s.eq_ignore_ascii_case("ide") {
+        Ok("ide")
+    } else if s.eq_ignore_ascii_case("sata") {
+        Ok("sata")
+    } else {
+        bad("controlador de disco no válido", s)
+    }
+}
+
+/// ISO opcional: ruta absoluta, fichero existente, extensión `.iso`, sin `-`
+/// inicial ni caracteres de control. Nunca se copia ni se mueve.
+pub fn vm_iso(s: &str) -> Result<&str> {
+    let ok_name = !s.is_empty() && !s.starts_with('-') && !s.chars().any(|c| c.is_control());
+    if !ok_name {
+        return bad("ruta de ISO no válida", s);
+    }
+    let path = Path::new(s);
+    if !path.is_absolute() {
+        return Err(CoreError::Invalid("la ruta de la ISO debe ser absoluta".into()));
+    }
+    let extension = path.extension().and_then(|e| e.to_str());
+    if !extension.is_some_and(|e| e.eq_ignore_ascii_case("iso")) {
+        return Err(CoreError::Invalid("la imagen debe tener extensión .iso".into()));
+    }
+    if !path.is_file() {
+        return Err(CoreError::Invalid(format!(
+            "la ISO «{}» no existe o no es un fichero",
+            s.chars().take(120).collect::<String>()
+        )));
+    }
+    Ok(s)
+}
+
+/// VRAM por defecto según el catálogo; 128 MB si el `ostype` no está en él.
+fn default_vram(ostype: &str) -> u32 {
+    vm_os_catalog()
+        .iter()
+        .find(|e| e.id == ostype)
+        .map(|e| e.defaults.vram_mb)
+        .unwrap_or(128)
+}
+
+/// Valida toda la petición antes de ejecutar cualquier comando. Los listados
+/// de ostypes y de VMs los aporta el llamador (leídos con `VBoxManage`).
+pub fn validate_create_request(
+    req: &CreateVmRequest,
+    available_ostypes: &[String],
+    existing_names: &[String],
+) -> Result<VmCreateParams> {
+    let name = vm_name_unique(&req.name, existing_names)?;
+    let ostype = vm_ostype(&req.ostype, available_ostypes)?;
+    let memory_mb = vm_memory_mb(req.memory_mb)?;
+    let cpus = vm_cpus(req.cpus)?;
+    let disk_mb = match (req.disk_mb, req.disk_gb) {
+        (Some(mb), _) => vm_disk_mb(mb)?,
+        (None, Some(gb)) => {
+            let mb = gb.checked_mul(1024).ok_or_else(|| CoreError::Invalid("el tamaño del disco es demasiado grande".into()))?;
+            vm_disk_mb(mb)?
+        }
+        (None, None) => return Err(CoreError::Invalid("indica el tamaño del disco en GB o en MB".into())),
+    };
+    let vram_mb = match req.vram_mb {
+        Some(v) => vm_vram_mb(v)?,
+        None => vm_vram_mb(default_vram(ostype))?,
+    };
+    let firmware = vm_firmware(&req.firmware)?;
+    let tpm = req.tpm;
+    if tpm && firmware != "efi" {
+        return Err(CoreError::Invalid("TPM 2.0 solo se puede usar con firmware EFI".into()));
+    }
+    let graphics = vm_graphics(&req.graphics)?;
+    let disk_bus = vm_disk_bus(&req.disk_bus)?;
+    let iso = match req.iso.as_deref() {
+        Some(s) if !s.is_empty() => Some(vm_iso(s)?.to_string()),
+        _ => None,
+    };
+    Ok(VmCreateParams {
+        name: name.to_string(),
+        ostype: ostype.to_string(),
+        memory_mb,
+        cpus,
+        disk_mb,
+        vram_mb,
+        firmware: firmware.to_string(),
+        tpm,
+        graphics: graphics.to_string(),
+        disk_bus: disk_bus.to_string(),
+        iso,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,5 +1345,170 @@ mod tests {
             edges: vec![Edge { from: "vm".into(), to: "web".into(), kind: EdgeKind::Network }],
         };
         assert!(disk_topology(&t).is_ok());
+    }
+
+    // ── C1: creación de VMs ──
+
+    #[test]
+    fn validates_vm_names() {
+        for name in ["Ubuntu", "Windows 10 (lab)", "a_b-c.d", "VM-01", "a"] {
+            assert_eq!(vm_name(name).unwrap(), name, "{name}");
+        }
+        for name in [
+            "",
+            "-vm",
+            " vm",
+            ".vm",
+            "a..b",
+            "a/b",
+            "a\\b",
+            "ñandú",
+            "vm;id",
+            "vm\n",
+            "vm ",
+            "vm.",
+            "c0ffee00-1111-2222-3333-444455556666",
+            &"a".repeat(65),
+        ] {
+            assert!(vm_name(name).is_err(), "{name:?}");
+        }
+        assert_eq!(vm_name(&"a".repeat(64)).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn vm_name_rejects_trailing_space_or_dot_and_uuid_shapes() {
+        for name in ["Ubuntu ", "Ubuntu.", " Equipo ", ".Equipo", "C0FFEE00-1111-2222-3333-444455556666"] {
+            assert!(vm_name(name).is_err(), "{name:?}");
+        }
+        // Un guion al final sigue siendo un nombre válido; solo se prohíbe el inicio.
+        assert!(vm_name("Equipo-").is_ok());
+        // Casi-UUID: no encaja en 8-4-4-4-12, así que es un nombre normal.
+        assert!(vm_name("c0ffee00-1111-2222-3333-44445555666").is_ok());
+    }
+
+    #[test]
+    fn vm_name_uniqueness_ignores_case() {
+        let existing = vec!["Ubuntu Server".into(), "win10".into()];
+        assert!(vm_name_unique("Nueva VM", &existing).is_ok());
+        assert!(vm_name_unique("ubuntu server", &existing).is_err());
+        assert!(vm_name_unique("WIN10", &existing).is_err());
+    }
+
+    #[test]
+    fn validates_ostype_against_a_real_trimmed_list() {
+        // Recorte real de `VBoxManage list ostypes`.
+        let out = r#"ID:          WindowsXP
+Description: Windows XP
+ID:          Windows11_64
+Description: Windows 11 (64-bit)
+ID:          Ubuntu_64
+Description: Ubuntu (64-bit)
+ID:          Other
+Description: Other/Unknown
+"#;
+        let ids: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("ID:").map(|v| v.trim().to_string()))
+            .collect();
+        assert_eq!(ids, ["WindowsXP", "Windows11_64", "Ubuntu_64", "Other"]);
+        assert_eq!(vm_ostype("Windows11_64", &ids).unwrap(), "Windows11_64");
+        assert!(vm_ostype("NoExiste", &ids).is_err());
+        assert!(vm_ostype("--evil", &ids).is_err());
+    }
+
+    #[test]
+    fn validates_create_ranges_and_enums() {
+        assert_eq!(vm_memory_mb(64).unwrap(), 64);
+        assert_eq!(vm_memory_mb(MAX_VM_MEMORY_MB).unwrap(), MAX_VM_MEMORY_MB);
+        for v in [0, 63, MAX_VM_MEMORY_MB + 1] {
+            assert!(vm_memory_mb(v).is_err(), "{v}");
+        }
+        assert_eq!(vm_cpus(1).unwrap(), 1);
+        assert_eq!(vm_cpus(MAX_VM_CPUS).unwrap(), MAX_VM_CPUS);
+        for v in [0, MAX_VM_CPUS + 1] {
+            assert!(vm_cpus(v).is_err(), "{v}");
+        }
+        assert_eq!(vm_disk_mb(1).unwrap(), 1);
+        assert_eq!(vm_disk_mb(MAX_VDI_SIZE_MB).unwrap(), MAX_VDI_SIZE_MB);
+        for v in [0, MAX_VDI_SIZE_MB + 1] {
+            assert!(vm_disk_mb(v).is_err(), "{v}");
+        }
+        assert_eq!(vm_vram_mb(1).unwrap(), 1);
+        assert_eq!(vm_vram_mb(MAX_VM_VRAM_MB).unwrap(), MAX_VM_VRAM_MB);
+        for v in [0, MAX_VM_VRAM_MB + 1] {
+            assert!(vm_vram_mb(v).is_err(), "{v}");
+        }
+        assert_eq!(vm_firmware("EFI").unwrap(), "efi");
+        assert_eq!(vm_graphics("VBoxSVGA").unwrap(), "vboxsvga");
+        assert_eq!(vm_disk_bus("SATA").unwrap(), "sata");
+        for bad_value in ["", "uefi", "--flag"] {
+            assert!(vm_firmware(bad_value).is_err());
+            assert!(vm_graphics(bad_value).is_err());
+            assert!(vm_disk_bus(bad_value).is_err());
+        }
+    }
+
+    #[test]
+    fn tpm_requires_efi() {
+        let mut req = CreateVmRequest {
+            name: "Win11".into(),
+            ostype: "Windows11_64".into(),
+            memory_mb: 4096,
+            cpus: 2,
+            disk_gb: Some(64),
+            disk_mb: None,
+            vram_mb: None,
+            firmware: "bios".into(),
+            tpm: true,
+            graphics: "vboxsvga".into(),
+            disk_bus: "sata".into(),
+            iso: None,
+        };
+        let available = vec!["Windows11_64".into()];
+        let err = validate_create_request(&req, &available, &[]).unwrap_err().to_string();
+        assert!(err.contains("TPM"), "{err}");
+
+        req.firmware = "efi".into();
+        let params = validate_create_request(&req, &available, &[]).unwrap();
+        assert!(params.tpm);
+        assert_eq!(params.firmware, "efi");
+        assert_eq!(params.disk_mb, 64 * 1024);
+        assert_eq!(params.vram_mb, 128); // viene del catálogo
+    }
+
+    #[test]
+    fn validates_iso_path() {
+        let dir = std::env::temp_dir();
+        let iso = dir.join(format!("vmlab-c1-{}-{}.ISO", std::process::id(), 1));
+        std::fs::write(&iso, b"ISO").unwrap();
+        let good = iso.to_string_lossy().into_owned();
+        assert_eq!(vm_iso(&good).unwrap(), good);
+
+        for bad_value in [
+            "discos/instalador.iso".to_string(), // relativa
+            dir.join("instalador.img").to_string_lossy().into_owned(),
+            format!("-{}", good),
+            dir.join(format!("vmlab-c1-{}-no-existe.iso", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert!(vm_iso(&bad_value).is_err(), "{bad_value:?}");
+        }
+        std::fs::remove_file(&iso).unwrap();
+    }
+
+    #[test]
+    fn every_catalog_default_passes_validation() {
+        for entry in vm_os_catalog() {
+            let d = entry.defaults;
+            assert!(vm_memory_mb(d.memory_mb).is_ok(), "{}", entry.label);
+            assert!(vm_cpus(d.cpus).is_ok(), "{}", entry.label);
+            assert!(vm_disk_mb(d.disk_gb * 1024).is_ok(), "{}", entry.label);
+            assert!(vm_vram_mb(d.vram_mb).is_ok(), "{}", entry.label);
+            assert!(vm_firmware(&d.firmware).is_ok(), "{}", entry.label);
+            assert!(vm_graphics(&d.graphics).is_ok(), "{}", entry.label);
+            assert!(vm_disk_bus(&d.disk_bus).is_ok(), "{}", entry.label);
+            assert!(!(d.tpm && d.firmware != "efi"), "{}", entry.label);
+        }
     }
 }

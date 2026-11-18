@@ -632,9 +632,225 @@ pub struct GuestHostsRequest {
     pub entries: Vec<GuestHostEntry>,
 }
 
+// ───────────────────── Creación de VMs ─────────────────────
+
+/// Valores por defecto de una entrada del catálogo de sistemas operativos.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmOsDefaults {
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub disk_gb: u32,
+    pub vram_mb: u32,
+    pub firmware: String,
+    pub tpm: bool,
+    pub graphics: String,
+    pub disk_bus: String,
+}
+
+/// Entrada del catálogo: `id` es el `ostype` exacto de VirtualBox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmOsEntry {
+    pub id: String,
+    pub label: String,
+    pub group: String,
+    pub defaults: VmOsDefaults,
+}
+
+/// Tipo de sistema operativo ofrecido por la versión instalada de VirtualBox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmOsType {
+    pub id: String,
+    pub description: String,
+    pub family: String,
+}
+
+/// Petición cerrada para crear una VM vacía. La ruta de la ISO la elige el
+/// usuario en el frontend, pero el backend la valida antes de tocar VirtualBox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVmRequest {
+    pub name: String,
+    pub ostype: String,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    /// Tamaño en GB. Se usa si no viene `diskMb`.
+    #[serde(default)]
+    pub disk_gb: Option<u32>,
+    /// Tamaño en MB. Tiene prioridad sobre `diskGb`.
+    #[serde(default)]
+    pub disk_mb: Option<u32>,
+    #[serde(default)]
+    pub vram_mb: Option<u32>,
+    pub firmware: String,
+    #[serde(default)]
+    pub tpm: bool,
+    pub graphics: String,
+    pub disk_bus: String,
+    #[serde(default)]
+    pub iso: Option<String>,
+}
+
+/// Parámetros ya validados: solo se usan para construir argumentos de `VBoxManage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmCreateParams {
+    pub name: String,
+    pub ostype: String,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub disk_mb: u32,
+    pub vram_mb: u32,
+    pub firmware: String,
+    pub tpm: bool,
+    pub graphics: String,
+    pub disk_bus: String,
+    pub iso: Option<String>,
+}
+
+/// Resultado de la creación. `cfgFile` y `vdiPath` son rutas reales leídas de
+/// VirtualBox, no supuestas por el frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedVm {
+    pub uuid: String,
+    pub name: String,
+    pub cfg_file: String,
+    pub vdi_path: String,
+}
+
+fn os_defaults(
+    memory_mb: u32,
+    cpus: u32,
+    disk_gb: u32,
+    vram_mb: u32,
+    firmware: &str,
+    tpm: bool,
+    graphics: &str,
+    disk_bus: &str,
+) -> VmOsDefaults {
+    VmOsDefaults {
+        memory_mb,
+        cpus,
+        disk_gb,
+        vram_mb,
+        firmware: firmware.into(),
+        tpm,
+        graphics: graphics.into(),
+        disk_bus: disk_bus.into(),
+    }
+}
+
+fn os_entry(id: &str, label: &str, group: &str, defaults: VmOsDefaults) -> VmOsEntry {
+    VmOsEntry {
+        id: id.into(),
+        label: label.into(),
+        group: group.into(),
+        defaults,
+    }
+}
+
+/// Catálogo puro y determinista. La VRAM es de 16 MB para XP y de 128 MB para
+/// Windows 7 en adelante y para las distribuciones Linux gráficas.
+pub fn vm_os_catalog() -> Vec<VmOsEntry> {
+    vec![
+        os_entry("WindowsXP", "Windows XP", "windows", os_defaults(1024, 1, 20, 16, "bios", false, "vboxvga", "ide")),
+        os_entry("Windows7_64", "Windows 7 (64 bits)", "windows", os_defaults(2048, 2, 40, 128, "bios", false, "vboxvga", "sata")),
+        os_entry("Windows81_64", "Windows 8.1 (64 bits)", "windows", os_defaults(4096, 2, 50, 128, "bios", false, "vboxsvga", "sata")),
+        os_entry("Windows10_64", "Windows 10 (64 bits)", "windows", os_defaults(4096, 2, 50, 128, "bios", false, "vboxsvga", "sata")),
+        os_entry("Windows11_64", "Windows 11 (64 bits)", "windows", os_defaults(4096, 2, 64, 128, "efi", true, "vboxsvga", "sata")),
+        os_entry("Ubuntu_64", "Ubuntu", "linux", os_defaults(4096, 2, 25, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("Ubuntu_64", "Pop!_OS", "linux", os_defaults(4096, 2, 25, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("Debian_64", "Debian", "linux", os_defaults(2048, 2, 20, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("Debian_64", "Kali Linux", "linux", os_defaults(2048, 2, 20, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("ArchLinux_64", "Arch Linux", "linux", os_defaults(4096, 2, 25, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("Fedora_64", "Fedora", "linux", os_defaults(4096, 2, 25, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("openSUSE_64", "openSUSE", "linux", os_defaults(2048, 2, 25, 128, "bios", false, "vmsvga", "sata")),
+        os_entry("Linux26_64", "Linux genérico", "linux", os_defaults(2048, 2, 20, 128, "bios", false, "vmsvga", "sata")),
+    ]
+}
+
+/// Filtra el catálogo con los `ostype` que realmente ofrece esta instalación.
+pub fn available_os_catalog(ids: &[String]) -> Vec<VmOsEntry> {
+    let ids: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    vm_os_catalog()
+        .into_iter()
+        .filter(|e| ids.contains(e.id.as_str()))
+        .collect()
+}
+
+/// Familia aproximada de un `ostype` de `list ostypes` (para el selector «Otro…»).
+pub fn os_family(id: &str, description: &str) -> String {
+    let text = format!("{id} {description}").to_ascii_lowercase();
+    if text.contains("windows") {
+        return "windows".into();
+    }
+    const LINUX: &[&str] = &[
+        "linux", "ubuntu", "debian", "fedora", "redhat", "centos", "oracle", "suse", "arch",
+        "kali", "mint", "gentoo", "alma", "rocky",
+    ];
+    if LINUX.iter().any(|k| text.contains(k)) {
+        return "linux".into();
+    }
+    "other".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_catalog_has_the_expected_defaults_and_aliases() {
+        let catalog = vm_os_catalog();
+        let xp = catalog.iter().find(|e| e.label == "Windows XP").unwrap();
+        assert_eq!(xp.id, "WindowsXP");
+        assert_eq!(xp.group, "windows");
+        assert_eq!((xp.defaults.cpus, xp.defaults.memory_mb, xp.defaults.disk_gb), (1, 1024, 20));
+        assert_eq!(xp.defaults.firmware, "bios");
+        assert_eq!(xp.defaults.disk_bus, "ide");
+        assert_eq!(xp.defaults.graphics, "vboxvga");
+        assert!(xp.defaults.vram_mb >= 16 && xp.defaults.vram_mb <= 32);
+
+        let w11 = catalog.iter().find(|e| e.label == "Windows 11 (64 bits)").unwrap();
+        assert_eq!(w11.id, "Windows11_64");
+        assert_eq!(w11.defaults.firmware, "efi");
+        assert!(w11.defaults.tpm);
+        assert_eq!(w11.defaults.disk_bus, "sata");
+        assert_eq!(w11.defaults.disk_gb, 64);
+
+        let pop = catalog.iter().find(|e| e.label == "Pop!_OS").unwrap();
+        assert_eq!(pop.id, "Ubuntu_64");
+        let kali = catalog.iter().find(|e| e.label == "Kali Linux").unwrap();
+        assert_eq!(kali.id, "Debian_64");
+        let generic = catalog.iter().find(|e| e.label == "Linux genérico").unwrap();
+        assert_eq!(generic.id, "Linux26_64");
+
+        for entry in &catalog {
+            assert!(entry.defaults.vram_mb >= 16, "{}", entry.label);
+            assert!(matches!(entry.group.as_str(), "windows" | "linux"));
+        }
+    }
+
+    #[test]
+    fn catalog_is_filtered_by_the_installed_ostypes() {
+        let ids = vec!["WindowsXP".into(), "Windows11_64".into(), "Ubuntu_64".into()];
+        let filtered = available_os_catalog(&ids);
+        let labels: Vec<&str> = filtered.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"Windows XP"));
+        assert!(labels.contains(&"Windows 11 (64 bits)"));
+        assert!(labels.contains(&"Ubuntu"));
+        assert!(labels.contains(&"Pop!_OS")); // mismo id, etiqueta distinta
+        assert!(!labels.contains(&"Windows 10 (64 bits)"));
+        assert!(available_os_catalog(&[]).is_empty());
+    }
+
+    #[test]
+    fn os_family_comes_from_the_ostype_or_description() {
+        assert_eq!(os_family("Windows7_64", "Windows 7 (64-bit)"), "windows");
+        assert_eq!(os_family("Ubuntu_64", "Ubuntu (64-bit)"), "linux");
+        assert_eq!(os_family("Other", "Other/Unknown"), "other");
+    }
 
     #[test]
     fn node_issue_serializes_with_stable_camel_case_codes() {
