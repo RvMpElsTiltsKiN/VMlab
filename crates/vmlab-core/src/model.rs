@@ -665,6 +665,9 @@ pub struct VmOsType {
     pub id: String,
     pub description: String,
     pub family: String,
+    /// Texto de la línea `Architecture:` (`x86`, `x86 (64-bit)`, `ARMv8…`).
+    /// Vacío en la salida antigua de VirtualBox, que no lo informaba.
+    pub architecture: String,
 }
 
 /// Petición cerrada para crear una VM vacía. La ruta de la ISO la elige el
@@ -718,6 +721,23 @@ pub struct CreatedVm {
     pub name: String,
     pub cfg_file: String,
     pub vdi_path: String,
+}
+
+/// Petición para quitar una VM de VirtualBox. Solo se acepta su UUID: nunca un
+/// nombre, para no borrar la máquina equivocada por un error de escritura.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmDeleteRequest {
+    pub uuid: String,
+    pub delete_files: bool,
+}
+
+/// Resultado de `vm_delete`: siempre informa de los avisos de protección de datos.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmDeleteResult {
+    pub removed: bool,
+    pub warnings: Vec<String>,
 }
 
 fn os_defaults(

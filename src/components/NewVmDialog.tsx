@@ -1,9 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { technicalText, useT } from '../i18n';
 import { ipc, isTauri } from '../lib/ipc';
+import {
+  OTHER_OS,
+  buildCreateVmRequest,
+  catalogChoice,
+  effectiveAdvanced,
+  entryFromChoice,
+  genericVmDefaults,
+  machineFromCreatedVm,
+  ostypeFromChoice,
+  recommendedAdvanced,
+} from '../lib/vmRequest';
 import { useLab } from '../store/useLab';
 import type {
-  CreateVmRequest,
   VmDiskBus,
   VmFirmware,
   VmGraphics,
@@ -12,7 +22,6 @@ import type {
   VmOsType,
 } from '../types';
 
-const OTHER_OS = 'other';
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const MAX_DISK_GB = Math.floor(2_000_000 / 1024);
 const SETTING_KEYS = [
@@ -42,20 +51,6 @@ function validVmName(name: string): boolean {
     && /^[A-Za-z0-9 ._()-]+$/.test(name);
 }
 
-/** Valores genéricos para un `ostype` que no está en el catálogo. */
-function genericDefaults(family: VmOsType['family']): VmOsDefaults {
-  return {
-    memoryMb: 2048,
-    cpus: 2,
-    diskGb: 20,
-    vramMb: 128,
-    firmware: 'bios',
-    tpm: false,
-    graphics: family === 'windows' ? 'vboxsvga' : 'vmsvga',
-    diskBus: 'sata',
-  };
-}
-
 function inRange(value: number, min: number, max: number): boolean {
   return Number.isInteger(value) && value >= min && value <= max;
 }
@@ -71,7 +66,8 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState('Nueva VM');
   const [catalog, setCatalog] = useState<VmOsEntry[]>([]);
   const [osChoice, setOsChoice] = useState('');
-  const [ostype, setOstype] = useState('');
+  // Solo para «Otro sistema…»: el id real de VirtualBox elegido en ese listado.
+  const [otherOstype, setOtherOstype] = useState('');
   const [ostypes, setOstypes] = useState<VmOsType[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -92,32 +88,42 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
   const [addToCanvas, setAddToCanvas] = useState(true);
   const [creating, setCreating] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [expertMode, setExpertMode] = useState(false);
+  const [recommended, setRecommended] = useState<VmOsDefaults>(() => genericVmDefaults('other'));
+  const [revertedNotice, setRevertedNotice] = useState(false);
 
   // Los campos que el usuario ha tocado se conservan al cambiar de sistema.
   const touchedRef = useRef<Touched>({});
-  const firmwareRef = useRef<VmFirmware>('bios');
   const catalogRequestedRef = useRef(false);
   const ostypesRequestedRef = useRef(false);
+
+  // Única fuente de verdad: la selección visible. El catálogo se resuelve por
+  // índice (hay ids repetidos: Ubuntu/Pop!_OS y Debian/Kali).
+  const ostype = ostypeFromChoice(catalog, osChoice, otherOstype);
 
   const mark = (key: SettingKey) => {
     touchedRef.current[key] = true;
   };
 
+  const applyAdvancedDefaults = useCallback((defaults: VmOsDefaults) => {
+    const next = recommendedAdvanced(defaults);
+    setVramMb(next.vramMb);
+    setFirmware(next.firmware);
+    setTpm(next.tpm);
+    setGraphics(next.graphics);
+    setDiskBus(next.diskBus);
+  }, []);
+
+  // Memoria/CPU/disco conservan lo editado; los cinco ajustes delicados siguen
+  // siempre al sistema elegido mientras el modo experto esté desactivado.
   const applyDefaults = useCallback((defaults: VmOsDefaults) => {
     const touched = touchedRef.current;
-    const nextFirmware = touched.firmware ? firmwareRef.current : defaults.firmware;
     if (!touched.memoryMb) setMemoryMb(defaults.memoryMb);
     if (!touched.cpus) setCpus(defaults.cpus);
     if (!touched.diskGb) setDiskGb(defaults.diskGb);
-    if (!touched.vramMb) setVramMb(defaults.vramMb);
-    if (!touched.firmware) {
-      firmwareRef.current = defaults.firmware;
-      setFirmware(defaults.firmware);
-    }
-    if (!touched.tpm) setTpm(defaults.tpm && nextFirmware === 'efi');
-    if (!touched.graphics) setGraphics(defaults.graphics);
-    if (!touched.diskBus) setDiskBus(defaults.diskBus);
-  }, []);
+    setRecommended({ ...defaults });
+    if (!expertMode) applyAdvancedDefaults(defaults);
+  }, [applyAdvancedDefaults, expertMode]);
 
   const loadOstypes = useCallback(async () => {
     if (ostypesRequestedRef.current) return;
@@ -127,12 +133,14 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
     try {
       setOstypes(await ipc.vmListOstypes());
     } catch (e) {
-      setOstypesError(technicalText(errText(e)));
+      const detail = errText(e);
+      setOstypesError(detail);
+      toast('error', technicalText(t('newvm.ostypesError', { detail })));
       ostypesRequestedRef.current = false;
     } finally {
       setOstypesLoading(false);
     }
-  }, []);
+  }, [t, toast]);
 
   const loadCatalog = useCallback(async () => {
     if (catalogRequestedRef.current) return;
@@ -143,22 +151,23 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
       const list = await ipc.vmOsCatalog();
       setCatalog(list);
       if (list.length > 0) {
-        setOsChoice('cat-0');
-        setOstype(list[0].id);
+        setOsChoice(catalogChoice(0));
         applyDefaults(list[0].defaults);
       } else {
         setOsChoice(OTHER_OS);
-        setOstype('');
-        applyDefaults(genericDefaults('other'));
+        setOtherOstype('');
+        applyDefaults(genericVmDefaults('other'));
         void loadOstypes();
       }
     } catch (e) {
-      setCatalogError(technicalText(errText(e)));
+      const detail = errText(e);
+      setCatalogError(detail);
+      toast('error', technicalText(t('newvm.catalogError', { detail })));
       catalogRequestedRef.current = false;
     } finally {
       setCatalogLoading(false);
     }
-  }, [applyDefaults, loadOstypes]);
+  }, [applyDefaults, loadOstypes, t, toast]);
 
   useEffect(() => {
     void loadCatalog();
@@ -180,33 +189,48 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
     setOsChoice(value);
     setSubmitError(null);
     if (value === OTHER_OS) {
-      setOstype('');
-      applyDefaults(genericDefaults('other'));
+      setOtherOstype('');
+      applyDefaults(genericVmDefaults('other'));
       void loadOstypes();
       return;
     }
-    const entry = catalog[Number(value)];
+    const entry = entryFromChoice(catalog, value);
     if (!entry) return;
-    setOstype(entry.id);
+    // El ostype se deriva de `osChoice`; aquí solo se actualizan los defaults
+    // de los campos no editados a mano.
     applyDefaults(entry.defaults);
   };
 
   const chooseOstype = (value: string) => {
-    setOstype(value);
+    setOtherOstype(value);
     setSubmitError(null);
     const info = ostypes.find((entry) => entry.id === value);
-    if (info) applyDefaults(genericDefaults(info.family));
+    if (info) applyDefaults(genericVmDefaults(info.family));
   };
 
   const changeFirmware = (value: VmFirmware) => {
     mark('firmware');
-    firmwareRef.current = value;
     setFirmware(value);
-    if (value !== 'efi') {
-      mark('tpm');
-      setTpm(false);
-    }
+    // No se limpia la TPM: el aviso contextual avisa de que EFI es obligatoria
+    // y la casilla queda deshabilitada. `effectiveAdvanced` no la enviará.
   };
+
+  const restoreRecommended = () => {
+    applyAdvancedDefaults(recommended);
+    setRevertedNotice(true);
+  };
+
+  const toggleExpert = (checked: boolean) => {
+    setExpertMode(checked);
+    if (!checked) restoreRecommended();
+    else setRevertedNotice(false);
+  };
+
+  useEffect(() => {
+    if (!revertedNotice) return;
+    const timer = setTimeout(() => setRevertedNotice(false), 3500);
+    return () => clearTimeout(timer);
+  }, [revertedNotice]);
 
   const chooseIso = async () => {
     if (isoBusy || creating) return;
@@ -247,6 +271,33 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
       ? t('newvm.xpNotice')
       : null;
 
+  const advanced = useMemo(() => effectiveAdvanced(recommended, expertMode, {
+    vramMb, firmware, tpm, graphics, diskBus,
+  }), [recommended, expertMode, vramMb, firmware, tpm, graphics, diskBus]);
+
+  const recommendedValues = recommendedAdvanced(recommended);
+  const advancedDiffers = (
+    advanced.vramMb !== recommendedValues.vramMb
+    || advanced.firmware !== recommendedValues.firmware
+    || advanced.graphics !== recommendedValues.graphics
+    || advanced.diskBus !== recommendedValues.diskBus
+  );
+  const shownFirmware = expertMode ? firmware : advanced.firmware;
+  const shownTpm = expertMode ? tpm : advanced.tpm;
+  const showAdvancedWarnings = expertMode || advancedDiffers;
+
+  const advancedWarnings: string[] = [];
+  if (showAdvancedWarnings && shownFirmware === 'efi' && ostype !== 'Windows11_64') {
+    advancedWarnings.push(t('newvm.warnEfiNonWin11'));
+  }
+  if (showAdvancedWarnings && ostype === 'Windows11_64'
+    && (shownFirmware !== 'efi' || !shownTpm)) {
+    advancedWarnings.push(t('newvm.warnWin11NeedsEfiTpm'));
+  }
+  if (showAdvancedWarnings && shownTpm && shownFirmware !== 'efi') {
+    advancedWarnings.push(t('newvm.warnTpmNeedsEfi'));
+  }
+
   const submit = async () => {
     if (creating) return;
     if (validationError) {
@@ -255,26 +306,28 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
     }
     setCreating(true);
     setSubmitError(null);
-    const request: CreateVmRequest = {
-      name,
-      ostype,
-      memoryMb,
-      cpus,
-      diskGb,
-      vramMb,
-      firmware,
-      tpm: firmware === 'efi' && tpm,
-      graphics,
-      diskBus,
-      ...(isoPath ? { iso: isoPath } : {}),
-    };
     try {
+      const request = buildCreateVmRequest({
+        name,
+        choice: osChoice,
+        otherOstype,
+        memoryMb,
+        cpus,
+        diskGb,
+        vramMb: advanced.vramMb,
+        firmware: advanced.firmware,
+        tpm: advanced.tpm,
+        graphics: advanced.graphics,
+        diskBus: advanced.diskBus,
+        isoPath,
+        expertMode,
+        recommended,
+      }, catalog);
       const created = await ipc.vmCreate(request);
       await refreshInventory();
       if (addToCanvas) {
-        // Igual que las máquinas de la lista: `label` es el nombre real y
-        // `target` el UUID devuelto por VirtualBox.
-        addMachine({ kind: 'vbox', label: created.name, target: created.uuid });
+        // `label` es el nombre real de la VM, nunca la etiqueta del SO elegido.
+        addMachine(machineFromCreatedVm(created));
       }
       toast('ok', t('newvm.success', { name: created.name }));
       setCreating(false);
@@ -335,10 +388,10 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
 
         {catalogLoading && <p className="hint">{t('newvm.loadingCatalog')}</p>}
         {catalogError && (
-          <>
-            <p className="hint err">{catalogError}</p>
+          <div className="newvm-load-error">
+            <span className="hint err">{t('newvm.loadError')}</span>
             <button className="btn" onClick={() => void loadCatalog()}>{t('newvm.retry')}</button>
-          </>
+          </div>
         )}
         {!catalogLoading && !catalogError && catalog.length === 0 && (
           <p className="hint">{t('newvm.noCatalog')}</p>
@@ -359,12 +412,27 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
             </select>
             {ostypesLoading && <span className="hint">{t('newvm.loadingOstypes')}</span>}
             {ostypesError && (
-              <>
-                <span className="hint err">{ostypesError}</span>
+              <div className="newvm-load-error">
+                <span className="hint err">{t('newvm.loadError')}</span>
                 <button className="btn" onClick={() => void loadOstypes()}>{t('newvm.retry')}</button>
-              </>
+              </div>
             )}
           </label>
+        )}
+
+        {ostype && <p className="hint newvm-ostype">{t('newvm.vboxType', { ostype })}</p>}
+        {ostype && (
+          <p className="hint newvm-summary">
+            {t('newvm.summary', {
+              ostype,
+              firmware: advanced.firmware === 'efi' ? t('newvm.firmwareEfi') : t('newvm.firmwareBios'),
+              tpm: advanced.tpm ? t('newvm.yes') : t('newvm.no'),
+              graphics: advanced.graphics === 'vboxvga'
+                ? 'VBoxVGA'
+                : advanced.graphics === 'vboxsvga' ? 'VBoxSVGA' : 'VMSVGA',
+              bus: advanced.diskBus.toUpperCase(),
+            })}
+          </p>
         )}
 
         {notice && <p className="hint warn">{notice}</p>}
@@ -389,15 +457,41 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
 
         <details className="newvm-advanced">
           <summary>{t('newvm.advanced')}</summary>
+          <label className="field check newvm-expert">
+            <input
+              type="checkbox"
+              checked={expertMode}
+              disabled={creating}
+              onChange={(event) => toggleExpert(event.currentTarget.checked)}
+            />
+            {t('newvm.expertMode')}
+          </label>
+          {!expertMode && <p className="hint">{t('newvm.recommendedHint')}</p>}
+          {expertMode && (
+            <>
+              <p className="hint warn">{t('newvm.expertWarning')}</p>
+              <button type="button" className="btn" disabled={creating} onClick={restoreRecommended}>
+                {t('newvm.restoreRecommended')}
+              </button>
+            </>
+          )}
+          {revertedNotice && <p className="hint warn" role="status">{t('newvm.revertedNotice')}</p>}
+
           <div className="grid2">
             <label className="field">
-              {t('newvm.vram')}
-              <input type="number" min={1} max={256} value={vramMb} disabled={creating}
+              <span className="field-label">
+                {t('newvm.vram')}
+                {!expertMode && <em className="newvm-recommended">{t('newvm.recommended')}</em>}
+              </span>
+              <input type="number" min={1} max={256} value={vramMb} disabled={creating} readOnly={!expertMode}
                 onChange={(event) => { mark('vramMb'); setVramMb(numberValue(event.currentTarget.value)); }} />
             </label>
             <label className="field">
-              {t('newvm.firmware')}
-              <select value={firmware} disabled={creating}
+              <span className="field-label">
+                {t('newvm.firmware')}
+                {!expertMode && <em className="newvm-recommended">{t('newvm.recommended')}</em>}
+              </span>
+              <select value={firmware} disabled={creating || !expertMode}
                 onChange={(event) => changeFirmware(event.currentTarget.value as VmFirmware)}>
                 <option value="bios">{t('newvm.firmwareBios')}</option>
                 <option value="efi">{t('newvm.firmwareEfi')}</option>
@@ -406,15 +500,19 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
             <label className="field check">
               <input
                 type="checkbox"
-                checked={firmware === 'efi' && tpm}
-                disabled={creating || firmware !== 'efi'}
+                checked={tpm}
+                disabled={creating || !expertMode || firmware !== 'efi'}
                 onChange={(event) => { mark('tpm'); setTpm(event.currentTarget.checked); }}
               />
               {t('newvm.tpm')}
+              {!expertMode && <em className="newvm-recommended">{t('newvm.recommended')}</em>}
             </label>
             <label className="field">
-              {t('newvm.graphics')}
-              <select value={graphics} disabled={creating}
+              <span className="field-label">
+                {t('newvm.graphics')}
+                {!expertMode && <em className="newvm-recommended">{t('newvm.recommended')}</em>}
+              </span>
+              <select value={graphics} disabled={creating || !expertMode}
                 onChange={(event) => { mark('graphics'); setGraphics(event.currentTarget.value as VmGraphics); }}>
                 <option value="vboxvga">VBoxVGA</option>
                 <option value="vboxsvga">VBoxSVGA</option>
@@ -422,15 +520,19 @@ export function NewVmDialog({ onClose }: { onClose: () => void }) {
               </select>
             </label>
             <label className="field">
-              {t('newvm.diskBus')}
-              <select value={diskBus} disabled={creating}
+              <span className="field-label">
+                {t('newvm.diskBus')}
+                {!expertMode && <em className="newvm-recommended">{t('newvm.recommended')}</em>}
+              </span>
+              <select value={diskBus} disabled={creating || !expertMode}
                 onChange={(event) => { mark('diskBus'); setDiskBus(event.currentTarget.value as VmDiskBus); }}>
                 <option value="ide">IDE</option>
                 <option value="sata">SATA</option>
               </select>
             </label>
           </div>
-          <p className="hint">{t('newvm.tpmHint')}</p>
+          {advancedWarnings.map((warning) => <p key={warning} className="hint warn">{warning}</p>)}
+          {expertMode && <p className="hint">{t('newvm.tpmHint')}</p>}
         </details>
 
         <div className="field newvm-iso">

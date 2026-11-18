@@ -224,6 +224,8 @@ export interface VmOsType {
   id: string;
   description: string;
   family: 'windows' | 'linux' | 'other';
+  /** Texto de `Architecture:` de VBoxManage (`x86`, `x86 (64-bit)`, `ARMv8…`). */
+  architecture: string;
 }
 
 /** Petición enviada a `vm_create`. La ISO es una ruta absoluta elegida por el usuario. */
@@ -247,6 +249,18 @@ export interface CreatedVm {
   name: string;
   cfgFile: string;
   vdiPath: string;
+}
+
+/** Petición de `vm_delete`. Solo UUID estricto: nunca un nombre de VM. */
+export interface VmDeleteRequest {
+  uuid: string;
+  deleteFiles: boolean;
+}
+
+/** Resultado de `vm_delete`, con avisos de discos de datos conservados. */
+export interface VmDeleteResult {
+  removed: boolean;
+  warnings: string[];
 }
 
 export interface Snapshot {

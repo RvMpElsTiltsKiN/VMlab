@@ -37,6 +37,17 @@ pub fn docker_image(s: &str) -> Result<&str> {
     if ok { Ok(s) } else { bad("imagen Docker no válida", s) }
 }
 
+/// UUID estricto de una VM de VirtualBox: `8-4-4-4-12` hexadecimales.
+/// Nunca admite nombres: borrar por nombre podría afectar a otra máquina.
+pub fn vm_uuid(s: &str) -> Result<&str> {
+    let bytes = s.as_bytes();
+    let separators = [8usize, 13, 18, 23];
+    let ok = bytes.len() == 36
+        && separators.iter().all(|&i| bytes[i] == b'-')
+        && bytes.iter().enumerate().all(|(i, c)| separators.contains(&i) || c.is_ascii_hexdigit());
+    if ok { Ok(s) } else { bad("UUID de máquina virtual no válido", s) }
+}
+
 /// Nombre o UUID de una VM de VirtualBox. Los nombres pueden llevar espacios y acentos.
 pub fn vbox_target(s: &str) -> Result<&str> {
     let ok = !s.is_empty()
@@ -863,6 +874,26 @@ pub fn validate_create_request(
 mod tests {
     use super::*;
     use crate::model::{DiskMount, DiskSpec, Edge, EnvVar, PortMap, PortProto};
+
+    #[test]
+    fn validates_vm_uuid() {
+        assert!(vm_uuid("c0ffee00-1111-2222-3333-444455556666").is_ok());
+        assert!(vm_uuid("00000000-0000-0000-0000-000000000000").is_ok());
+        assert!(vm_uuid("C0FFEE00-1111-2222-3333-444455556666").is_ok());
+
+        for bad_uuid in [
+            "Mi VM",
+            "-c0ffee00-1111-2222-3333-444455556666",
+            "c0ffee00111122223333444455556666",
+            "c0ffee00-1111-2222-3333-44445555666",
+            "c0ffee00-1111-2222-3333-4444555566666",
+            "g0ffee00-1111-2222-3333-444455556666",
+            "c0ffee00_1111-2222-3333-444455556666",
+            "",
+        ] {
+            assert!(vm_uuid(bad_uuid).is_err(), "{bad_uuid} debería ser inválido");
+        }
+    }
 
     #[test]
     fn validates_docker_run_options() {

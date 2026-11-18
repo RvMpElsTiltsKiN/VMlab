@@ -32,6 +32,8 @@ import type {
   Snapshot,
   ToolsInfo,
   TopologyPayload,
+  VmDeleteRequest,
+  VmDeleteResult,
   VmOsEntry,
   VmOsType,
 } from '../types';
@@ -53,6 +55,8 @@ const real = {
   vmOsCatalog: () => invoke<VmOsEntry[]>('vm_os_catalog'),
   vmListOstypes: () => invoke<VmOsType[]>('vm_list_ostypes'),
   vmCreate: (request: CreateVmRequest) => invoke<CreatedVm>('vm_create', { request }),
+  vmDelete: (request: VmDeleteRequest) =>
+    invoke<VmDeleteResult>('vm_delete', { uuid: request.uuid, deleteFiles: request.deleteFiles }),
   startDocker: () => invoke<DockerStartResult>('docker_start'),
   refreshStatus: () => invoke<Snapshot>('refresh_status'),
   machineAction: (kind: MachineKind, target: string, image: string | undefined, options: DockerRunOptions | undefined, action: Action) =>
@@ -105,8 +109,8 @@ const real = {
 // ───────────────────────── Simulador (solo navegador) ─────────────────────────
 
 const mockStates: Snapshot['states'] = {
-  'vbox:11111111-aaaa': 'running',
-  'vbox:22222222-bbbb': 'stopped',
+  'vbox:11111111-aaaa-1111-aaaa-111111111111': 'running',
+  'vbox:22222222-bbbb-2222-bbbb-222222222222': 'stopped',
   'docker:web': 'running',
   'docker:db': 'stopped',
 };
@@ -131,15 +135,18 @@ const MOCK_VM_OSTYPES: VmOsType[] = [
     id,
     description: MOCK_VM_OS_CATALOG.find((e) => e.id === id)!.label,
     family: MOCK_VM_OS_CATALOG.find((e) => e.id === id)!.group,
+    architecture: id.endsWith('_64') ? 'x86 (64-bit)' : 'x86',
   })),
-  { id: 'Windows2019_64', description: 'Windows Server 2019 (64-bit)', family: 'windows' },
-  { id: 'FreeBSD_64', description: 'FreeBSD (64-bit)', family: 'other' },
-  { id: 'DOS', description: 'DOS', family: 'other' },
+  { id: 'Windows2019_64', description: 'Windows Server 2019 (64-bit)', family: 'windows', architecture: 'x86 (64-bit)' },
+  { id: 'FreeBSD_64', description: 'FreeBSD (64-bit)', family: 'other', architecture: 'x86 (64-bit)' },
+  { id: 'DOS', description: 'DOS', family: 'other', architecture: 'x86' },
+  // El backend excluye ARM del selector «Otro sistema…»; el mock hace lo mismo.
+  { id: 'Other_arm64', description: 'Other/Unknown (ARM 64-bit)', family: 'other', architecture: 'ARMv8 (64-bit)' },
 ];
 
 const mockBaseVms: MachineInfo[] = [
-  { kind: 'vbox', target: '11111111-aaaa', label: 'Kali Linux', state: mockStates['vbox:11111111-aaaa'], image: null, guestAdditions: { version: '7.2.22', known: true } },
-  { kind: 'vbox', target: '22222222-bbbb', label: 'Windows Server 2022', state: mockStates['vbox:22222222-bbbb'], image: null, guestAdditions: { version: null, known: true } },
+  { kind: 'vbox', target: '11111111-aaaa-1111-aaaa-111111111111', label: 'Kali Linux', state: mockStates['vbox:11111111-aaaa-1111-aaaa-111111111111'], image: null, guestAdditions: { version: '7.2.22', known: true } },
+  { kind: 'vbox', target: '22222222-bbbb-2222-bbbb-222222222222', label: 'Windows Server 2022', state: mockStates['vbox:22222222-bbbb-2222-bbbb-222222222222'], image: null, guestAdditions: { version: null, known: true } },
 ];
 const mockCreatedVms: MachineInfo[] = [];
 let mockVmSeq = 0;
@@ -238,7 +245,9 @@ const mock: typeof real = {
   },
   vmListOstypes: async () => {
     await delay(150);
-    return MOCK_VM_OSTYPES.map((entry) => ({ ...entry }));
+    return MOCK_VM_OSTYPES
+      .filter((entry) => !/arm/i.test(entry.architecture))
+      .map((entry) => ({ ...entry }));
   },
   vmCreate: async (request) => {
     await delay(900);
@@ -264,6 +273,23 @@ const mock: typeof real = {
       cfgFile: `${folder}/${name}.vbox`,
       vdiPath: `${folder}/${name}.vdi`,
     };
+  },
+  vmDelete: async (request) => {
+    await delay(600);
+    const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_RE.test(request.uuid)) {
+      throw new Error(t('mock.invalidVmUuid'));
+    }
+    const inBase = mockBaseVms.findIndex((vm) => vm.target === request.uuid);
+    const inCreated = mockCreatedVms.findIndex((vm) => vm.target === request.uuid);
+    const index = inBase >= 0 ? inBase : inCreated;
+    if (index < 0) {
+      throw new Error(t('toast.vmMissing', { name: request.uuid }));
+    }
+    const list = inBase >= 0 ? mockBaseVms : mockCreatedVms;
+    const [removed] = list.splice(index, 1);
+    delete mockStates[mockKey('vbox', removed.target)];
+    return { removed: true, warnings: [] };
   },
   startDocker: async () => {
     await delay(900);
@@ -460,7 +486,7 @@ const mock: typeof real = {
   networkProbe: async (nodes) => {
     await delay(250);
     return nodes.map((n) => {
-      const host = n.target === '11111111-aaaa' || n.target === 'web' ? 11 : 12;
+      const host = n.target === '11111111-aaaa-1111-aaaa-111111111111' || n.target === 'web' ? 11 : 12;
       return n.kind === 'vbox'
         ? {
             kind: n.kind,
@@ -576,7 +602,7 @@ const mock: typeof real = {
       attached: true,
       started: true,
       alreadyRunning: false,
-      os: target === '22222222-bbbb' ? 'windows' : 'linux',
+      os: target === '22222222-bbbb-2222-bbbb-222222222222' ? 'windows' : 'linux',
       warnings: [],
     };
   },

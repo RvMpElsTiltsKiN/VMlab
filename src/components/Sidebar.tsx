@@ -6,7 +6,8 @@ import { useLab } from '../store/useLab';
 import type { GuestAdditionsPrep, MachineInfo, PaletteItem } from '../types';
 import { DRAG_MIME } from './Canvas';
 import { NewVmDialog } from './NewVmDialog';
-import { CheckIcon, ContainerIcon, CubeIcon, DiskIcon, PlayIcon, PlusIcon, RefreshIcon, WarnIcon } from './icons';
+import { DeleteVmDialog } from './DeleteVmDialog';
+import { CheckIcon, ContainerIcon, CubeIcon, DiskIcon, PlayIcon, PlusIcon, RefreshIcon, TrashIcon, WarnIcon } from './icons';
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,199}$/;
@@ -105,7 +106,7 @@ function GuestAdditions({ m }: { m: MachineInfo }) {
   );
 }
 
-function Item({ m, used }: { m: MachineInfo; used: boolean }) {
+function Item({ m, used, onDelete }: { m: MachineInfo; used: boolean; onDelete: (vm: MachineInfo) => void }) {
   const t = useT();
   const addMachine = useLab((s) => s.addMachine);
   const item: PaletteItem = { kind: m.kind, label: m.label, target: m.target, image: m.image ?? undefined };
@@ -128,10 +129,23 @@ function Item({ m, used }: { m: MachineInfo; used: boolean }) {
       title={t('sidebar.dragItemHint')}>
       <span className="pal-icon">{m.kind === 'vbox' ? <CubeIcon /> : <ContainerIcon />}</span>
       <span className="pal-text">
-        <span className="pal-name">{m.label}</span>
-        <span className="pal-sub">{m.image ?? m.target.slice(0, 13)}</span>
+        <span className="pal-name" title={m.label}>{m.label}</span>
+        <span className="pal-sub" title={m.image ?? m.target}>{m.image ?? m.target.slice(0, 13)}</span>
       </span>
       <span className="status" data-state={m.state} title={stateLabel(m.state, t)}><i className="dot" /></span>
+      {m.kind === 'vbox' && (
+        <span className="vm-delete-wrap" title={m.state === 'stopped' ? t('deleteVm.tooltip') : t('deleteVm.disabledHint')}>
+          <button
+            type="button"
+            className="icon-btn sm vm-delete"
+            aria-label={t('deleteVm.tooltip')}
+            disabled={m.state !== 'stopped'}
+            onClick={(e) => { e.stopPropagation(); onDelete(m); }}
+          >
+            <TrashIcon />
+          </button>
+        </span>
+      )}
       {m.kind === 'vbox' && <GuestAdditions m={m} />}
     </li>
   );
@@ -154,8 +168,8 @@ function DiskItem() {
       onDoubleClick={() => addMachine(item)} title={t('sidebar.dragItemHint')}>
       <span className="pal-icon"><DiskIcon /></span>
       <span className="pal-text">
-        <span className="pal-name">{t('sidebar.disk')}</span>
-        <span className="pal-sub">{t('sidebar.diskHint')}</span>
+        <span className="pal-name" title={t('sidebar.disk')}>{t('sidebar.disk')}</span>
+        <span className="pal-sub" title={t('sidebar.diskHint')}>{t('sidebar.diskHint')}</span>
       </span>
     </li>
   );
@@ -163,6 +177,7 @@ function DiskItem() {
 
 export function Sidebar() {
   const t = useT();
+  const [deleteVm, setDeleteVm] = useState<MachineInfo | null>(null);
   const tools = useLab((s) => s.tools);
   const inventory = useLab((s) => s.inventory);
   const nodes = useLab((s) => s.nodes);
@@ -217,10 +232,15 @@ export function Sidebar() {
           </span>
           {inventory?.vboxError && <p className="hint err">{inventory.vboxError}</p>}
           <ul className="pal-list">
-            {inventory?.vbox.map((m) => <Item key={m.target} m={m} used={used(m)} />)}
+            {inventory?.vbox.map((m) => <Item key={m.target} m={m} used={used(m)} onDelete={setDeleteVm} />)}
           </ul>
           {inventory && !inventory.vboxError && inventory.vbox.length === 0 && <p className="hint">{t('sidebar.noVms')}</p>}
           <p className="hint">{t('sidebar.dragHint')}</p>
+        </div>
+
+        <div className="side-section">
+          <div className="side-title"><span>{t('sidebar.disks')}</span></div>
+          <ul className="pal-list"><DiskItem /></ul>
         </div>
 
         <div className="side-section">
@@ -245,7 +265,7 @@ export function Sidebar() {
             </div>
           )}
           <ul className="pal-list">
-            {inventory?.docker.map((m) => <Item key={m.target} m={m} used={used(m)} />)}
+            {inventory?.docker.map((m) => <Item key={m.target} m={m} used={used(m)} onDelete={setDeleteVm} />)}
           </ul>
         </div>
 
@@ -259,13 +279,9 @@ export function Sidebar() {
           </div>
           <p className="hint">{t('sidebar.runHintStart')} <code>docker run</code> {t('sidebar.runHintEnd')}</p>
         </div>
-
-        <div className="side-section">
-          <div className="side-title"><span>{t('sidebar.disks')}</span></div>
-          <ul className="pal-list"><DiskItem /></ul>
-        </div>
       </div>
       {newVmOpen && <NewVmDialog onClose={() => setNewVmOpen(false)} />}
+      {deleteVm && <DeleteVmDialog vm={deleteVm} onClose={() => setDeleteVm(null)} />}
     </aside>
   );
 }

@@ -15,7 +15,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "dist:win": "npm run icons && tauri build",
-    "test:core": "cargo test --manifest-path crates/vmlab-core/Cargo.toml"
+    "test:core": "cargo test --manifest-path crates/vmlab-core/Cargo.toml",
+    "test:vm-request": "node scripts/check-vm-request.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.0",

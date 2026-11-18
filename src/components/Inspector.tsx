@@ -30,11 +30,13 @@ import type {
   GuestSystem,
   LinkConditions,
   MachineData,
+  MachineInfo,
   MachineNode,
   NetMode,
   NodeNet,
 } from '../types';
 import { CableChecks } from './CableChecks';
+import { DeleteVmDialog } from './DeleteVmDialog';
 import { CameraIcon, TrashIcon } from './icons';
 
 const DEFAULT_NET: NodeNet = { mode: 'intnet', adapter: 2 };
@@ -1636,6 +1638,7 @@ function CablePanel({ edge }: { edge: Edge }) {
 
 export function Inspector() {
   const t = useT();
+  const [deleteVmOpen, setDeleteVmOpen] = useState(false);
   const node = useLab((s) => s.nodes.find((n) => n.selected));
   const edge = useLab((s) => s.edges.find((e) => e.selected));
   const state = useLab((s) => (node ? resolveState(node.data, s.snapshot) : 'unknown'));
@@ -1644,6 +1647,16 @@ export function Inspector() {
   const hasLinks = useLab((s) => (node ? s.edges.some((e) => e.source === node.id || e.target === node.id) : false));
   const { updateNode, removeNode, act } = useLab.getState();
   const isSlot = node?.data.kind === 'vbox' && node.data.slot === true;
+  const deleteVm: MachineInfo | null = node?.data.kind === 'vbox'
+    ? {
+        kind: 'vbox',
+        target: node.data.target,
+        label: node.data.label,
+        state,
+        image: null,
+        guestAdditions: null,
+      }
+    : null;
 
   if (edge) return <CablePanel edge={edge} />;
   if (node && isDisk(node)) return <DiskPanel node={node} />;
@@ -1698,8 +1711,21 @@ export function Inspector() {
 
           {!isSlot && <TerminalPanel node={node} state={state} />}
 
+          {deleteVm && !isSlot && (
+            <span className="vm-delete-wrap" title={state === 'stopped' ? t('deleteVm.tooltip') : t('deleteVm.disabledHint')}>
+              <button
+                type="button"
+                className="btn ghost danger-text"
+                disabled={state !== 'stopped' || labsnapBusy}
+                onClick={() => setDeleteVmOpen(true)}
+              >
+                <TrashIcon /> {t('deleteVm.action')}
+              </button>
+            </span>
+          )}
           <button className="btn ghost danger-text" disabled={labsnapBusy} onClick={() => removeNode(node.id)}><TrashIcon /> {t('insp.remove')}</button>
           <p className="hint">{t('insp.removeHint')}</p>
+          {deleteVmOpen && deleteVm && <DeleteVmDialog vm={deleteVm} onClose={() => setDeleteVmOpen(false)} />}
         </>
       )}
     </aside>

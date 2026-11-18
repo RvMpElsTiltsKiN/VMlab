@@ -5,8 +5,9 @@
 use crate::disks;
 use crate::error::{CoreError, Result};
 use crate::model::{
-    available_os_catalog, Action, CreateVmRequest, CreatedVm, GuestAdditionsInfo, GuestAdditionsPrep,
-    LinkInfo, NetMode, NodeIssue, NodeNet, VmCreateParams, VmOsEntry, VmOsType,
+    available_os_catalog, os_family, Action, CreateVmRequest, CreatedVm, GuestAdditionsInfo,
+    GuestAdditionsPrep, LinkInfo, NetMode, NodeIssue, NodeNet, VmCreateParams, VmDeleteRequest,
+    VmDeleteResult, VmOsEntry, VmOsType,
 };
 use crate::runner::{run, run_ok};
 use crate::tools::Tools;
@@ -38,14 +39,46 @@ pub fn parse_vm_list(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Parsea `VBoxManage list ostypes`: bloques `ID:  <id>` / `Description: <texto>`.
-/// La familia no viene en la salida; se deriva del id y la descripción.
+const OSTYPES_PARSE_ERROR: &str = "no se pudo interpretar la lista de sistemas operativos de VirtualBox";
+
+/// `Family: Windows (Windows)` → `windows`; `Family: Other (Other)` → `other`.
+fn family_from_output(value: &str) -> &'static str {
+    let text = value.trim();
+    let name = text.split_once(" (").map_or(text, |(name, _)| name);
+    match name.trim().to_ascii_lowercase().as_str() {
+        "windows" => "windows",
+        "linux" => "linux",
+        _ => "other",
+    }
+}
+
+/// Parsea `VBoxManage list ostypes` en los formatos 7.x (`ID / Description: <id> --
+/// <texto>`, `Family:`, `Architecture:`) y antiguo (`ID:` / `Description:`).
 pub fn parse_ostypes(out: &str) -> Vec<VmOsType> {
     let mut result = Vec::new();
     let mut current: Option<VmOsType> = None;
     for line in out.lines() {
-        let line = line.trim_end();
-        if let Some(id) = line.strip_prefix("ID:") {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ID / Description:") {
+            let rest = rest.trim();
+            let (id, description) = rest.split_once(" -- ").unwrap_or((rest, ""));
+            let (id, description) = (id.trim(), description.trim());
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(previous) = current.take() {
+                result.push(previous);
+            }
+            current = Some(VmOsType {
+                id: id.to_string(),
+                description: description.to_string(),
+                family: os_family(id, description),
+                architecture: String::new(),
+            });
+        } else if let Some(id) = line.strip_prefix("ID:") {
             let id = id.trim();
             if id.is_empty() {
                 continue;
@@ -56,12 +89,22 @@ pub fn parse_ostypes(out: &str) -> Vec<VmOsType> {
             current = Some(VmOsType {
                 id: id.to_string(),
                 description: String::new(),
-                family: crate::model::os_family(id, ""),
+                family: os_family(id, ""),
+                architecture: String::new(),
             });
+        } else if let Some(value) = line.strip_prefix("Family:") {
+            if let Some(entry) = current.as_mut() {
+                entry.family = family_from_output(value).to_string();
+            }
+        } else if let Some(value) = line.strip_prefix("Architecture:") {
+            if let Some(entry) = current.as_mut() {
+                entry.architecture = value.trim().to_string();
+            }
         } else if let Some(description) = line.strip_prefix("Description:") {
             if let Some(entry) = current.as_mut() {
                 entry.description = description.trim().to_string();
-                entry.family = crate::model::os_family(&entry.id, &entry.description);
+                // En el formato antiguo no hay línea `Family:`.
+                entry.family = os_family(&entry.id, &entry.description);
             }
         }
     }
@@ -71,13 +114,39 @@ pub fn parse_ostypes(out: &str) -> Vec<VmOsType> {
     result
 }
 
+/// Como [`parse_ostypes`], pero avisa si VirtualBox devolvió texto sin tipos
+/// reconocibles (por ejemplo, porque cambió otra vez el formato de salida).
+pub fn parse_ostypes_checked(out: &str) -> Result<Vec<VmOsType>> {
+    let types = parse_ostypes(out);
+    if types.is_empty() && !out.trim().is_empty() {
+        return Err(CoreError::Message(OSTYPES_PARSE_ERROR.into()));
+    }
+    Ok(types)
+}
+
+/// `true` para tipos ARM (`ARMv8 (64-bit)`, `arm64`, …).
+pub fn ostype_is_arm(entry: &VmOsType) -> bool {
+    entry.architecture.to_ascii_lowercase().contains("arm")
+}
+
+/// Tipos que se ofrecen en el selector «Otro sistema…» (sin ARM).
+pub fn ostypes_for_selection(types: Vec<VmOsType>) -> Vec<VmOsType> {
+    types.into_iter().filter(|entry| !ostype_is_arm(entry)).collect()
+}
+
 /// Lista completa de tipos de sistema ofrecidos por la versión instalada.
+/// La usan la validación y el catálogo: incluye también los tipos ARM.
 pub async fn list_ostypes(tools: &Tools) -> Result<Vec<VmOsType>> {
     let bin = tools.vbox()?;
     let out = run_ok(bin, &["list", "ostypes"], SHORT)
         .await
         .map_err(|e| create_vm_error("consultar los tipos de sistema operativo", e))?;
-    Ok(parse_ostypes(&out.stdout))
+    parse_ostypes_checked(&out.stdout)
+}
+
+/// Lista para el desplegable «Otro sistema…», sin los tipos incompatibles ARM.
+pub async fn list_ostypes_for_selection(tools: &Tools) -> Result<Vec<VmOsType>> {
+    Ok(ostypes_for_selection(list_ostypes(tools).await?))
 }
 
 /// Catálogo filtrado con los `ostype` que existen en esta instalación.
@@ -1244,6 +1313,23 @@ pub fn parse_created_vm_info(info: &str) -> Option<(String, String)> {
     Some((uuid, cfg))
 }
 
+/// Comprueba que el tipo que VirtualBox dice haber creado es el pedido.
+///
+/// Campo usado: `OSTypeId` (ID estable) cuando la versión lo expone; si no,
+/// `ostype`, que en 7.2 es un valor legible (`Ubuntu (64-bit)`) y se compara
+/// con la descripción del tipo pedido. También se acepta que `ostype` traiga
+/// directamente el ID, como hacen versiones anteriores.
+pub fn created_ostype_matches(requested: &VmOsType, info: &str) -> bool {
+    let same = |a: &str, b: &str| !a.trim().is_empty() && a.trim().eq_ignore_ascii_case(b.trim());
+    if let Some(id) = vm_field_ci(info, "OSTypeId") {
+        return same(&id, &requested.id);
+    }
+    match vm_field_ci(info, "ostype") {
+        Some(value) => same(&value, &requested.id) || same(&value, &requested.description),
+        None => false,
+    }
+}
+
 pub fn createvm_args(name: &str, ostype: &str) -> Result<Vec<String>> {
     validate::vbox_target(name)?;
     let valid_ostype = !ostype.is_empty()
@@ -1384,6 +1470,94 @@ pub fn unregistervm_args(target: &str) -> Result<Vec<String>> {
     Ok(vec!["unregistervm".into(), target.into(), "--delete".into()])
 }
 
+/// Argumentos para borrar una VM desde la interfaz. Solo UUID estricto: un nombre
+/// nunca llega a `unregistervm`. `delete_files` decide si VirtualBox borra también
+/// los ficheros propios de la máquina.
+pub fn unregistervm_delete_args(uuid: &str, delete_files: bool) -> Result<Vec<String>> {
+    validate::vm_uuid(uuid)?;
+    let mut args = vec!["unregistervm".into(), uuid.into()];
+    if delete_files {
+        args.push("--delete".into());
+    }
+    Ok(args)
+}
+
+/// Error específico por estado al intentar eliminar una VM. Los textos indican
+/// exactamente qué hacer; nunca se descarta un estado guardado automáticamente.
+pub fn delete_vm_state_error(vm: &str, state: &str) -> String {
+    let state = state.trim();
+    if state.eq_ignore_ascii_case("saved") {
+        format!(
+            "«{vm}» tiene un estado guardado; descarta el estado guardado o inicia y apaga la máquina del todo antes de eliminarla."
+        )
+    } else if state.eq_ignore_ascii_case("running") {
+        format!("«{vm}» está en marcha; apágala del todo antes de eliminarla.")
+    } else if state.eq_ignore_ascii_case("paused") {
+        format!("«{vm}» está en pausa; apágala del todo antes de eliminarla.")
+    } else if state.eq_ignore_ascii_case("starting") {
+        format!("«{vm}» se está iniciando; espera a que arranque y apágala del todo antes de eliminarla.")
+    } else {
+        format!("«{vm}» está en estado «{state}»; solo se puede eliminar con la máquina apagada del todo.")
+    }
+}
+
+/// Quita una VM de VirtualBox. Comprueba UUID, existencia y estado antes de tocar
+/// nada; desconecta primero los VDI de datos de VMLab para que `--delete` no los
+/// borre, y aborta si esa desconexión falla.
+pub async fn delete_vm(tools: &Tools, req: &VmDeleteRequest) -> Result<VmDeleteResult> {
+    let uuid = validate::vm_uuid(&req.uuid)?;
+    let bin = tools.vbox()?;
+
+    let listed = run_ok(bin, &["list", "vms"], SHORT).await?;
+    if !parse_vm_list(&listed.stdout).into_iter().any(|(_, u)| u == uuid) {
+        return Err(CoreError::Invalid(format!("no existe ninguna máquina virtual con UUID «{uuid}»")));
+    }
+
+    let info = run_ok(bin, &["showvminfo", uuid, "--machinereadable"], SHORT).await?;
+    let state = vm_field(&info.stdout, "VMState").unwrap_or_default();
+    if !storage_editable(&state) {
+        return Err(CoreError::Invalid(delete_vm_state_error(uuid, &state)));
+    }
+
+    let disks_dir = tools.disks_dir.as_deref().ok_or_else(|| {
+        CoreError::Invalid("no se ha configurado la carpeta de discos de VMLab".into())
+    })?;
+    // `detach_stale_vdis` solo devuelve avisos cuando no puede desconectar; tras
+    // una desconexión correcta devuelve una lista vacía. Sacamos los nombres antes
+    // para poder informar de que esos discos se han conservado.
+    let preserved: Vec<String> = parse_vm_storage(&info.stdout)
+        .attachments
+        .iter()
+        .filter(|a| disks::vdi_path_allowed(disks_dir, Path::new(&a.medium)))
+        .filter_map(|a| data_disk_name(&a.medium))
+        .collect();
+    // Un vector no vacío significa que no se pudo desconectar (p. ej. la VM
+    // cambió de estado mientras tanto): en ese caso no se elimina nada.
+    let detach_warnings = detach_stale_vdis(tools, disks_dir, uuid, &[], false).await?;
+    if !detach_warnings.is_empty() {
+        return Err(CoreError::Invalid(detach_warnings.join(" ")));
+    }
+    let warnings = preserved
+        .into_iter()
+        .map(|disk| format!("El disco «{disk}» se ha conservado."))
+        .collect();
+
+    let args = unregistervm_delete_args(uuid, req.delete_files)?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(bin, &argv, LONG).await?;
+    Ok(VmDeleteResult { removed: true, warnings })
+}
+
+/// Nombre visible de un VDI de datos de VMLab a partir de su fichero
+/// `vmlab-disk-<nombre>.vdi`. Devuelve `None` para cualquier otro medio.
+pub fn data_disk_name(medium: &str) -> Option<String> {
+    let file = Path::new(medium).file_name()?.to_str()?;
+    file.strip_prefix("vmlab-disk-")?
+        .strip_suffix(".vdi")
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// Plan puro de los pasos de almacenamiento de una VM recién creada: devuelve
 /// los `argv` de cada comando sin ejecutar nada. XP usa IDE (disco en 0:0 e ISO
 /// en 1:0 del mismo controlador); los demás usan SATA para el disco y crean un
@@ -1472,7 +1646,7 @@ pub async fn create_vm(tools: &Tools, req: CreateVmRequest) -> Result<CreatedVm>
 
     // 1. Consultar el conjunto cerrado de ostypes y los nombres existentes.
     let types = list_ostypes(tools).await?;
-    let ids: Vec<String> = types.into_iter().map(|o| o.id).collect();
+    let ids: Vec<String> = types.iter().map(|o| o.id.clone()).collect();
     let out = run_ok(bin, &["list", "vms"], SHORT)
         .await
         .map_err(|e| create_vm_error("listar las máquinas virtuales", e))?;
@@ -1518,6 +1692,22 @@ pub async fn create_vm(tools: &Tools, req: CreateVmRequest) -> Result<CreatedVm>
             return Err(rollback_create_vm(bin, &params.name, e, None, None).await);
         }
     };
+
+    // 4b. Defensa: si VirtualBox ignoró el `--ostype` pedido, deshacemos la VM
+    //     antes de seguir creando discos. El UUID ya es conocido, así que el
+    //     rollback no puede afectar a ninguna otra máquina.
+    if let Some(requested) = types.iter().find(|o| o.id == params.ostype) {
+        if !created_ostype_matches(requested, &info.stdout) {
+            let reported = vm_field_ci(&info.stdout, "OSTypeId")
+                .or_else(|| vm_field_ci(&info.stdout, "ostype"))
+                .unwrap_or_else(|| "desconocido".into());
+            let e = CoreError::Message(format!(
+                "VirtualBox creó la VM con el tipo '{reported}' en vez del pedido '{}' ({})",
+                requested.id, requested.description
+            ));
+            return Err(rollback_create_vm(bin, &uuid, e, None, None).await);
+        }
+    }
 
     // 5. Configurar, crear el VDI y conectarlo todo. Cualquier fallo deshace
     //    únicamente esta VM, usando su UUID.
@@ -2703,32 +2893,140 @@ storagecontrollermaxportcount0="2"
 
     // ── C1: creación de VMs ──
 
-    #[test]
-    fn parses_a_real_trimmed_ostypes_list() {
-        let out = r#"ID:          WindowsXP
-Description: Windows XP
-ID:          Windows7_64
-Description: Windows 7 (64-bit)
-ID:          Windows11_64
-Description: Windows 11 (64-bit)
-ID:          Ubuntu_64
-Description: Ubuntu (64-bit)
-ID:          Debian_64
-Description: Debian (64-bit)
-ID:          Other
-Description: Other/Unknown
+    const REAL_OSTYPES_72: &str = r#"Supported guest OS types:
+
+ID / Description: Other -- Other/Unknown
+Family:           Other (Other)
+Architecture:     x86
+
+ID / Description: Other_64 -- Other/Unknown (64-bit)
+Family:           Other (Other)
+Architecture:     x86 (64-bit)
+
+ID / Description: Other_arm64 -- Other/Unknown (ARM 64-bit)
+Family:           Other (Other)
+Architecture:     ARMv8 (64-bit)
 "#;
-        let types = parse_ostypes(out);
-        assert_eq!(types.len(), 6);
+
+    #[test]
+    fn parses_the_real_vbox_72_ostypes_list() {
+        let types = parse_ostypes_checked(REAL_OSTYPES_72).unwrap();
+        assert_eq!(types.len(), 3);
+
+        assert_eq!(types[0].id, "Other");
+        assert_eq!(types[0].description, "Other/Unknown");
+        assert_eq!(types[0].family, "other");
+        assert_eq!(types[0].architecture, "x86");
+
+        assert_eq!(types[1].id, "Other_64");
+        assert_eq!(types[1].description, "Other/Unknown (64-bit)");
+        assert_eq!(types[1].architecture, "x86 (64-bit)");
+
+        assert_eq!(types[2].id, "Other_arm64");
+        assert_eq!(types[2].description, "Other/Unknown (ARM 64-bit)");
+        assert_eq!(types[2].architecture, "ARMv8 (64-bit)");
+        assert!(ostype_is_arm(&types[2]));
+        assert!(!ostype_is_arm(&types[0]));
+
+        let selection = ostypes_for_selection(types);
+        assert_eq!(selection.len(), 2);
+        assert_eq!(selection[1].id, "Other_64");
+        assert!(!selection.iter().any(ostype_is_arm));
+    }
+
+    #[test]
+    fn old_ostypes_format_still_parses() {
+        let out = "ID:          WindowsXP\n\
+                   Description: Windows XP\n\
+                   ID:          Ubuntu_64\n\
+                   Description: Ubuntu (64-bit)\n";
+        let types = parse_ostypes_checked(out).unwrap();
+        assert_eq!(types.len(), 2);
         assert_eq!(types[0].id, "WindowsXP");
         assert_eq!(types[0].description, "Windows XP");
         assert_eq!(types[0].family, "windows");
-        assert_eq!(types[2].id, "Windows11_64");
-        assert_eq!(types[3].family, "linux");
-        assert_eq!(types[5].id, "Other");
-        assert_eq!(types[5].family, "other");
-        assert!(parse_ostypes("").is_empty());
+        assert_eq!(types[0].architecture, "");
+        assert_eq!(types[1].id, "Ubuntu_64");
+        assert_eq!(types[1].family, "linux");
+    }
+
+    #[test]
+    fn unrecognized_ostypes_output_is_reported() {
+        let err = parse_ostypes_checked("Formato desconocido\n").unwrap_err().to_string();
+        assert_eq!(err, OSTYPES_PARSE_ERROR);
+        assert!(parse_ostypes_checked("").unwrap().is_empty());
         assert!(parse_ostypes("Description: huérfana\n").is_empty());
+    }
+
+    #[test]
+    fn catalog_uses_every_ostype_id_while_selection_skips_arm() {
+        let out = r#"Supported guest OS types:
+
+ID / Description: WindowsXP -- Windows XP
+Family:           Windows (Windows)
+Architecture:     x86
+
+ID / Description: Windows11_64 -- Windows 11 (64-bit)
+Family:           Windows (Windows)
+Architecture:     x86 (64-bit)
+
+ID / Description: Ubuntu_64 -- Ubuntu (64-bit)
+Family:           Linux (Linux)
+Architecture:     x86 (64-bit)
+
+ID / Description: Other_arm64 -- Other/Unknown (ARM 64-bit)
+Family:           Other (Other)
+Architecture:     ARMv8 (64-bit)
+"#;
+        let types = parse_ostypes_checked(out).unwrap();
+        assert_eq!(types[0].family, "windows");
+        assert_eq!(types[2].family, "linux");
+
+        let ids: Vec<String> = types.iter().map(|entry| entry.id.clone()).collect();
+        assert!(ids.iter().any(|id| id == "Other_arm64"));
+        assert!(validate::vm_ostype("Other_arm64", &ids).is_ok());
+
+        let catalog = available_os_catalog(&ids);
+        let labels: Vec<&str> = catalog
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect();
+        assert!(labels.contains(&"Windows XP"));
+        assert!(labels.contains(&"Windows 11 (64 bits)"));
+        assert!(labels.contains(&"Ubuntu"));
+        assert!(labels.contains(&"Pop!_OS"));
+
+        let selection = ostypes_for_selection(types);
+        assert!(!selection.iter().any(|entry| entry.id == "Other_arm64"));
+    }
+
+    #[test]
+    fn created_ostype_is_checked_against_id_or_readable_description() {
+        let requested = VmOsType {
+            id: "Ubuntu_64".into(),
+            description: "Ubuntu (64-bit)".into(),
+            family: "linux".into(),
+            architecture: "x86 (64-bit)".into(),
+        };
+
+        // `OSTypeId` manda cuando existe, aunque `ostype` sea legible.
+        let with_id = "UUID=\"abc\"\nCfgFile=\"C:\\vm\\vm.vbox\"\nOSTypeId=\"Ubuntu_64\"\nostype=\"Ubuntu (64-bit)\"\n";
+        assert!(created_ostype_matches(&requested, with_id));
+
+        // Sin ID, en 7.2 `ostype` trae la descripción legible.
+        let readable = "ostype=\"Ubuntu (64-bit)\"\n";
+        assert!(created_ostype_matches(&requested, readable));
+
+        // Otras versiones ponen el ID directamente en `ostype`.
+        let plain = "ostype=\"Ubuntu_64\"\n";
+        assert!(created_ostype_matches(&requested, plain));
+
+        // El fallo real: se pidió Ubuntu y VirtualBox puso Windows XP.
+        let wrong_id = "OSTypeId=\"WindowsXP\"\nostype=\"Windows XP (32-bit)\"\n";
+        assert!(!created_ostype_matches(&requested, wrong_id));
+        let wrong_description = "ostype=\"Windows XP (32-bit)\"\n";
+        assert!(!created_ostype_matches(&requested, wrong_description));
+        assert!(!created_ostype_matches(&requested, "UUID=\"abc\"\n"));
     }
 
     #[test]
@@ -2828,6 +3126,44 @@ VMState="poweroff"
                 .collect::<Vec<String>>()
         );
         assert!(unregistervm_args("--otra-vm").is_err());
+
+        let uuid = "c0ffee00-1111-2222-3333-444455556666";
+        assert_eq!(
+            unregistervm_delete_args(uuid, false).unwrap(),
+            ["unregistervm", uuid].iter().map(|s| s.to_string()).collect::<Vec<String>>()
+        );
+        assert_eq!(
+            unregistervm_delete_args(uuid, true).unwrap(),
+            ["unregistervm", uuid, "--delete"].iter().map(|s| s.to_string()).collect::<Vec<String>>()
+        );
+        assert!(unregistervm_delete_args("Mi VM", true).is_err());
+        assert!(unregistervm_delete_args("--otra-vm", false).is_err());
+    }
+
+    #[test]
+    fn delete_vm_only_allows_poweroff_or_aborted() {
+        assert!(storage_editable("poweroff"));
+        assert!(storage_editable("aborted"));
+        assert!(!storage_editable("saved"));
+        assert!(!storage_editable("running"));
+        assert!(!storage_editable("paused"));
+        assert!(!storage_editable("starting"));
+
+        let saved = delete_vm_state_error("Mi VM", "saved");
+        assert!(saved.contains("descarta el estado guardado o inicia y apaga la máquina del todo"));
+        assert!(delete_vm_state_error("Mi VM", "running").contains("en marcha"));
+        assert!(delete_vm_state_error("Mi VM", "paused").contains("en pausa"));
+        assert!(delete_vm_state_error("Mi VM", "starting").contains("iniciando"));
+        assert!(delete_vm_state_error("Mi VM", "other").contains("estado «other»"));
+    }
+
+    #[test]
+    fn data_disk_name_only_accepts_vmlab_vdis() {
+        assert_eq!(data_disk_name("C:\\VMs\\VMLab\\disks\\vmlab-disk-datos.vdi").as_deref(), Some("datos"));
+        assert_eq!(data_disk_name("/tmp/disks/vmlab-disk-disco1.vdi").as_deref(), Some("disco1"));
+        assert_eq!(data_disk_name("vmlab-disk-.vdi"), None);
+        assert_eq!(data_disk_name("C:\\ISOs\\ubuntu.iso"), None);
+        assert_eq!(data_disk_name("Mi VM.vdi"), None);
     }
 
     #[test]

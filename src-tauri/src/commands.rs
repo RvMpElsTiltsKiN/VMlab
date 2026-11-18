@@ -7,7 +7,8 @@ use vmlab_core::model::{
     default_adapter, Action, ApplyReport, CreateVmRequest, CreatedVm, DockerRunOptions, DockerStartInfo,
     GuestAdditionsPrep, GuestConfigRequest, GuestHostsRequest,
     GuestProfile, GuestReport, Inventory, LabSnapInfo, LabSnapNode, LabSnapReport, LinkConditions, LinkReport, NodeKind,
-    NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology, VmOsEntry, VmOsType,
+    NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology, VmDeleteRequest, VmDeleteResult,
+    VmOsEntry, VmOsType,
 };
 use vmlab_core::capture::{self, CaptureFilter, CaptureInfo};
 use vmlab_core::connectivity::LinkDiagnostics;
@@ -48,10 +49,10 @@ pub async fn vm_os_catalog(state: State<'_, AppState>) -> Result<Vec<VmOsEntry>,
     vbox::available_vm_os_catalog(&state.tools().await).await.map_err(s)
 }
 
-/// Lista completa de `ostypes` para el selector «Otro…».
+/// Tipos para el selector «Otro…»: todos menos los ARM (incompatibles).
 #[tauri::command]
 pub async fn vm_list_ostypes(state: State<'_, AppState>) -> Result<Vec<VmOsType>, String> {
-    vbox::list_ostypes(&state.tools().await).await.map_err(s)
+    vbox::list_ostypes_for_selection(&state.tools().await).await.map_err(s)
 }
 
 /// Crea una VM vacía con VDI nuevo e ISO opcional; sin instalación desatendida.
@@ -61,6 +62,21 @@ pub async fn vm_create(
     request: CreateVmRequest,
 ) -> Result<CreatedVm, String> {
     vbox::create_vm(&state.tools().await, request).await.map_err(s)
+}
+
+/// Quita una VM de VirtualBox. La carpeta de discos la decide el backend para
+/// que `detach_stale_vdis` pueda proteger los VDI de datos de VMLab.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vm_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    uuid: String,
+    delete_files: bool,
+) -> Result<VmDeleteResult, String> {
+    let request = VmDeleteRequest { uuid, delete_files };
+    let mut tools = state.tools().await;
+    tools.disks_dir = Some(app.path().app_data_dir().map_err(s)?.join("disks"));
+    vbox::delete_vm(&tools, &request).await.map_err(s)
 }
 
 #[tauri::command]
