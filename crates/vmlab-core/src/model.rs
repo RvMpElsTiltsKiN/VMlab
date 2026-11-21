@@ -9,6 +9,8 @@ pub enum NodeKind {
     Docker,
     /// Volumen Docker del lienzo. No es una máquina: no tiene red ni estado.
     Disk,
+    /// Unidad óptica del lienzo. No es una máquina: no tiene red ni estado.
+    Optical,
 }
 
 impl NodeKind {
@@ -17,6 +19,7 @@ impl NodeKind {
             NodeKind::Vbox => format!("vbox:{target}"),
             NodeKind::Docker => format!("docker:{target}"),
             NodeKind::Disk => format!("disk:{target}"),
+            NodeKind::Optical => format!("optical:{target}"),
         }
     }
 }
@@ -202,6 +205,17 @@ pub struct DiskSpec {
     pub size_mb: Option<u32>,
 }
 
+/// Configuración de una unidad óptica. La imagen es opcional: `None` (o un
+/// lab antiguo sin el campo) significa unidad vacía. La misma ISO puede
+/// montarse en varias unidades porque VirtualBox la abre solo para lectura.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpticalSpec {
+    /// Ruta absoluta a la imagen `.iso`. `None` deja la unidad vacía.
+    #[serde(default)]
+    pub iso: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSpec {
@@ -227,6 +241,9 @@ pub struct NodeSpec {
     /// Solo Disco: modo de uso y rutas de montaje en los contenedores enlazados.
     #[serde(default)]
     pub disk: Option<DiskSpec>,
+    /// Solo Unidad óptica: imagen montada (opcional).
+    #[serde(default)]
+    pub optical: Option<OpticalSpec>,
 }
 
 impl Default for NodeSpec {
@@ -241,6 +258,7 @@ impl Default for NodeSpec {
             net: None,
             link: None,
             disk: None,
+            optical: None,
         }
     }
 }
@@ -362,6 +380,59 @@ pub struct ApplyReport {
     pub applied: usize,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// Resultado de cambiar la ISO de una unidad óptica en una VM conectada al nodo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpticalIsoResult {
+    /// Nombre de la VM en VirtualBox.
+    pub name: String,
+    /// UUID de la VM (lo que se usa como `target` en el lienzo).
+    pub uuid: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ───────── Discos gestionados (listar, ampliar, eliminar) ─────────
+
+/// Tipo de almacenamiento creado por VMLab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedDiskKind {
+    /// VDI `vmlab-disk-<nombre>.vdi` dentro de `Tools::disks_dir`.
+    Vdi,
+    /// Volumen Docker `vmlab-vol-<nombre>`.
+    Volume,
+}
+
+/// Máquina virtual o contenedor que está usando un disco gestionado.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedDiskUser {
+    pub name: String,
+    /// UUID de la VM; los contenedores Docker no lo tienen.
+    pub uuid: Option<String>,
+}
+
+/// Disco gestionado por VMLab, listo para mostrar en la interfaz.
+///
+/// `name` es el nombre base para VDI (`datos`) y el nombre completo de Docker
+/// para volúmenes (`vmlab-vol-datos`), que es lo que acepta `docker volume rm`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedDisk {
+    pub name: String,
+    pub kind: ManagedDiskKind,
+    pub capacity_mb: Option<u64>,
+    pub size_on_disk_mb: Option<u64>,
+    pub in_use_by: Vec<ManagedDiskUser>,
+    /// `false` si está en uso o si no se pudo leer su información con seguridad.
+    pub deletable: bool,
+    /// `false` para volúmenes y cuando no se pudo leer el medio con VirtualBox.
+    pub resizable: bool,
+    pub note: Option<String>,
 }
 
 /// Resultado de aplicar o quitar las condiciones de red de un nodo.
@@ -942,6 +1013,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_disk_serializes_in_camel_case() {
+        let disk = ManagedDisk {
+            name: "datos".into(),
+            kind: ManagedDiskKind::Vdi,
+            capacity_mb: Some(1024),
+            size_on_disk_mb: Some(2),
+            in_use_by: vec![ManagedDiskUser {
+                name: "windows 10 client".into(),
+                uuid: Some("ed89600c-3c10-4645-92a4-e9856684ae1f".into()),
+            }],
+            deletable: false,
+            resizable: true,
+            note: None,
+        };
+        let json = serde_json::to_value(&disk).unwrap();
+        assert_eq!(json["name"], "datos");
+        assert_eq!(json["kind"], "vdi");
+        assert_eq!(json["capacityMb"], 1024);
+        assert_eq!(json["sizeOnDiskMb"], 2);
+        assert_eq!(json["inUseBy"][0]["name"], "windows 10 client");
+        assert_eq!(json["inUseBy"][0]["uuid"], "ed89600c-3c10-4645-92a4-e9856684ae1f");
+        assert_eq!(json["deletable"], false);
+        assert_eq!(json["resizable"], true);
+        assert!(json["note"].is_null());
+
+        let kind: ManagedDiskKind = serde_json::from_str("\"volume\"").unwrap();
+        assert_eq!(kind, ManagedDiskKind::Volume);
+        assert!(serde_json::from_str::<ManagedDiskKind>("\"vmlab-vol-datos\"").is_err());
+    }
+
+    #[test]
     fn disk_fields_serialize_in_camel_case() {
         let t = Topology {
             nodes: vec![NodeSpec {
@@ -964,5 +1066,46 @@ mod tests {
         assert_eq!(json["nodes"][0]["disk"]["mounts"][0]["container"], "web");
         assert_eq!(json["nodes"][0]["disk"]["mounts"][0]["path"], "/data");
         assert_eq!(json["edges"][0]["kind"], "mount");
+    }
+
+    #[test]
+    fn optical_fields_serialize_in_camel_case_and_are_optional() {
+        let t = Topology {
+            nodes: vec![
+                NodeSpec {
+                    id: "cd".into(),
+                    kind: NodeKind::Optical,
+                    target: "Unidad óptica".into(),
+                    optical: Some(OpticalSpec { iso: Some("C:\\ISO\\ubuntu.iso".into()) }),
+                    ..NodeSpec::default()
+                },
+                NodeSpec {
+                    id: "cd2".into(),
+                    kind: NodeKind::Optical,
+                    target: "Vacía".into(),
+                    ..NodeSpec::default()
+                },
+            ],
+            edges: vec![Edge { from: "cd".into(), to: "vm".into(), kind: EdgeKind::Mount }],
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["nodes"][0]["kind"], "optical");
+        assert_eq!(json["nodes"][0]["optical"]["iso"], "C:\\ISO\\ubuntu.iso");
+        assert_eq!(NodeKind::Optical.key("cd"), "optical:cd");
+        assert_eq!(json["nodes"][1]["optical"], serde_json::Value::Null);
+
+        // Un lab anterior no tiene ni `optical` ni `iso`: carga como unidad vacía.
+        let old = serde_json::json!({
+            "nodes": [{ "id": "cd", "kind": "optical", "target": "CD", "optical": {} }],
+            "edges": []
+        });
+        let t: Topology = serde_json::from_value(old).unwrap();
+        assert_eq!(t.nodes[0].optical.as_ref().and_then(|o| o.iso.as_deref()), None);
+        let old2 = serde_json::json!({
+            "nodes": [{ "id": "cd", "kind": "optical", "target": "CD" }],
+            "edges": []
+        });
+        let t: Topology = serde_json::from_value(old2).unwrap();
+        assert_eq!(t.nodes[0].optical, None);
     }
 }

@@ -3,13 +3,41 @@ use crate::error::{CoreError, Result};
 use crate::model::*;
 use crate::tools::Tools;
 use crate::validate::DiskKind;
-use crate::{connectivity, disks, docker, docker_desktop, guest, netem, topology, vbox};
+use crate::{connectivity, disks, docker, docker_desktop, guest, netem, optical, topology, vbox};
 use crate::docker::MountInfo;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 fn vbox_state(running: bool) -> PowerState {
     if running { PowerState::Running } else { PowerState::Stopped }
+}
+
+/// Los fallos de una VM se devuelven como avisos y siempre nombran a la VM, para
+/// que se pueda distinguir qué conexión falló cuando un nodo tiene varias.
+fn optical_vm_warning(vm: &NodeSpec, detail: impl std::fmt::Display) -> String {
+    format!("{}: {detail}", vm.display())
+}
+
+/// Unidades que cada VM debe conservar, calculadas desde los planes ya validados.
+fn optical_wanted_by_vm(plans: &[optical::OpticalPlan]) -> HashMap<&str, HashSet<&str>> {
+    let mut wanted: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for plan in plans {
+        wanted
+            .entry(plan.vm.target.as_str())
+            .or_default()
+            .insert(plan.node.id.as_str());
+    }
+    wanted
+}
+
+/// Solo las unidades del extradata de *esta* VM que ya no están en el lienzo.
+fn optical_units_to_remove<'a>(
+    entries: &'a [(String, vbox::OpticalSlot)],
+    wanted: &HashSet<&str>,
+) -> Vec<&'a (String, vbox::OpticalSlot)> {
+    entries.iter().filter(|(id, _)| !wanted.contains(id.as_str())).collect()
 }
 
 /// Crea (sin arrancar) el contenedor de un nodo Docker del segmento cuando todavía
@@ -142,6 +170,9 @@ pub async fn act(
         NodeKind::Disk => Err(CoreError::Invalid(
             "un disco no se puede encender ni apagar; solo se crea el volumen".into(),
         )),
+        NodeKind::Optical => Err(CoreError::Invalid(
+            "una unidad óptica no se puede encender ni apagar; solo cambia su ISO".into(),
+        )),
     }
 }
 
@@ -182,10 +213,17 @@ pub async fn docker_stop(tools: &Tools) -> Result<()> {
 
 /// Aplica la topología del lienzo al sistema. Nunca aborta a la mitad: acumula errores por nodo.
 pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
-    // Los discos se validan antes de cualquier operación: un enlace a una VM o un
-    // disco exclusivo con varios contenedores no debe aplicar parte de la red.
+    // Discos y ópticos se validan antes de cualquier operación: un enlace
+    // incorrecto no debe aplicar parte de la red ni tocar el almacenamiento.
+    let mut early_errors: Vec<String> = Vec::new();
     if let Err(e) = crate::validate::disk_topology(t) {
-        return ApplyReport { errors: vec![e.to_string()], ..Default::default() };
+        early_errors.push(e.to_string());
+    }
+    if let Err(e) = crate::validate::optical_topology(t) {
+        early_errors.push(e.to_string());
+    }
+    if !early_errors.is_empty() {
+        return ApplyReport { errors: early_errors, ..Default::default() };
     }
     let has_vdi = t
         .nodes
@@ -236,8 +274,9 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
     // modifica: como mucho se avisa de que el tamaño pedido no se aplicará.
     if let Some(dir) = disks_dir {
         for vdi in &vdi_plans {
-            match vbox::ensure_vdi_file(tools, dir, &vdi.path, vdi.size_mb).await {
-                Ok(Some(warning)) => rep.warnings.push(format!("{}: {warning}", vdi.node.display())),
+            match vbox::ensure_vdi_file(tools, dir, &vdi.path, vdi.size_mb, vdi.node.display()).await {
+                // El aviso ya incluye el nombre del disco y ambas cifras.
+                Ok(Some(warning)) => rep.warnings.push(warning),
                 Ok(None) => {}
                 Err(e) => rep.errors.push(format!("{}: {e}", vdi.node.display())),
             }
@@ -277,6 +316,153 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
             match vbox::attach_wanted_vdis(tools, dir, &vm.target, &wanted, running.contains(&vm.target)).await {
                 Ok(warnings) => rep.warnings.extend(warnings),
                 Err(e) => rep.errors.push(format!("{}: {e}", vm.display())),
+            }
+        }
+    }
+
+    // Unidades ópticas: crear solo con la VM apagada; cambiar el medio también
+    // con la VM en marcha; quitar las que ya no estén en el lienzo solo apagadas.
+    // Cada arista se procesa por separado: un fallo en una VM no impide seguir
+    // con las demás y se devuelve como aviso nombrando la VM.
+    let optical_plans = match optical::plan(t) {
+        Ok(plans) => plans,
+        Err(e) => {
+            rep.errors.push(e.to_string());
+            Vec::new()
+        }
+    };
+    if !optical_plans.is_empty() && tools.vboxmanage.is_none() {
+        rep.errors.push(CoreError::ToolMissing("VBoxManage").to_string());
+    } else if tools.vboxmanage.is_some() {
+        for plan in &optical_plans {
+            let detail = |msg: String| format!("unidad «{}»: {msg}", plan.node.id);
+            if let Err(e) = crate::validate::vbox_target(&plan.vm.target) {
+                rep.warnings.push(optical_vm_warning(&plan.vm, detail(e.to_string())));
+                continue;
+            }
+            let storage = match vbox::vm_optical_storage(tools, &plan.vm.target).await {
+                Ok(storage) => storage,
+                Err(e) => {
+                    rep.warnings.push(optical_vm_warning(&plan.vm, detail(e.to_string())));
+                    continue;
+                }
+            };
+            let existing =
+                match vbox::read_optical_extradata(tools, &plan.vm.target, &plan.node.id).await {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        rep.warnings.push(optical_vm_warning(&plan.vm, detail(e.to_string())));
+                        continue;
+                    }
+                };
+            match existing {
+                Some(slot) => {
+                    if vbox::optical_medium_is(&storage, &slot, plan.iso.as_deref()) {
+                        continue;
+                    }
+                    let medium = plan
+                        .iso
+                        .as_deref()
+                        .map_or(vbox::OpticalMedium::Empty, vbox::OpticalMedium::Iso);
+                    if let Err(e) = vbox::set_optical_medium(
+                        tools,
+                        &plan.vm.target,
+                        &slot,
+                        medium,
+                        plan.iso.is_none(),
+                    )
+                    .await
+                    {
+                        // El error de VirtualBox se muestra tal cual: no sabemos
+                        // si el cambio en caliente funciona en cada versión.
+                        rep.warnings.push(optical_vm_warning(
+                            &plan.vm,
+                            detail(format!("no se pudo cambiar la ISO en caliente: {e}")),
+                        ));
+                    }
+                }
+                None => {
+                    if let Some(warning) =
+                        vbox::optical_state_warning(&plan.vm.target, &storage.state, "crear")
+                    {
+                        rep.warnings.push(optical_vm_warning(&plan.vm, detail(warning)));
+                        continue;
+                    }
+                    let placement = match vbox::plan_optical_slot(&storage) {
+                        Ok(placement) => placement,
+                        Err(e) => {
+                            rep.warnings.push(optical_vm_warning(&plan.vm, detail(e.to_string())));
+                            continue;
+                        }
+                    };
+                    if let Err(e) = vbox::create_optical_drive(
+                        tools,
+                        &plan.vm.target,
+                        &plan.node.id,
+                        &placement,
+                        plan.iso.as_deref(),
+                    )
+                    .await
+                    {
+                        rep.warnings.push(optical_vm_warning(&plan.vm, detail(e.to_string())));
+                    }
+                }
+            }
+        }
+
+        // El extradata es la única fuente de verdad para retirar unidades: así
+        // no se tocan nunca las unidades ópticas que el usuario pusiera a mano.
+        // El conjunto deseado se calcula por VM, así que quitar una conexión no
+        // afecta a la misma unidad montada en otras VMs.
+        let wanted_by_vm = optical_wanted_by_vm(&optical_plans);
+        let mut visited: HashSet<&str> = HashSet::new();
+        for vm in t.nodes.iter().filter(|n| n.kind == NodeKind::Vbox) {
+            if !visited.insert(vm.target.as_str()) {
+                continue;
+            }
+            if let Err(e) = crate::validate::vbox_target(&vm.target) {
+                rep.errors.push(format!("{}: {e}", vm.display()));
+                continue;
+            }
+            let wanted = wanted_by_vm.get(vm.target.as_str()).cloned().unwrap_or_default();
+            let entries = match vbox::list_optical_extradata(tools, &vm.target).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    rep.warnings.push(format!("{}: {e}", vm.display()));
+                    continue;
+                }
+            };
+            let to_remove = optical_units_to_remove(&entries, &wanted);
+            if to_remove.is_empty() {
+                continue;
+            }
+            let storage = match vbox::vm_optical_storage(tools, &vm.target).await {
+                Ok(storage) => storage,
+                Err(e) => {
+                    rep.warnings.push(format!("{}: {e}", vm.display()));
+                    continue;
+                }
+            };
+            for item in to_remove {
+                let node_id = item.0.as_str();
+                let slot = &item.1;
+                if let Some(warning) = vbox::optical_state_warning(&vm.target, &storage.state, "quitar") {
+                    rep.warnings.push(format!(
+                        "unidad «{node_id}» de «{}»: {warning}",
+                        vm.display()
+                    ));
+                    continue;
+                }
+                match vbox::remove_optical_drive(tools, &vm.target, node_id, slot).await {
+                    Ok(()) => rep.warnings.push(format!(
+                        "Se ha quitado la unidad óptica «{node_id}» de «{}» porque ya no está en el lienzo.",
+                        vm.display()
+                    )),
+                    Err(e) => rep.warnings.push(format!(
+                        "unidad «{node_id}» de «{}»: {e}",
+                        vm.display()
+                    )),
+                }
             }
         }
     }
@@ -324,8 +510,8 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
                         Err(e) => Err(e),
                     }
                 }
-                // Los discos no pertenecen a segmentos de red: no hay nada que hacer.
-                NodeKind::Disk => Ok(()),
+                // Los discos y las unidades ópticas no pertenecen a segmentos de red.
+                NodeKind::Disk | NodeKind::Optical => Ok(()),
             };
             match res {
                 Ok(()) => rep.applied += 1,
@@ -383,7 +569,7 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
                     Err(e) => Err(e),
                 }
             }
-            NodeKind::Disk => Ok(()),
+            NodeKind::Disk | NodeKind::Optical => Ok(()),
         };
         if let Err(e) = res {
             rep.errors.push(format!("{}: {e}", n.display()));
@@ -398,7 +584,7 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
             continue;
         }
         let is_on = match n.kind {
-            NodeKind::Disk => false,
+            NodeKind::Disk | NodeKind::Optical => false,
             NodeKind::Vbox => running.contains(&n.target),
             NodeKind::Docker => match netem::is_running(tools, &n.target).await {
                 Ok(value) => value,
@@ -433,7 +619,7 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
             NodeKind::Docker => netem::apply_docker(tools, &n.target, conditions)
                 .await
                 .map(|_| None),
-            NodeKind::Disk => Ok(None),
+            NodeKind::Disk | NodeKind::Optical => Ok(None),
         };
         match result {
             Ok(Some(warning)) => rep.warnings.push(format!("{}: {warning}", n.display())),
@@ -452,4 +638,162 @@ pub async fn apply(tools: &Tools, t: &Topology) -> ApplyReport {
         let _ = docker::prune_networks(tools, &in_use).await;
     }
     rep
+}
+
+type OpticalChange = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+/// Ejecuta los cambios en orden y devuelve un resultado por VM. Un fallo no
+/// detiene los demás; por eso cada intento lleva ya nombre y UUID de su VM.
+async fn collect_optical_iso_results(
+    attempts: Vec<(String, String, OpticalChange)>,
+) -> Vec<OpticalIsoResult> {
+    let mut results = Vec::with_capacity(attempts.len());
+    for (name, uuid, change) in attempts {
+        let result = change.await;
+        results.push(OpticalIsoResult {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
+            name,
+            uuid,
+        });
+    }
+    results
+}
+
+/// Cambia o expulsa la ISO del nodo en TODAS las VMs que tengan esa unidad
+/// gestionada (descubierta por el extradata `VMLab/Optical/<nodeId>`). `iso: None`
+/// expulsa el medio sin borrar el fichero ni la unidad. Devuelve un resultado por
+/// VM con nombre, UUID y éxito o error; un fallo en una VM no afecta a las demás.
+pub async fn set_optical_iso(
+    tools: &Tools,
+    node_id: &str,
+    iso: Option<&str>,
+) -> Result<Vec<OpticalIsoResult>> {
+    crate::validate::optical_node_id(node_id)?;
+    let wanted = iso.filter(|s| !s.trim().is_empty());
+    if let Some(iso) = wanted {
+        crate::validate::vm_iso(iso)?;
+    }
+
+    let mut attempts: Vec<(String, String, OpticalChange)> = Vec::new();
+    let mut results = Vec::new();
+    for vm in vbox::list_basic(tools).await? {
+        let slot = match vbox::read_optical_extradata(tools, &vm.uuid, node_id).await {
+            Ok(slot) => slot,
+            Err(e) => {
+                results.push(OpticalIsoResult {
+                    name: vm.name,
+                    uuid: vm.uuid,
+                    ok: false,
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
+        };
+        let Some(slot) = slot else { continue };
+        let target = vm.uuid.clone();
+        let tools = tools.clone();
+        let desired = wanted.map(str::to_string);
+        attempts.push((
+            vm.name,
+            vm.uuid,
+            Box::pin(async move {
+                let medium = desired
+                    .as_deref()
+                    .map_or(vbox::OpticalMedium::Empty, vbox::OpticalMedium::Iso);
+                vbox::set_optical_medium(&tools, &target, &slot, medium, false).await
+            }),
+        ));
+    }
+    results.extend(collect_optical_iso_results(attempts).await);
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Edge, EdgeKind, OpticalSpec};
+
+    fn attempt(name: &str, uuid: &str, ok: bool) -> (String, String, OpticalChange) {
+        (
+            name.into(),
+            uuid.into(),
+            Box::pin(async move {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(CoreError::Message("fallo de prueba".into()))
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn iso_change_reports_every_vm_and_continues_after_a_failure() {
+        let results = collect_optical_iso_results(vec![
+            attempt("una", "uuid-1", true),
+            attempt("dos", "uuid-2", false),
+            attempt("tres", "uuid-3", true),
+        ])
+        .await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].name, "una");
+        assert_eq!(results[0].uuid, "uuid-1");
+        assert!(results[0].ok);
+        assert_eq!(results[0].error, None);
+        assert!(!results[1].ok);
+        assert!(results[1].error.as_deref().unwrap().contains("fallo de prueba"));
+        assert!(results[2].ok);
+    }
+
+    #[test]
+    fn removing_one_optical_link_does_not_affect_other_vms() {
+        let optical = |id: &str| NodeSpec {
+            id: id.into(),
+            kind: NodeKind::Optical,
+            target: id.into(),
+            optical: Some(OpticalSpec { iso: None }),
+            ..NodeSpec::default()
+        };
+        let machine = |id: &str| NodeSpec {
+            id: id.into(),
+            kind: NodeKind::Vbox,
+            target: id.into(),
+            ..NodeSpec::default()
+        };
+        let mount = |from: &str, to: &str| Edge {
+            from: from.into(),
+            to: to.into(),
+            kind: EdgeKind::Mount,
+        };
+
+        // Desconectamos vm1: el plan conservado solo es el de vm2.
+        let after = Topology {
+            nodes: vec![machine("vm1"), machine("vm2"), optical("cd")],
+            edges: vec![mount("cd", "vm2")],
+        };
+        let plans = optical::plan(&after).unwrap();
+        let wanted_by_vm = optical_wanted_by_vm(&plans);
+        let slot = vbox::OpticalSlot { controller: "SATA".into(), port: 0, device: 0 };
+        let entries_vm1 = vec![("cd".to_string(), slot.clone())];
+        let entries_vm2 = vec![("cd".to_string(), slot)];
+
+        let none = HashSet::new();
+        let remove_vm1 = optical_units_to_remove(&entries_vm1, &none);
+        assert_eq!(remove_vm1.len(), 1);
+        assert_eq!(remove_vm1[0].0, "cd");
+
+        let wanted_vm2 = wanted_by_vm.get("vm2").cloned().unwrap_or_default();
+        assert!(optical_units_to_remove(&entries_vm2, &wanted_vm2).is_empty());
+    }
+
+    #[test]
+    fn optical_warnings_name_the_affected_vm() {
+        let vm = NodeSpec {
+            target: "uuid-1".into(),
+            label: Some("Mi VM".into()),
+            ..NodeSpec::default()
+        };
+        assert_eq!(optical_vm_warning(&vm, "no se pudo crear"), "Mi VM: no se pudo crear");
+    }
 }

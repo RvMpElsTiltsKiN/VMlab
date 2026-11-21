@@ -14,9 +14,11 @@ import type {
   MachineNode,
   NetMode,
   NodeNet,
+  OpticalSpec,
 } from '../types';
 import { MAX_DISK_SIZE_MB, normalizeMountPath, syncDiskMounts, validMountPath } from './disk';
 import { hasLinkConditions, LINK_LIMITS } from './link';
+import { isoPathLooksValid } from './optical';
 
 /** Nodo tal y como viaja dentro de un archivo `.vmlab`. */
 export interface LabNode {
@@ -109,6 +111,7 @@ const ALL_DATA_KEYS = new Set<string>([
   'link',
   'slot',
   'disk',
+  'optical',
   ...GUEST_STRING_KEYS,
   'guestSystem',
   'guestMode',
@@ -225,6 +228,13 @@ function exportDisk(disk: DiskSpec | undefined): DiskSpec | undefined {
   };
 }
 
+/** Lista blanca de `optical` para exportar. La ruta es local de este equipo. */
+function exportOptical(spec: OpticalSpec | undefined): OpticalSpec | undefined {
+  const iso = spec?.iso?.trim();
+  if (!iso || !isoPathLooksValid(iso)) return undefined;
+  return { iso };
+}
+
 /** Lista blanca de `MachineData` para exportar. La contraseña de invitado nunca se guarda. */
 function exportData(data: MachineData): Record<string, unknown> {
   const out: Record<string, unknown> = { kind: data.kind, label: data.label, target: data.target };
@@ -232,6 +242,12 @@ function exportData(data: MachineData): Record<string, unknown> {
   if (data.kind === 'disk') {
     const disk = exportDisk(data.disk);
     if (disk) out.disk = disk;
+    return out;
+  }
+
+  if (data.kind === 'optical') {
+    const optical = exportOptical(data.optical);
+    if (optical) out.optical = optical;
     return out;
   }
 
@@ -608,6 +624,26 @@ function parseDisk(value: unknown, label: string, warnings: Message[]): DiskSpec
   return { ...(sizeMb === undefined ? {} : { sizeMb }), shared, mounts };
 }
 
+/** Lee el campo opcional `optical` de un laboratorio antiguo o reciente. */
+function parseOptical(value: unknown, label: string, warnings: Message[]): OpticalSpec | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value)) {
+    warnings.push({ key: 'labFile.warn.opticalInvalid', params: { label } });
+    return undefined;
+  }
+  const iso = value.iso;
+  if (iso === undefined || iso === null || iso === '') return undefined;
+  if (typeof iso !== 'string' || charLength(iso) > 1024 || !isoPathLooksValid(iso)) {
+    warnings.push({ key: 'labFile.warn.opticalIsoInvalid', params: { label } });
+    return undefined;
+  }
+  const unknown = Object.keys(value).filter((key) => key !== 'iso');
+  if (unknown.length) {
+    warnings.push({ key: 'labFile.warn.opticalUnknown', params: { label, fields: droppedKeys(unknown) } });
+  }
+  return { iso };
+}
+
 function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Message[]): MachineNode | null {
   if (!isRecord(raw)) {
     warnings.push({ key: 'labFile.warn.nodeNotObject', params: { index: index + 1 } });
@@ -645,7 +681,7 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Mes
   }
 
   const kind = data.kind;
-  if (kind !== 'vbox' && kind !== 'docker' && kind !== 'disk') {
+  if (kind !== 'vbox' && kind !== 'docker' && kind !== 'disk' && kind !== 'optical') {
     const kindLabel = kindName(kind);
     warnings.push(
       kindLabel
@@ -675,7 +711,7 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Mes
     warnings.push({ key: 'labFile.warn.nodeUnknown', params: { label: display, fields: droppedKeys(unknown) } });
   }
 
-  if (kind !== 'disk' && data.link !== undefined) {
+  if (kind !== 'disk' && kind !== 'optical' && data.link !== undefined) {
     const link = parseLink(data.link, display, warnings);
     if (link) out.link = link;
   }
@@ -690,6 +726,20 @@ function parseNode(raw: unknown, index: number, seen: Set<string>, warnings: Mes
     );
     if (extra.length) {
       warnings.push({ key: 'labFile.warn.diskFields', params: { label: display, fields: droppedKeys(extra) } });
+    }
+    return { id, type: 'machine', position: { x: position.x, y: position.y }, data: out };
+  }
+
+  if (kind === 'optical') {
+    if (data.optical !== undefined) {
+      const optical = parseOptical(data.optical, display, warnings);
+      if (optical) out.optical = optical;
+    }
+    const extra = ['image', 'run', 'net', 'slot', 'link', 'disk', ...GUEST_KEYS].filter(
+      (key) => data[key] !== undefined,
+    );
+    if (extra.length) {
+      warnings.push({ key: 'labFile.warn.opticalFields', params: { label: display, fields: droppedKeys(extra) } });
     }
     return { id, type: 'machine', position: { x: position.x, y: position.y }, data: out };
   }
@@ -815,9 +865,20 @@ export function parseLab(text: string): ParseLabResult {
       return;
     }
     const kind: EdgeKind = item.kind === 'mount' ? 'mount' : 'network';
-    if (kind === 'mount' && (nodeKinds.get(source) === 'disk') === (nodeKinds.get(target) === 'disk')) {
+    const sourceKind = nodeKinds.get(source);
+    const targetKind = nodeKinds.get(target);
+    const peripheral = (k: string | undefined) => k === 'disk' || k === 'optical';
+    if (kind === 'mount' && peripheral(sourceKind) === peripheral(targetKind)) {
       warnings.push({ key: 'labFile.warn.edgeMountInvalid', params: { source, target } });
       return;
+    }
+    if (sourceKind === 'optical' || targetKind === 'optical') {
+      const opticalId = sourceKind === 'optical' ? source : target;
+      const otherKind = sourceKind === 'optical' ? targetKind : sourceKind;
+      if (kind !== 'mount' || otherKind !== 'vbox') {
+        warnings.push({ key: 'labFile.warn.edgeOpticalInvalid', params: { source: opticalId, target } });
+        return;
+      }
     }
     const key = `${kind}|${source < target ? `${source}|${target}` : `${target}|${source}`}`;
     if (seen.has(key)) {

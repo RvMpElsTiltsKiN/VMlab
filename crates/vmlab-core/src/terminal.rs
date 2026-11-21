@@ -76,6 +76,9 @@ pub fn open(
         NodeKind::Disk => {
             return Err(CoreError::Invalid("un disco no tiene terminal".into()));
         }
+        NodeKind::Optical => {
+            return Err(CoreError::Invalid("una unidad óptica no tiene terminal".into()));
+        }
     };
 
     launch(&program, &args)

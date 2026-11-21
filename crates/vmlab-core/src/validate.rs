@@ -161,6 +161,17 @@ pub fn labsnap_id(s: &str) -> Result<&str> {
     if ok { Ok(s) } else { bad("identificador de instantánea no válido", s) }
 }
 
+/// Identificador de un nodo del lienzo. Acaba formando parte de la clave de
+/// extradata `VMLab/Optical/<id>`, así que se prohíben controles y el separador `|`.
+pub fn optical_node_id(s: &str) -> Result<&str> {
+    let ok = !s.is_empty()
+        && s.chars().count() <= 128
+        && !s.starts_with('-')
+        && !s.contains('|')
+        && !s.chars().any(|c| c.is_control());
+    if ok { Ok(s) } else { bad("identificador de unidad óptica no válido", s) }
+}
+
 /// Nombre visible de una instantánea: 1-40 caracteres, letras, números, espacios
 /// y `- _ . ( )`. Se admiten tildes y `ñ`; se rechazan comillas, barras y controles.
 pub fn labsnap_label(s: &str) -> Result<&str> {
@@ -334,10 +345,11 @@ pub fn disk_kind(t: &Topology, disk: &NodeSpec) -> Result<DiskKind> {
         let kind = match target.kind {
             NodeKind::Docker => DiskKind::Docker,
             NodeKind::Vbox => DiskKind::Vdi,
-            NodeKind::Disk => {
+            NodeKind::Disk | NodeKind::Optical => {
                 return Err(CoreError::Invalid(format!(
-                    "el disco «{}» no puede enlazarse con otro disco",
-                    disk.display()
+                    "el disco «{}» no puede enlazarse con «{}»",
+                    disk.display(),
+                    target.display()
                 )))
             }
         };
@@ -376,6 +388,12 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
     let by_id: HashMap<&str, &NodeSpec> = t.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let disks: Vec<&NodeSpec> = t.nodes.iter().filter(|n| n.kind == NodeKind::Disk).collect();
     let disk_ids: HashSet<&str> = disks.iter().map(|d| d.id.as_str()).collect();
+    let optical_ids: HashSet<&str> = t
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Optical)
+        .map(|n| n.id.as_str())
+        .collect();
 
     for n in &t.nodes {
         if n.kind != NodeKind::Disk && n.disk.is_some() {
@@ -509,6 +527,10 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
     }
 
     for e in &t.edges {
+        // Los enlaces de las unidades ópticas se comprueban en `optical_topology`.
+        if optical_ids.contains(e.from.as_str()) || optical_ids.contains(e.to.as_str()) {
+            continue;
+        }
         let from_disk = disk_ids.contains(e.from.as_str());
         let to_disk = disk_ids.contains(e.to.as_str());
         if !from_disk && !to_disk {
@@ -579,6 +601,79 @@ pub fn disk_topology(t: &Topology) -> Result<()> {
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Valida la parte óptica de una topología: ISO y enlaces `Mount` exclusivamente
+/// con VMs de VirtualBox. Una unidad puede conectarse a varias VMs (una unidad
+/// distinta por VM, todas con la misma ISO). Es una comprobación pura: se ejecuta
+/// antes de tocar VirtualBox. Una topología sin ópticos siempre es válida.
+pub fn optical_topology(t: &Topology) -> Result<()> {
+    let by_id: HashMap<&str, &NodeSpec> = t.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let optical_ids: HashSet<&str> = t
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Optical)
+        .map(|n| n.id.as_str())
+        .collect();
+
+    for n in &t.nodes {
+        if n.kind != NodeKind::Optical && n.optical.is_some() {
+            return Err(CoreError::Invalid(format!(
+                "solo una unidad óptica puede tener una ISO: «{}»",
+                n.display()
+            )));
+        }
+    }
+
+    for o in t.nodes.iter().filter(|n| n.kind == NodeKind::Optical) {
+        optical_node_id(&o.id)?;
+        if o.disk.is_some() {
+            return Err(CoreError::Invalid(format!(
+                "la unidad óptica «{}» no puede tener discos",
+                o.display()
+            )));
+        }
+        let iso = o.optical.as_ref().and_then(|s| s.iso.as_deref()).filter(|s| !s.trim().is_empty());
+        if let Some(iso) = iso {
+            vm_iso(iso).map_err(|e| CoreError::Invalid(format!("unidad «{}»: {e}", o.display())))?;
+        }
+    }
+
+    for e in &t.edges {
+        let from_optical = optical_ids.contains(e.from.as_str());
+        let to_optical = optical_ids.contains(e.to.as_str());
+        if !from_optical && !to_optical {
+            continue;
+        }
+        if from_optical && to_optical {
+            return Err(CoreError::Invalid(
+                "una unidad óptica no puede enlazarse con otra unidad óptica".into(),
+            ));
+        }
+        if e.kind != EdgeKind::Mount {
+            return Err(CoreError::Invalid(
+                "una unidad óptica solo se conecta con enlaces de montaje".into(),
+            ));
+        }
+        let (optical_id, other_id) = if from_optical {
+            (e.from.as_str(), e.to.as_str())
+        } else {
+            (e.to.as_str(), e.from.as_str())
+        };
+        let other = by_id.get(other_id).ok_or_else(|| {
+            CoreError::Invalid(format!(
+                "la unidad «{optical_id}» enlaza con «{other_id}», que no está en el lienzo"
+            ))
+        })?;
+        if other.kind != NodeKind::Vbox {
+            return Err(CoreError::Invalid(format!(
+                "la unidad «{optical_id}» solo se puede enlazar con una máquina virtual de VirtualBox, no con «{}»",
+                other.display()
+            )));
+        }
+        vbox_target(&other.target)?;
     }
     Ok(())
 }
@@ -1541,5 +1636,110 @@ Description: Other/Unknown
             assert!(vm_disk_bus(&d.disk_bus).is_ok(), "{}", entry.label);
             assert!(!(d.tpm && d.firmware != "efi"), "{}", entry.label);
         }
+    }
+
+    fn optical_node(id: &str, iso: Option<String>) -> NodeSpec {
+        NodeSpec {
+            id: id.into(),
+            kind: NodeKind::Optical,
+            target: id.into(),
+            optical: Some(crate::model::OpticalSpec { iso }),
+            ..NodeSpec::default()
+        }
+    }
+    fn lab_vm(id: &str) -> NodeSpec {
+        NodeSpec { id: id.into(), kind: NodeKind::Vbox, target: id.into(), ..NodeSpec::default() }
+    }
+    fn edge(a: &str, b: &str, kind: EdgeKind) -> Edge {
+        Edge { from: a.into(), to: b.into(), kind }
+    }
+
+    #[test]
+    fn optical_iso_uses_the_same_validator_as_vm_creation() {
+        let dir = std::env::temp_dir();
+        let iso = dir.join(format!("vmlab-optical-{}.iso", std::process::id()));
+        std::fs::write(&iso, b"ISO").unwrap();
+        let good = iso.to_string_lossy().into_owned();
+
+        let t = Topology {
+            nodes: vec![lab_vm("vm"), optical_node("cd", Some(good.clone()))],
+            edges: vec![edge("cd", "vm", EdgeKind::Mount)],
+        };
+        assert!(optical_topology(&t).is_ok());
+        assert_eq!(vm_iso(&good).unwrap(), good);
+
+        let cases = [
+            "discos/instalador.iso".to_string(),
+            dir.join("instalador.img").to_string_lossy().into_owned(),
+            format!("-{good}"),
+            dir.join(format!("vmlab-optical-{}-no-existe.iso", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        for bad_iso in cases {
+            let t = Topology {
+                nodes: vec![lab_vm("vm"), optical_node("cd", Some(bad_iso.clone()))],
+                edges: vec![edge("cd", "vm", EdgeKind::Mount)],
+            };
+            let err = optical_topology(&t).unwrap_err().to_string();
+            assert!(err.contains("unidad"), "{bad_iso}: {err}");
+        }
+        // Una ISO vacía es una unidad vacía, no un error.
+        let t = Topology {
+            nodes: vec![lab_vm("vm"), optical_node("cd", Some(String::new()))],
+            edges: vec![edge("cd", "vm", EdgeKind::Mount)],
+        };
+        assert!(optical_topology(&t).is_ok());
+        std::fs::remove_file(&iso).unwrap();
+    }
+
+    #[test]
+    fn optical_drive_rejects_docker_but_accepts_many_virtual_machines() {
+        let docker = NodeSpec {
+            id: "web".into(),
+            kind: NodeKind::Docker,
+            target: "web".into(),
+            ..NodeSpec::default()
+        };
+        let t = Topology {
+            nodes: vec![docker, optical_node("cd", None)],
+            edges: vec![edge("cd", "web", EdgeKind::Mount)],
+        };
+        let err = optical_topology(&t).unwrap_err().to_string();
+        assert!(err.contains("máquina virtual de VirtualBox"), "{err}");
+
+        let t = Topology {
+            nodes: vec![lab_vm("vm1"), lab_vm("vm2"), optical_node("cd", None)],
+            edges: vec![edge("cd", "vm1", EdgeKind::Mount), edge("cd", "vm2", EdgeKind::Mount)],
+        };
+        assert!(optical_topology(&t).is_ok());
+
+        let t = Topology {
+            nodes: vec![lab_vm("vm"), optical_node("cd", None)],
+            edges: vec![edge("cd", "vm", EdgeKind::Network)],
+        };
+        assert!(optical_topology(&t).is_err());
+
+        let t = Topology {
+            nodes: vec![optical_node("cd1", None), optical_node("cd2", None)],
+            edges: vec![edge("cd1", "cd2", EdgeKind::Mount)],
+        };
+        assert!(optical_topology(&t).is_err());
+
+        let t = Topology {
+            nodes: vec![optical_node("cd|mal", None)],
+            edges: vec![],
+        };
+        assert!(optical_topology(&t).is_err());
+    }
+
+    #[test]
+    fn optical_mount_edges_do_not_break_disk_validation() {
+        let t = Topology {
+            nodes: vec![lab_vm("vm"), optical_node("cd", None)],
+            edges: vec![edge("cd", "vm", EdgeKind::Mount)],
+        };
+        assert!(disk_topology(&t).is_ok());
+        assert!(optical_topology(&t).is_ok());
     }
 }

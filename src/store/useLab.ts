@@ -18,6 +18,7 @@ import {
   syncDiskMounts,
 } from '../lib/disk';
 import { ipc, setMockNotice } from '../lib/ipc';
+import { isMachineNode, isOptical, isoFileName, linkedVmsOf, nextOpticalName } from '../lib/optical';
 import { parseLab, serializeLab, type LabEdge, type LabNode } from '../lib/labFile';
 import { hasLinkConditions } from '../lib/link';
 import { EMPTY_SNAPSHOT, resolveState } from '../lib/status';
@@ -37,7 +38,9 @@ import type {
   LabSnapNode,
   MachineData,
   MachineNode,
+  ManagedDisk,
   NodeProbe,
+  OpticalVmStatus,
   PaletteItem,
   Snapshot,
   ToolsInfo,
@@ -69,6 +72,14 @@ interface LabState {
   applying: boolean;
   /** Docker Desktop se está arrancando en segundo plano. */
   dockerStarting: boolean;
+  /** Discos gestionados por VMLab, en caché para no consultar IPC al renderizar. */
+  managedDisks: ManagedDisk[];
+  /** Unidades ópticas creadas por `apply_topology` en esta sesión (no se guardan en `.vmlab`). */
+  opticalReady: Record<string, boolean>;
+  /** Unidades cuya ISO guardada no existe en este equipo (detectada al aplicar). */
+  opticalIsoMissing: Record<string, boolean>;
+  /** Estado por unidad y VM enlazada: nodo óptico → id de VM → estado. */
+  opticalVmState: Record<string, Record<string, OpticalVmStatus>>;
   /** Instantáneas del laboratorio disponibles en los nodos del lienzo. */
   labsnaps: LabSnapInfo[];
   /** Hay una operación de instantáneas en curso (puede tardar minutos). */
@@ -91,6 +102,8 @@ interface LabState {
 
   init: () => Promise<void>;
   refreshInventory: () => Promise<void>;
+  /** Actualiza la caché de discos. Devuelve false si el backend no respondió. */
+  refreshDisks: (options?: { quiet?: boolean }) => Promise<boolean>;
   startDocker: () => Promise<void>;
   onNodesChange: (c: NodeChange<MachineNode>[]) => void;
   onEdgesChange: (c: EdgeChange[]) => void;
@@ -99,6 +112,8 @@ interface LabState {
   updateNode: (id: string, patch: Partial<MachineData>) => void;
   /** Cambia la ruta de un enlace de montaje y mantiene `disk.mounts` alineado. */
   setMountPath: (edgeId: string, path: string) => void;
+  /** Cambia o expulsa la ISO; si la unidad ya existe, llama directamente al backend. */
+  setOpticalIso: (id: string, iso?: string) => Promise<void>;
   removeNode: (id: string) => void;
   exportLab: () => void;
   importLab: (text: string, mode: LabMode) => Promise<void>;
@@ -199,6 +214,25 @@ function applyTheme(t: Theme) {
 
 const errText = (e: unknown) => (typeof e === 'string' ? e : e instanceof Error ? e.message : JSON.stringify(e));
 
+/** Quita ids de un mapa de estado de unidades ópticas. */
+function omitOpticalFlags(record: Record<string, boolean>, ids: string[]): Record<string, boolean> {
+  if (!ids.length) return record;
+  const out = { ...record };
+  for (const id of ids) delete out[id];
+  return out;
+}
+
+/** Quita unidades de los estados por VM cuando desaparecen del lienzo. */
+function omitOpticalVmState(
+  record: Record<string, Record<string, OpticalVmStatus>>,
+  ids: string[],
+): Record<string, Record<string, OpticalVmStatus>> {
+  if (!ids.length) return record;
+  const out = { ...record };
+  for (const id of ids) delete out[id];
+  return out;
+}
+
 /** Errores de la CLI cuando Docker Desktop está cerrado o su motor aún no escucha. */
 const DOCKER_DOWN_RE = /failed to connect to the docker api|cannot connect to the docker daemon|is the docker daemon running|error during connect/i;
 
@@ -207,13 +241,13 @@ const newId = () => `n_${Date.now().toString(36)}${Math.random().toString(36).sl
 
 /** Nodos que todavía no apuntan a una máquina real (huecos de plantilla o destino vacío). */
 function unassignedNodes(nodes: MachineNode[]): MachineNode[] {
-  return nodes.filter((n) => !isDisk(n) && (n.data.slot === true || n.data.target.trim() === ''));
+  return nodes.filter((n) => isMachineNode(n) && (n.data.slot === true || n.data.target.trim() === ''));
 }
 
-/** Nodos que viajan al backend de instantáneas: ni huecos ni discos. */
+/** Nodos que viajan al backend de instantáneas: solo máquinas reales. */
 function labsnapNodes(nodes: MachineNode[]): LabSnapNode[] {
   return nodes
-    .filter((n) => !isDisk(n) && n.data.slot !== true && n.data.target.trim() !== '')
+    .filter((n) => isMachineNode(n) && n.data.slot !== true && n.data.target.trim() !== '')
     .map((n) => ({ kind: n.data.kind as LabSnapNode['kind'], target: n.data.target, label: n.data.label }));
 }
 
@@ -302,7 +336,7 @@ function mergeLab(
     if (data.target) {
       const key = `${data.kind}:${data.target}`;
       if (taken.has(key)) {
-        if (template && (data.kind === 'docker' || data.kind === 'disk')) {
+        if (template && (data.kind === 'docker' || data.kind === 'disk' || data.kind === 'optical')) {
           let suffix = 2;
           let candidate = `${data.target}-${suffix}`;
           while (taken.has(`${data.kind}:${candidate}`)) {
@@ -338,7 +372,7 @@ function mergeLab(
   // reasignar ids hay que traducirlos para que el disco apunte al contenedor
   // que realmente está ahora en el lienzo.
   const incomingDiskIds = new Set(
-    incomingNodes.filter((n) => n.data.kind === 'disk').map((n) => n.id),
+    incomingNodes.filter((n) => n.data.kind === 'disk' || n.data.kind === 'optical').map((n) => n.id),
   );
   const mountPaths = new Map<string, string | undefined>();
   for (const input of incomingNodes) {
@@ -395,6 +429,10 @@ export const useLab = create<LabState>()((set, get) => ({
   busy: {},
   applying: false,
   dockerStarting: false,
+  managedDisks: [],
+  opticalReady: {},
+  opticalIsoMissing: {},
+  opticalVmState: {},
   labsnaps: [],
   labsnapBusy: false,
   captures: [],
@@ -438,6 +476,9 @@ export const useLab = create<LabState>()((set, get) => ({
     });
 
     try { set({ tools: await ipc.detectTools() }); } catch { /* se mostrará como no detectado */ }
+    // Sin Docker el backend no puede enumerar volúmenes; el gestor mostrará el
+    // estado vacío. No interrumpimos el arranque por este fallo.
+    void get().refreshDisks({ quiet: true });
     await get().refreshInventory();
     try { set({ snapshot: await ipc.refreshStatus() }); } catch { /* el monitor lo reintenta */ }
     await ipc.onStatus((snapshot) => set({ snapshot }));
@@ -449,6 +490,16 @@ export const useLab = create<LabState>()((set, get) => ({
       set({ inventory: await ipc.listMachines() });
     } catch (e) {
       get().toast('error', technicalText(errText(e)));
+    }
+  },
+
+  async refreshDisks(options) {
+    try {
+      set({ managedDisks: await ipc.disksList() });
+      return true;
+    } catch (e) {
+      if (!options?.quiet) get().toast('error', technicalText(errText(e)));
+      return false;
     }
   },
 
@@ -471,9 +522,40 @@ export const useLab = create<LabState>()((set, get) => ({
   },
 
   onNodesChange: (c) =>
-    set((s) => syncDiskMounts(applyNodeChanges(c, s.nodes), s.edges)),
+    set((s) => {
+      const byId = new Map(s.nodes.map((n) => [n.id, n]));
+      const removed = c
+        .filter((change) => change.type === 'remove')
+        .map((change) => byId.get(change.id))
+        .filter((n): n is MachineNode => !!n && isOptical(n))
+        .map((n) => n.id);
+      return {
+        ...syncDiskMounts(applyNodeChanges(c, s.nodes), s.edges),
+        opticalReady: omitOpticalFlags(s.opticalReady, removed),
+        opticalIsoMissing: omitOpticalFlags(s.opticalIsoMissing, removed),
+        opticalVmState: omitOpticalVmState(s.opticalVmState, removed),
+      };
+    }),
   onEdgesChange: (c) =>
-    set((s) => syncDiskMounts(s.nodes, applyEdgeChanges(c, s.edges))),
+    set((s) => {
+      const byId = new Map(s.nodes.map((n) => [n.id, n]));
+      const affected = new Set<string>();
+      for (const change of c) {
+        if (change.type !== 'remove') continue;
+        const edge = s.edges.find((e) => e.id === change.id);
+        if (!edge) continue;
+        for (const id of [edge.source, edge.target]) {
+          if (byId.get(id) && isOptical(byId.get(id)!)) affected.add(id);
+        }
+      }
+      const ids = [...affected];
+      return {
+        ...syncDiskMounts(s.nodes, applyEdgeChanges(c, s.edges)),
+        opticalReady: omitOpticalFlags(s.opticalReady, ids),
+        opticalIsoMissing: omitOpticalFlags(s.opticalIsoMissing, ids),
+        opticalVmState: omitOpticalVmState(s.opticalVmState, ids),
+      };
+    }),
 
   onConnect(c) {
     if (!c.source || !c.target || c.source === c.target) return;
@@ -546,7 +628,43 @@ export const useLab = create<LabState>()((set, get) => ({
       return;
     }
 
-    // Sin discos: solo cables de red. Nunca se crea un enlace de montaje entre dos no-discos.
+    const aOptical = isOptical(a);
+    const bOptical = isOptical(b);
+    if (aOptical || bOptical) {
+      if (aOptical && bOptical) {
+        toast('error', t('optical.linkOptical'));
+        return;
+      }
+      const drive = aOptical ? a : b;
+      const target = aOptical ? b : a;
+      if (target.data.kind !== 'vbox') {
+        toast('error', t('optical.linkVmOnly'));
+        return;
+      }
+      const exists = edges.some(
+        (e) =>
+          edgeKind(e) === 'mount' &&
+          ((e.source === drive.id && e.target === target.id) ||
+            (e.source === target.id && e.target === drive.id)),
+      );
+      if (exists) return;
+      const edge: Edge = {
+        id: `e_${c.source}_${c.target}_mount`,
+        source: c.source,
+        target: c.target,
+        sourceHandle: c.sourceHandle,
+        targetHandle: c.targetHandle,
+        kind: 'mount',
+      };
+      set((s) => ({
+        ...syncDiskMounts(s.nodes, [...s.edges, edge]),
+        opticalReady: { ...s.opticalReady, [drive.id]: false },
+        opticalVmState: omitOpticalVmState(s.opticalVmState, [drive.id]),
+      }));
+      return;
+    }
+
+    // Sin periféricos: solo cables de red.
     const exists = edges.some(
       (e) =>
         edgeKind(e) === 'network' &&
@@ -574,6 +692,13 @@ export const useLab = create<LabState>()((set, get) => ({
         label: item.label || t('disk.defaultName'),
         target,
         disk: { sizeMb: DEFAULT_DISK_SIZE_MB, shared: false, mounts: [] },
+      };
+    } else if (item.kind === 'optical') {
+      data = {
+        kind: 'optical',
+        label: item.label || t('optical.title'),
+        target: nextOpticalName(nodes),
+        optical: {},
       };
     } else {
       if (nodes.some((n) => n.data.kind === item.kind && n.data.target === item.target)) {
@@ -606,11 +731,96 @@ export const useLab = create<LabState>()((set, get) => ({
       return syncDiskMounts(s.nodes, edges);
     }),
 
+  async setOpticalIso(id, iso) {
+    const node = get().nodes.find((n) => n.id === id);
+    if (!node || !isOptical(node)) return;
+    const vms = linkedVmsOf(node, get().nodes, get().edges);
+    const name = isoFileName(iso);
+    // La ISO siempre queda guardada en el lienzo, incluso si alguna VM está pendiente.
+    get().updateNode(id, { optical: { ...(node.data.optical ?? {}), iso } });
+
+    // Sin unidades creadas no hay nada que cambiar en caliente: se aplicará luego.
+    if (!vms.length || !get().opticalReady[id]) {
+      set((s) => ({ opticalIsoMissing: { ...s.opticalIsoMissing, [id]: false } }));
+      get().toast('info', t('optical.savedForApply', { name: name || t('optical.empty') }));
+      return;
+    }
+
+    set((s) => ({ busy: { ...s.busy, [id]: true } }));
+    try {
+      const results = await ipc.opticalSetIso(id, iso ?? null);
+      const byVm = new Map<string, MachineNode>();
+      for (const vm of vms) {
+        byVm.set(vm.data.target, vm);
+        byVm.set(vm.data.label, vm);
+      }
+      const lines: string[] = [];
+      const failures: string[] = [];
+      const nextState: Record<string, OpticalVmStatus> = {};
+      for (const result of results) {
+        const vm = byVm.get(result.uuid) ?? byVm.get(result.name);
+        const label = vm?.data.label || result.name;
+        if (result.ok) {
+          lines.push(t('optical.resultOk', { vm: label }));
+        } else {
+          const detail = result.error ?? '';
+          lines.push(t('optical.resultError', { vm: label, detail }));
+          failures.push(t('optical.resultError', { vm: label, detail }));
+        }
+        if (vm) nextState[vm.id] = { ready: result.ok, ...(result.ok ? {} : { error: result.error }) };
+      }
+      // Las VMs a las que el backend no devolvió resultado siguen pendientes.
+      for (const vm of vms) {
+        if (!nextState[vm.id]) {
+          nextState[vm.id] = { ready: false };
+          lines.push(t('optical.resultPending', { vm: vm.data.label }));
+        }
+      }
+      const okCount = results.filter((r) => r.ok).length;
+      const summary = t(
+        iso ? 'optical.isoSummary' : 'optical.ejectSummary',
+        { name, ok: okCount, total: results.length },
+      );
+      const isoMissing = results.some(
+        (r) => !r.ok && /no existe|no es un fichero/i.test(r.error ?? ''),
+      );
+      set((s) => ({
+        opticalVmState: {
+          ...s.opticalVmState,
+          [id]: { ...(s.opticalVmState[id] ?? {}), ...nextState },
+        },
+        opticalReady: { ...s.opticalReady, [id]: Object.values(nextState).some((v) => v.ready) },
+        opticalIsoMissing: { ...s.opticalIsoMissing, [id]: isoMissing },
+      }));
+      get().toast(failures.length ? 'warning' : 'ok', `${summary}\n${lines.join('\n')}`);
+      if (failures.length) {
+        // Persistentes y copiables: el resumen de errores se puede pegar en un informe.
+        get().toast(
+          'error',
+          technicalText(t('optical.changeFailed', { count: failures.length, detail: failures.join(' | ') })),
+        );
+      }
+    } catch (e) {
+      get().toast(
+        'error',
+        technicalText(t('optical.changeFailed', { count: vms.length, detail: errText(e) })),
+      );
+    } finally {
+      set((s) => ({ busy: { ...s.busy, [id]: false } }));
+    }
+  },
+
   removeNode: (id) =>
     set((s) => {
       const nodes = s.nodes.filter((n) => n.id !== id);
       const edges = s.edges.filter((e) => e.source !== id && e.target !== id);
-      return syncDiskMounts(nodes, edges);
+      const opticalReady = { ...s.opticalReady };
+      const opticalIsoMissing = { ...s.opticalIsoMissing };
+      const opticalVmState = { ...s.opticalVmState };
+      delete opticalReady[id];
+      delete opticalIsoMissing[id];
+      delete opticalVmState[id];
+      return { ...syncDiskMounts(nodes, edges), opticalReady, opticalIsoMissing, opticalVmState };
     }),
 
   exportLab() {
@@ -656,7 +866,7 @@ export const useLab = create<LabState>()((set, get) => ({
 
     const warnings = [...parsed.warnings];
     const result = mergeLab(parsed.nodes, parsed.edges, mode, get().nodes, get().edges, inventory, false, warnings);
-    set({ nodes: result.nodes, edges: result.edges, probes: {}, report: null });
+    set({ nodes: result.nodes, edges: result.edges, probes: {}, report: null, opticalReady: {}, opticalIsoMissing: {}, opticalVmState: {} });
     const summary = mode === 'replace'
       ? t('toast.importedReplace', { count: result.added })
       : t('toast.importedAppend', { count: result.added });
@@ -666,7 +876,7 @@ export const useLab = create<LabState>()((set, get) => ({
   applyTemplate(template, mode) {
     const warnings: Message[] = [];
     const result = mergeLab(template.nodes, template.edges, mode, get().nodes, get().edges, get().inventory, true, warnings);
-    set({ nodes: result.nodes, edges: result.edges, probes: {}, report: null });
+    set({ nodes: result.nodes, edges: result.edges, probes: {}, report: null, opticalReady: {}, opticalIsoMissing: {}, opticalVmState: {} });
     const summary = mode === 'replace'
       ? t('toast.templateReplace', { name: template.name, count: result.added })
       : t('toast.templateAppend', { name: template.name, count: result.added });
@@ -676,7 +886,7 @@ export const useLab = create<LabState>()((set, get) => ({
   async act(id, action) {
     if (get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    if (!node || !isMachineNode(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
     const kind = machineKindOf(node.data.kind);
     if (!kind) return;
     set((s) => ({ busy: { ...s.busy, [id]: true } }));
@@ -704,7 +914,7 @@ export const useLab = create<LabState>()((set, get) => ({
     const node = get().nodes.find((n) => n.id === id);
     if (!node) return;
     const { data } = node;
-    if (isDisk(node)) return;
+    if (!isMachineNode(node)) return;
     const kind = machineKindOf(data.kind);
     if (!kind) return;
     if (data.slot === true || !data.target.trim()) {
@@ -743,7 +953,7 @@ export const useLab = create<LabState>()((set, get) => ({
       get().toast('error', error);
       return;
     }
-    await Promise.allSettled(get().nodes.filter((n) => !isDisk(n)).map((n) => get().act(n.id, action)));
+    await Promise.allSettled(get().nodes.filter(isMachineNode).map((n) => get().act(n.id, action)));
   },
 
   async applyNetwork() {
@@ -759,13 +969,47 @@ export const useLab = create<LabState>()((set, get) => ({
       const { nodes, edges } = get();
       const report = await ipc.applyTopology(toPayload(nodes, edges));
       set({ report });
+
+      // Estado por VM: el backend nombra a la VM en cada aviso, así que podemos
+      // distinguir una unidad creada de una VM pendiente o con error.
+      const opticalReady: Record<string, boolean> = {};
+      const opticalIsoMissing: Record<string, boolean> = {};
+      const opticalVmState: Record<string, Record<string, OpticalVmStatus>> = {};
+      const issueRe = /apaga|estado guardado|unidad óptica|crear|no existe|no es un fichero/i;
+      for (const drive of nodes.filter(isOptical)) {
+        const vms = linkedVmsOf(drive, nodes, edges);
+        const states: Record<string, OpticalVmStatus> = {};
+        for (const vm of vms) {
+          const tokens = [vm.data.label.trim(), vm.data.target.trim()].filter(Boolean);
+          const mentions = (text: string) => tokens.some((token) => text.includes(token));
+          const issue = [...report.errors, ...report.warnings].find(
+            (msg) => mentions(msg) && issueRe.test(msg),
+          );
+          states[vm.id] = { ready: !issue, ...(issue ? { error: issue } : {}) };
+        }
+        opticalVmState[drive.id] = states;
+        opticalReady[drive.id] = vms.length > 0 && Object.values(states).every((s) => s.ready);
+        const iso = drive.data.optical?.iso?.trim();
+        if (iso) {
+          const name = isoFileName(iso);
+          const missingRe = /no existe|no es un fichero/i;
+          opticalIsoMissing[drive.id] =
+            report.errors.some((e) => e.includes(name) && missingRe.test(e)) ||
+            report.warnings.some((w) => w.includes(name) && missingRe.test(w));
+        }
+      }
+      set({ opticalReady, opticalIsoMissing, opticalVmState });
+
+      const hasPeripherals = nodes.some((n) => isDisk(n) || isOptical(n));
       if (report.errors.length) {
-        // Los errores son persistentes (kind='error'). Si hay discos en el
-        // lienzo se añade el detalle del backend para poder diagnosticar el
-        // volumen o la ruta que ha fallado.
+        // Los errores son persistentes (kind='error'). Con periféricos se añade
+        // el detalle del backend para diagnosticar volúmenes, rutas e ISOs.
         const summary = t('toast.applyNetworkErrors', { count: report.errors.length });
-        const text = nodes.some(isDisk)
-          ? toastSummary(t('toast.applyDiskErrors'), report.errors)
+        const text = hasPeripherals
+          ? toastSummary(
+              t(nodes.some(isOptical) ? 'toast.applyOpticalErrors' : 'toast.applyDiskErrors'),
+              report.errors,
+            )
           : summary;
         get().toast('error', text);
       } else {
@@ -774,13 +1018,15 @@ export const useLab = create<LabState>()((set, get) => ({
           report.networks.length ? t('toast.networkApplied', { count: report.applied }) : t('toast.noConnections'),
         );
       }
-      // Los avisos del backend también se muestran al aplicar. Si hay discos
-      // en el lienzo son persistentes y copiables, como los errores.
+      // Los avisos del backend también se muestran al aplicar. Con periféricos
+      // son persistentes y copiables, como los errores.
       if (report.warnings.length) {
         const text = toastSummary(t('toast.applyWarnings'), orderedWarnings(report.warnings));
-        if (nodes.some(isDisk)) get().toast('warning', text);
+        if (hasPeripherals) get().toast('warning', text);
         else get().toast('info', text);
       }
+      // Al aplicar la red pueden crearse volúmenes nuevos: refresca la caché.
+      void get().refreshDisks({ quiet: true });
       void get().refreshProbes();
     } catch (e) {
       get().toast('error', technicalText(errText(e)));
@@ -792,7 +1038,7 @@ export const useLab = create<LabState>()((set, get) => ({
   async applyLink(id) {
     if (get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    if (!node || !isMachineNode(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
     const kind = machineKindOf(node.data.kind);
     if (!kind) return;
     const conditions = node.data.link;
@@ -829,7 +1075,7 @@ export const useLab = create<LabState>()((set, get) => ({
   async clearLink(id) {
     if (get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
+    if (!node || !isMachineNode(node) || node.data.slot === true || !node.data.target.trim() || get().busy[id]) return;
     const kind = machineKindOf(node.data.kind);
     if (!kind) return;
 
@@ -867,7 +1113,7 @@ export const useLab = create<LabState>()((set, get) => ({
   async startCapture(id, filter) {
     if (get().captureBusy || get().labsnapBusy) return;
     const node = get().nodes.find((n) => n.id === id);
-    if (!node || isDisk(node) || node.data.slot === true || !node.data.target.trim()) return;
+    if (!node || !isMachineNode(node) || node.data.slot === true || !node.data.target.trim()) return;
     const kind = machineKindOf(node.data.kind);
     if (!kind) return;
     if (resolveState(node.data, get().snapshot) !== 'running') {
@@ -1034,7 +1280,7 @@ export const useLab = create<LabState>()((set, get) => ({
     );
     const targets = nodes.filter(
       (n) =>
-        !isDisk(n) &&
+        isMachineNode(n) &&
         linked.has(n.id) &&
         n.data.slot !== true &&
         !!n.data.target &&

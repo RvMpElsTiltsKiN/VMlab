@@ -1,5 +1,6 @@
 import { DEFAULT_MOUNT_PATH, edgeKind, isDisk } from './disk';
-import type { DiskMount, DiskSpec, Edge, MachineNode, TopologyPayload } from '../types';
+import { isOptical } from './optical';
+import type { DiskMount, DiskSpec, Edge, MachineNode, OpticalSpec, TopologyPayload } from '../types';
 
 export interface NetGroup {
   index: number;
@@ -12,8 +13,8 @@ export interface NetGroup {
  * es una red local. Sirve para colorear aristas y mostrar el resumen sin ir al backend.
  */
 export function computeGroups(nodes: MachineNode[], edges: Edge[]) {
-  // Los discos no son máquinas: no forman segmentos de red ni se sondean.
-  const machines = nodes.filter((n) => !isDisk(n));
+  // Los periféricos no son máquinas: no forman segmentos de red ni se sondean.
+  const machines = nodes.filter((n) => !isDisk(n) && !isOptical(n));
   const parent = new Map<string, string>(machines.map((n) => [n.id, n.id]));
   const find = (x: string): string => {
     let r = x;
@@ -69,6 +70,12 @@ export function uniqueHostSlug(label: string, used: Set<string>): string {
   return candidate;
 }
 
+/** Adaptación de la ISO al contrato IPC: una unidad vacía viaja sin campo. */
+function toOpticalSpec(spec: OpticalSpec | undefined): OpticalSpec | undefined {
+  const iso = spec?.iso?.trim();
+  return iso ? { iso } : undefined;
+}
+
 /** Adaptación del disco al contrato IPC: las VM no reciben ruta y sí tamaño. */
 function toDiskSpec(spec: DiskSpec | undefined, byId: Map<string, MachineNode>): DiskSpec | undefined {
   if (!spec) return undefined;
@@ -95,9 +102,10 @@ export function toPayload(nodes: MachineNode[], edges: Edge[]): TopologyPayload 
       image: n.data.image || undefined,
       label: n.data.label,
       net: n.data.kind === 'vbox' ? n.data.net : undefined,
-      link: n.data.kind === 'disk' ? undefined : n.data.link,
+      link: isDisk(n) || isOptical(n) ? undefined : n.data.link,
       options: n.data.kind === 'docker' ? n.data.run : undefined,
-      disk: n.data.kind === 'disk' ? toDiskSpec(n.data.disk, byId) : undefined,
+      disk: isDisk(n) ? toDiskSpec(n.data.disk, byId) : undefined,
+      optical: isOptical(n) ? toOpticalSpec(n.data.optical) : undefined,
     })),
     edges: edges.map((e) => ({ from: e.source, to: e.target, kind: edgeKind(e) })),
   };

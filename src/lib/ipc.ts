@@ -3,6 +3,7 @@
  * (npm run dev) cae a un simulador para poder desarrollar la interfaz sin VirtualBox ni Docker.
  */
 import { t } from '../i18n';
+import { isoFileName, isoPathLooksValid } from './optical';
 import type {
   Action,
   ApplyReport,
@@ -26,7 +27,10 @@ import type {
   LinkReport,
   MachineInfo,
   MachineKind,
+  ManagedDisk,
+  ManagedDiskKind,
   NodeProbe,
+  OpticalIsoResult,
   ProbeNode,
   ScreenshotInfo,
   Snapshot,
@@ -65,6 +69,11 @@ const real = {
   openTerminal: (kind: MachineKind, target: string, user?: string, host?: string) =>
     invoke<void>('open_terminal', { kind, target, user: user ?? null, host: host ?? null }),
   applyTopology: (topology: TopologyPayload) => invoke<ApplyReport>('apply_topology', { topology }),
+  disksList: () => invoke<ManagedDisk[]>('disks_list'),
+  diskDelete: (name: string, kind: ManagedDiskKind) => invoke<void>('disk_delete', { name, kind }),
+  diskResize: (name: string, sizeMb: number) => invoke<void>('disk_resize', { name, sizeMb }),
+  opticalSetIso: (nodeId: string, iso: string | null) =>
+    invoke<OpticalIsoResult[]>('optical_set_iso', { nodeId, iso }),
   linkApply: (kind: MachineKind, target: string, adapter: number | undefined, conditions: LinkConditions) =>
     invoke<LinkReport>('link_apply', { kind, target, adapter: adapter ?? null, conditions }),
   linkClear: (kind: MachineKind, target: string, adapter: number | undefined) =>
@@ -150,6 +159,39 @@ const mockBaseVms: MachineInfo[] = [
 ];
 const mockCreatedVms: MachineInfo[] = [];
 let mockVmSeq = 0;
+
+/** Discos simulados: estado mutable para probar borrado y ampliación sin backend. */
+const mockDisks: ManagedDisk[] = [
+  {
+    name: 'datos',
+    kind: 'vdi',
+    capacityMb: 10_240,
+    sizeOnDiskMb: 2_304,
+    inUseBy: [],
+    deletable: true,
+    resizable: true,
+    note: null,
+  },
+  {
+    name: 'vmlab-vol-web',
+    kind: 'volume',
+    capacityMb: null,
+    sizeOnDiskMb: 96,
+    inUseBy: [{ name: 'web', uuid: null }],
+    deletable: false,
+    resizable: false,
+    note: null,
+  },
+];
+
+interface MockOpticalUnit {
+  name: string;
+  uuid: string;
+  iso: string | null;
+}
+
+/** Unidades ópticas creadas por el simulador: nodo → (VM del lienzo → unidad). */
+const mockOpticalUnits = new Map<string, Map<string, MockOpticalUnit>>();
 
 /** IPv4 a entero sin signo, o `null` si el texto no tiene cuatro octetos válidos. */
 function mockIpv4(text: string): number | null {
@@ -333,12 +375,92 @@ const mock: typeof real = {
       }),
     );
   },
-  applyTopology: async (t) => ({
-    networks: t.edges.length ? ['vmlab-demo0001'] : [],
-    applied: t.nodes.length,
-    errors: [],
-    warnings: [],
-  }),
+  applyTopology: async (topology) => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const vmIds = new Set(topology.nodes.filter((n) => n.kind === 'vbox').map((n) => n.id));
+    const byId = new Map(topology.nodes.map((n) => [n.id, n]));
+    const created = new Map<string, Map<string, MockOpticalUnit>>();
+
+    for (const node of topology.nodes.filter((n) => n.kind === 'optical')) {
+      const iso = node.optical?.iso?.trim() || null;
+      if (iso && !isoPathLooksValid(iso)) {
+        warnings.push(t('mock.opticalIsoInvalid', { name: isoFileName(iso) }));
+      }
+      for (const edge of topology.edges) {
+        if (edge.kind !== 'mount') continue;
+        if (edge.from !== node.id && edge.to !== node.id) continue;
+        const otherId = edge.from === node.id ? edge.to : edge.from;
+        if (!vmIds.has(otherId)) {
+          errors.push(t('mock.opticalVmOnly', { name: node.label || node.id }));
+          continue;
+        }
+        const vm = byId.get(otherId);
+        if (!vm) {
+          errors.push(t('mock.opticalVmMissing', { name: node.label || node.id }));
+          continue;
+        }
+        const units = created.get(node.id) ?? new Map<string, MockOpticalUnit>();
+        units.set(otherId, { name: vm.label || vm.target || otherId, uuid: vm.target, iso });
+        created.set(node.id, units);
+      }
+    }
+    mockOpticalUnits.clear();
+    for (const [id, units] of created) mockOpticalUnits.set(id, units);
+
+    return {
+      networks: topology.edges.length ? ['vmlab-demo0001'] : [],
+      applied: topology.nodes.length,
+      errors,
+      warnings,
+    };
+  },
+  opticalSetIso: async (nodeId, iso) => {
+    const units = mockOpticalUnits.get(nodeId);
+    if (!units || units.size === 0) {
+      throw new Error(t('mock.opticalNotCreated'));
+    }
+    const results: OpticalIsoResult[] = [];
+    for (const unit of units.values()) {
+      unit.iso = iso;
+      results.push({ name: unit.name, uuid: unit.uuid, ok: true });
+    }
+    return results;
+  },
+  disksList: async () => {
+    await delay(150);
+    return mockDisks.map((disk) => ({
+      ...disk,
+      inUseBy: disk.inUseBy.map((user) => ({ ...user })),
+      note: disk.inUseBy.length ? t('mock.diskInUse') : disk.note,
+    }));
+  },
+  diskDelete: async (name, kind) => {
+    await delay(400);
+    const index = mockDisks.findIndex((disk) => disk.name === name && disk.kind === kind);
+    if (index < 0) throw new Error(t('mock.diskMissing', { name }));
+    const disk = mockDisks[index];
+    if (disk.inUseBy.length || !disk.deletable) {
+      throw new Error(t('mock.diskInUse'));
+    }
+    mockDisks.splice(index, 1);
+  },
+  diskResize: async (name, sizeMb) => {
+    await delay(500);
+    const disk = mockDisks.find((d) => d.name === name && d.kind === 'vdi');
+    if (!disk) throw new Error(t('mock.diskMissing', { name }));
+    const current = disk.capacityMb ?? 0;
+    if (
+      !disk.resizable ||
+      !Number.isFinite(sizeMb) ||
+      sizeMb <= current ||
+      sizeMb > 2_000_000
+    ) {
+      throw new Error(t('mock.diskNotGrow'));
+    }
+    disk.capacityMb = sizeMb;
+    disk.note = null;
+  },
   linkApply: async (kind, target, _adapter, conditions) => {
     await delay(700);
     if (kind === 'docker') {

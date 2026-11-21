@@ -18,6 +18,7 @@ import {
 } from '@xyflow/react';
 import { linkLive } from '../lib/connectivity';
 import { diskSizeLabel, edgeKind, isDisk, mountPathOf } from '../lib/disk';
+import { isMachineNode } from '../lib/optical';
 import { resolveState } from '../lib/status';
 import { useT } from '../i18n';
 import { useLab } from '../store/useLab';
@@ -76,7 +77,7 @@ function Flow() {
 
   // Sonda periódica: el cable pasa a verde en cuanto ambos extremos se ven en la
   // misma red. Se relanza al arrancar/parar VMs y al cambiar adaptador o modo.
-  const machines = nodes.filter((n) => !isDisk(n));
+  const machines = nodes.filter(isMachineNode);
   const runningKey = machines
     .filter((n) => resolveState(n.data, snapshot) === 'running')
     .map((n) => n.id)
@@ -243,7 +244,13 @@ function Flow() {
           pannable={!canvasLocked}
           zoomable={!canvasLocked}
           nodeColor={(n) =>
-            n.data?.kind === 'disk' ? '#d6a24a' : n.data?.kind === 'vbox' ? '#8b7cf6' : '#38a8f0'
+            n.data?.kind === 'disk'
+              ? '#d6a24a'
+              : n.data?.kind === 'optical'
+                ? '#5cc8ff'
+                : n.data?.kind === 'vbox'
+                  ? '#8b7cf6'
+                  : '#38a8f0'
           }
         />
       </ReactFlow>

@@ -1,4 +1,5 @@
 import type { Edge, MachineNode, NodeKind } from '../types';
+import { isOptical } from './optical';
 
 /** Tipos del lienzo. `MachineKind` sigue siendo el contrato IPC de máquinas. */
 export const DEFAULT_MOUNT_PATH = '/data';
@@ -112,14 +113,25 @@ type SyncedMount = { container: string; path?: string };
 const sameMounts = (a: SyncedMount[] | undefined, b: SyncedMount[]): boolean =>
   !!a && a.length === b.length && a.every((m, i) => m.container === b[i].container && m.path === b[i].path);
 
+/** Elimina la ruta de montaje de una arista con máquina virtual o unidad óptica. */
+function withoutPath(edge: Edge): Edge {
+  const data: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(edge.data ?? {})) {
+    if (key !== 'path') data[key] = value;
+  }
+  return { ...edge, kind: 'mount', data: Object.keys(data).length ? data : undefined };
+}
+
 /**
- * Mantiene `edges` y `disk.mounts` sincronizados en todo momento.
+ * Mantiene `edges`, `disk.mounts` y los enlaces de las unidades ópticas
+ * sincronizados en todo momento.
  *
  * La ruta canónica de cada enlace de contenedor está en `edge.data.path`;
  * `disk.mounts` se reconstruye a partir de las aristas de montaje. Los enlaces
- * con VM no tienen ruta: el backend elige el fichero VDI. Se descartan los
- * enlaces inválidos (disco-disco, montaje sin disco, mezcla de contenedores y
- * VMs, o más de una VM en el mismo disco) para no enviar una topología inválida.
+ * con VM o unidad óptica no tienen ruta. Se descartan los enlaces inválidos
+ * (periférico-periférico, montaje sin periférico, Docker+VM en un disco, más de
+ * una VM por disco, o una unidad óptica que no apunte a VirtualBox). Una unidad
+ * óptica sí admite varias VMs: cada par unidad/VM conserva su propia arista.
  */
 export function syncDiskMounts(
   nodes: MachineNode[],
@@ -127,11 +139,13 @@ export function syncDiskMounts(
 ): { nodes: MachineNode[]; edges: Edge[] } {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const diskIds = new Set(nodes.filter(isDisk).map((n) => n.id));
+  const opticalIds = new Set(nodes.filter(isOptical).map((n) => n.id));
   const mountsByDisk = new Map<string, SyncedMount[]>();
   /** Tipo del primer enlace válido de cada disco: no se pueden mezclar. */
   const linkedKind = new Map<string, 'docker' | 'vbox'>();
   const linkedContainers = new Set<string>();
   const vmDisks = new Set<string>();
+  const linkedOpticalPairs = new Set<string>();
   const outEdges: Edge[] = [];
 
   for (const edge of edges) {
@@ -140,14 +154,31 @@ export function syncDiskMounts(
     if (!a || !b || a.id === b.id) continue;
     const aDisk = diskIds.has(a.id);
     const bDisk = diskIds.has(b.id);
+    const aOptical = opticalIds.has(a.id);
+    const bOptical = opticalIds.has(b.id);
 
-    if (!aDisk && !bDisk) {
-      // Un enlace de montaje necesita un disco en uno de sus extremos.
+    // Dos periféricos nunca se montan entre sí.
+    if ((aDisk || aOptical) && (bDisk || bOptical)) continue;
+
+    if (!aDisk && !bDisk && !aOptical && !bOptical) {
+      // Un enlace de montaje necesita un disco o una unidad óptica en un extremo.
       if (edgeKind(edge) === 'mount') continue;
       outEdges.push({ ...edge, kind: 'network' });
       continue;
     }
-    if (aDisk && bDisk) continue;
+
+    if (aOptical || bOptical) {
+      if (edgeKind(edge) !== 'mount') continue;
+      const optical = aOptical ? a : b;
+      const target = aOptical ? b : a;
+      if (target.data.kind !== 'vbox') continue;
+      // Varias VMs por unidad están permitidas; solo se evita el par duplicado.
+      const pair = `${optical.id}:${target.id}`;
+      if (linkedOpticalPairs.has(pair)) continue;
+      linkedOpticalPairs.add(pair);
+      outEdges.push(withoutPath(edge));
+      continue;
+    }
 
     const diskId = aDisk ? a.id : b.id;
     const target = aDisk ? b : a;
@@ -166,12 +197,7 @@ export function syncDiskMounts(
     if (kind === 'vbox') {
       vmDisks.add(diskId);
       mountsByDisk.set(diskId, [...list, { container: target.id }]);
-      // La arista no debe arrastrar `data.path` de archivos o enlaces antiguos.
-      const data: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(edge.data ?? {})) {
-        if (key !== 'path') data[key] = value;
-      }
-      outEdges.push({ ...edge, kind: 'mount', data: Object.keys(data).length ? data : undefined });
+      outEdges.push(withoutPath(edge));
       continue;
     }
 
@@ -183,7 +209,17 @@ export function syncDiskMounts(
 
   const outNodes = nodes.map((node) => {
     if (node.data.kind !== 'disk') {
-      return node.data.disk === undefined ? node : { ...node, data: { ...node.data, disk: undefined } };
+      const stripDisk = node.data.disk !== undefined;
+      const stripOptical = node.data.kind !== 'optical' && node.data.optical !== undefined;
+      if (!stripDisk && !stripOptical) return node;
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          ...(stripDisk ? { disk: undefined } : {}),
+          ...(stripOptical ? { optical: undefined } : {}),
+        },
+      };
     }
     const mounts = mountsByDisk.get(node.id) ?? [];
     const shared = vmDisks.has(node.id) ? false : node.data.disk?.shared ?? false;
@@ -201,7 +237,7 @@ export function syncDiskMounts(
   return { nodes: outNodes, edges: outEdges };
 }
 
-/** Tipo de nodo para el payload IPC: los discos nunca llegan a acciones de máquina. */
+/** Tipo de nodo para el payload IPC: discos y unidades ópticas no son máquinas. */
 export function machineKindOf(kind: NodeKind): 'vbox' | 'docker' | null {
-  return kind === 'disk' ? null : kind;
+  return kind === 'disk' || kind === 'optical' ? null : kind;
 }

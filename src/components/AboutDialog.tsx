@@ -73,6 +73,7 @@ export function AboutDialog({ onClose }: { onClose: () => void }) {
         </div>
 
         <p className="hint about-privacy">{t('about.privacy')}</p>
+        <p className="hint about-optical">{t('about.opticalPaths')}</p>
 
         <div className="modal-actions">
           <button className="btn" onClick={onClose}>{t('common.close')}</button>

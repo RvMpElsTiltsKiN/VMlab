@@ -20,6 +20,8 @@ export const CubeIcon = () => <Svg><path d="M21 8 12 3 3 8v8l9 5 9-5V8Z" /><path
 export const ContainerIcon = () => <Svg><rect x="3" y="7" width="18" height="11" rx="2" /><path d="M8 7v11M12 7v11M16 7v11" /></Svg>;
 /** Cilindro de disco de datos. */
 export const DiskIcon = () => <Svg><ellipse cx="12" cy="6" rx="8" ry="3" /><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" /></Svg>;
+/** Disco óptico (CD/DVD). */
+export const OpticalIcon = () => <Svg><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="2.5" /><path d="M12 3a9 9 0 0 1 7.8 4.5L14 9.6" /></Svg>;
 export const PlayIcon = () => <Svg size={14}><path d="m7 4 13 8-13 8V4Z" fill="currentColor" /></Svg>;
 export const StopIcon = () => <Svg size={14}><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" /></Svg>;
 export const RestartIcon = () => <Svg size={14}><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5" /></Svg>;

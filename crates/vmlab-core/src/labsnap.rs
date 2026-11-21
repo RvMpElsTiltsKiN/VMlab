@@ -171,7 +171,7 @@ pub async fn list(tools: &Tools, nodes: &[LabSnapNode]) -> Vec<LabSnapInfo> {
         for (id, label, created_at) in snapshots_of(tools, node).await {
             let created_at = match node.kind {
                 NodeKind::Docker => created_at.and_then(|v| docker_created_at_iso(&v)),
-                NodeKind::Vbox | NodeKind::Disk => created_at,
+                NodeKind::Vbox | NodeKind::Disk | NodeKind::Optical => created_at,
             };
             let entry = by_id.entry(id).or_insert_with(|| Accumulated {
                 label: label.clone(),
@@ -245,6 +245,9 @@ pub async fn take(tools: &Tools, nodes: &[LabSnapNode], label: &str) -> Result<L
             NodeKind::Vbox => vbox::snapshot_take(tools, &node.target, &id, label).await,
             NodeKind::Docker => docker::snapshot_take(tools, &node.target, &id, label).await,
             NodeKind::Disk => Err(CoreError::Invalid("los discos no admiten instantáneas".into())),
+            NodeKind::Optical => Err(CoreError::Invalid(
+                "las unidades ópticas no admiten instantáneas".into(),
+            )),
         };
         match result {
             Ok(()) => report.done += 1,
@@ -327,6 +330,9 @@ pub async fn restore(tools: &Tools, nodes: &[LabSnapNode], id: &str) -> Result<L
             NodeKind::Vbox => vbox::snapshot_restore(tools, &node.target, id).await.map(|_| None),
             NodeKind::Docker => docker::snapshot_restore(tools, &node.target, id).await,
             NodeKind::Disk => Err(CoreError::Invalid("los discos no admiten instantáneas".into())),
+            NodeKind::Optical => Err(CoreError::Invalid(
+                "las unidades ópticas no admiten instantáneas".into(),
+            )),
         };
         match result {
             Ok(renamed) => {
@@ -378,6 +384,9 @@ pub async fn delete(tools: &Tools, nodes: &[LabSnapNode], id: &str) -> Result<La
             NodeKind::Vbox => vbox::snapshot_delete(tools, &node.target, id).await,
             NodeKind::Docker => docker::snapshot_delete(tools, &node.target, id).await,
             NodeKind::Disk => Err(CoreError::Invalid("los discos no admiten instantáneas".into())),
+            NodeKind::Optical => Err(CoreError::Invalid(
+                "las unidades ópticas no admiten instantáneas".into(),
+            )),
         };
         match result {
             Ok(()) => report.done += 1,

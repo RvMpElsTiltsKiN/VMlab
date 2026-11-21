@@ -45,17 +45,20 @@ fn segment_name(ids: &mut Vec<&str>) -> String {
 
 pub fn plan(t: &Topology) -> Plan {
     let index: HashMap<&str, usize> = t.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
-    // Un disco no es un nodo de red: sus enlaces son montajes y no deben unir
-    // contenedores ni cambiar el nombre (hash) del segmento.
-    let disks: HashSet<&str> = t
+    // Los discos y las unidades ópticas no son nodos de red: sus enlaces son
+    // montajes y no deben unir contenedores ni cambiar el nombre (hash) del segmento.
+    let non_network: HashSet<&str> = t
         .nodes
         .iter()
-        .filter(|n| n.kind == NodeKind::Disk)
+        .filter(|n| matches!(n.kind, NodeKind::Disk | NodeKind::Optical))
         .map(|n| n.id.as_str())
         .collect();
     let mut parent: Vec<usize> = (0..t.nodes.len()).collect();
     for e in &t.edges {
-        if e.kind != EdgeKind::Network || disks.contains(e.from.as_str()) || disks.contains(e.to.as_str()) {
+        if e.kind != EdgeKind::Network
+            || non_network.contains(e.from.as_str())
+            || non_network.contains(e.to.as_str())
+        {
             continue;
         }
         if let (Some(&a), Some(&b)) = (index.get(e.from.as_str()), index.get(e.to.as_str())) {
@@ -67,7 +70,7 @@ pub fn plan(t: &Topology) -> Plan {
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for i in 0..t.nodes.len() {
-        if disks.contains(t.nodes[i].id.as_str()) {
+        if non_network.contains(t.nodes[i].id.as_str()) {
             continue;
         }
         let r = find(&mut parent, i);
@@ -194,6 +197,35 @@ mod tests {
             edges: vec![e("a", "d"), e("d", "b")],
         };
         let p = plan(&t);
+        assert!(p.segments.is_empty());
+        assert_eq!(p.isolated.len(), 2);
+    }
+
+    #[test]
+    fn an_optical_drive_never_joins_a_network_segment() {
+        let base = Topology {
+            nodes: vec![n("web", NodeKind::Docker), n("db", NodeKind::Docker)],
+            edges: vec![e("web", "db")],
+        };
+        let with_drive = Topology {
+            nodes: vec![
+                n("web", NodeKind::Docker),
+                n("db", NodeKind::Docker),
+                n("cd", NodeKind::Optical),
+            ],
+            edges: vec![e("web", "db"), mount("cd", "web")],
+        };
+        let (a, b) = (plan(&base), plan(&with_drive));
+        assert_eq!(a.segments[0].name, b.segments[0].name);
+        assert_eq!(b.segments[0].nodes.len(), 2);
+        assert_eq!(b.isolated.len(), 0);
+
+        // Ni aunque un cable de red atraviese la unidad se unen los extremos.
+        let bridged = Topology {
+            nodes: vec![n("a", NodeKind::Docker), n("b", NodeKind::Docker), n("cd", NodeKind::Optical)],
+            edges: vec![e("a", "cd"), e("cd", "b")],
+        };
+        let p = plan(&bridged);
         assert!(p.segments.is_empty());
         assert_eq!(p.isolated.len(), 2);
     }

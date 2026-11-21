@@ -97,6 +97,9 @@ impl AppState {
     /// Reserva el hueco de una captura antes de arrancar el proceso, para que dos
     /// peticiones simultáneas no creen dos capturas del mismo nodo.
     pub fn reserve_capture(&self, id: &str, kind: NodeKind, target: &str) -> Result<(), String> {
+        if matches!(kind, NodeKind::Disk | NodeKind::Optical) {
+            return Err("este nodo no tiene tráfico de red: no se puede capturar".into());
+        }
         capture::validate_id(id).map_err(|e| e.to_string())?;
         let mut captures = self.captures.lock().map_err(|_| lock_error())?;
         let key = kind.key(target);
@@ -242,9 +245,9 @@ impl AppState {
                 NodeKind::Docker => {
                     let _ = capture::remove_docker_helper(tools, id).await;
                 }
-                // Los discos no pueden iniciar capturas, pero la reserva puede
-                // quedar registrada por una llamada fallida: no hay nada que parar.
-                NodeKind::Disk => {}
+                // Los discos y las unidades ópticas no pueden iniciar capturas,
+                // pero la reserva puede quedar registrada por una llamada fallida.
+                NodeKind::Disk | NodeKind::Optical => {}
             }
         }
 

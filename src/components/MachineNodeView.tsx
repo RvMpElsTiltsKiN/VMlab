@@ -4,10 +4,11 @@ import { useT } from '../i18n';
 import { probeKey } from '../lib/connectivity';
 import { diskSizeLabel, vdiName, volumeName } from '../lib/disk';
 import { linkSummary } from '../lib/link';
+import { isoFileName } from '../lib/optical';
 import { resolveState, stateLabel } from '../lib/status';
 import { useLab } from '../store/useLab';
 import type { MachineNode } from '../types';
-import { ContainerIcon, CubeIcon, DiskIcon, PlayIcon, RestartIcon, StopIcon, TerminalIcon } from './icons';
+import { ContainerIcon, CubeIcon, DiskIcon, OpticalIcon, PlayIcon, RestartIcon, StopIcon, TerminalIcon } from './icons';
 
 const HANDLES: [string, Position][] = [
   ['t', Position.Top],
@@ -32,6 +33,8 @@ function MachineNodeViewInner({ id, data, selected }: NodeProps<MachineNode>) {
   const capturing = useLab((s) =>
     s.captures.some((c) => c.running && c.kind === data.kind && c.target === data.target),
   );
+  const opticalReady = useLab((s) => !!s.opticalReady[id]);
+  const opticalMissing = useLab((s) => !!s.opticalIsoMissing[id]);
   const slot = data.kind === 'vbox' && data.slot === true;
   const running = state === 'running' || state === 'paused';
   const sub = slot ? t('node.unassignedShort') : data.kind === 'docker' ? data.image || t('node.noImage') : data.target.slice(0, 13);
@@ -60,6 +63,30 @@ function MachineNodeViewInner({ id, data, selected }: NodeProps<MachineNode>) {
           <span className="status">
             {t('node.diskMounts', { count: mounts })}
             {hasVm ? ` · ${diskSizeLabel(data.disk?.sizeMb)}` : ''}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // Una unidad óptica no es una máquina: muestra la ISO y si ya fue creada.
+  if (data.kind === 'optical') {
+    const iso = data.optical?.iso?.trim();
+    return (
+      <div className={`node optical ${selected ? 'selected' : ''}`}>
+        {HANDLES.map(([hid, pos]) => (
+          <Handle key={hid} id={hid} type="source" position={pos} />
+        ))}
+        <div className="node-head">
+          <span className="node-icon"><OpticalIcon /></span>
+          <div className="node-titles">
+            <div className="node-title" title={data.label}>{data.label}</div>
+            <div className="node-sub mono" title={iso}>{iso ? isoFileName(iso) : t('optical.empty')}</div>
+          </div>
+        </div>
+        <div className="node-foot">
+          <span className={`status ${opticalMissing ? 'err' : ''}`}>
+            {opticalMissing ? t('optical.missingShort') : opticalReady ? t('optical.ready') : t('optical.pending')}
           </span>
         </div>
       </div>

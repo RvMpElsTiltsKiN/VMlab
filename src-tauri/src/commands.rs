@@ -6,14 +6,14 @@ use crate::state::AppState;
 use vmlab_core::model::{
     default_adapter, Action, ApplyReport, CreateVmRequest, CreatedVm, DockerRunOptions, DockerStartInfo,
     GuestAdditionsPrep, GuestConfigRequest, GuestHostsRequest,
-    GuestProfile, GuestReport, Inventory, LabSnapInfo, LabSnapNode, LabSnapReport, LinkConditions, LinkReport, NodeKind,
-    NodeProbe, ProbeNode, ScreenshotInfo, Snapshot, Topology, VmDeleteRequest, VmDeleteResult,
-    VmOsEntry, VmOsType,
+    GuestProfile, GuestReport, Inventory, LabSnapInfo, LabSnapNode, LabSnapReport, LinkConditions, LinkReport, ManagedDisk,
+    ManagedDiskKind, NodeKind, NodeProbe, OpticalIsoResult, ProbeNode, ScreenshotInfo, Snapshot, Topology,
+    VmDeleteRequest, VmDeleteResult, VmOsEntry, VmOsType,
 };
 use vmlab_core::capture::{self, CaptureFilter, CaptureInfo};
 use vmlab_core::connectivity::LinkDiagnostics;
 use vmlab_core::tools::Tools;
-use vmlab_core::{compose, connectivity, engine, labsnap, netem, terminal, vbox};
+use vmlab_core::{compose, connectivity, disk_manager, engine, labsnap, netem, terminal, vbox};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tauri::{AppHandle, Manager, State};
@@ -160,6 +160,68 @@ pub async fn apply_topology(
     Ok(engine::apply(&tools, &topology).await)
 }
 
+// ───────── Gestión de discos (Fase A) ─────────
+
+/// Enumera los VDI y volúmenes creados por VMLab. La carpeta de discos la fija
+/// el backend, igual que en `apply_topology`; el frontend nunca envía rutas.
+#[tauri::command]
+pub async fn disks_list(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ManagedDisk>, String> {
+    let tools = state.tools().await;
+    let disks_dir = app.path().app_data_dir().map_err(s)?.join("disks");
+    disk_manager::list(&tools, &disks_dir).await.map_err(s)
+}
+
+/// Elimina un VDI o un volumen gestionado. El tipo viaja desde la UI, pero los
+/// nombres se vuelven a validar en el core antes de tocar nada.
+#[tauri::command]
+pub async fn disk_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    kind: ManagedDiskKind,
+) -> Result<(), String> {
+    let tools = state.tools().await;
+    let disks_dir = app.path().app_data_dir().map_err(s)?.join("disks");
+    match kind {
+        ManagedDiskKind::Vdi => disk_manager::delete_managed_disk(&tools, &disks_dir, &name).await,
+        ManagedDiskKind::Volume => disk_manager::delete_managed_volume(&tools, &name).await,
+    }
+    .map_err(s)
+}
+
+/// Amplía un VDI gestionado. Solo acepta tamaños mayores que el actual; el
+/// backend comprueba el estado de las VMs antes de llamar a VirtualBox.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn disk_resize(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    size_mb: u64,
+) -> Result<(), String> {
+    let tools = state.tools().await;
+    let disks_dir = app.path().app_data_dir().map_err(s)?.join("disks");
+    disk_manager::resize_managed_disk(&tools, &disks_dir, &name, size_mb).await.map_err(s)
+}
+
+// ───────── Unidad óptica (Fase A) ─────────
+
+/// Cambia o expulsa la ISO del nodo óptico en todas las VMs conectadas, sin
+/// aplicar la red. `iso: null` deja las unidades vacías; VMLab nunca borra el
+/// fichero. Devuelve un resultado por VM (nombre, uuid y éxito o error).
+#[tauri::command(rename_all = "camelCase")]
+pub async fn optical_set_iso(
+    state: State<'_, AppState>,
+    node_id: String,
+    iso: Option<String>,
+) -> Result<Vec<OpticalIsoResult>, String> {
+    engine::set_optical_iso(&state.tools().await, &node_id, iso.as_deref())
+        .await
+        .map_err(s)
+}
+
 /// Aplica las condiciones de red de un nodo (netem en Docker, límite en VirtualBox).
 #[tauri::command]
 pub async fn link_apply(
@@ -190,6 +252,9 @@ pub async fn link_apply(
         NodeKind::Disk => {
             return Err("un disco no tiene red: los enlaces de montaje no admiten condiciones de red".into());
         }
+        NodeKind::Optical => {
+            return Err("una unidad óptica no tiene red: no admite condiciones de red".into());
+        }
     }
     Ok(report)
 }
@@ -216,6 +281,9 @@ pub async fn link_clear(
         }
         NodeKind::Disk => {
             return Err("un disco no tiene red: no hay condiciones de red que quitar".into());
+        }
+        NodeKind::Optical => {
+            return Err("una unidad óptica no tiene red: no hay condiciones de red que quitar".into());
         }
     }
     Ok(report)
@@ -280,6 +348,10 @@ pub async fn capture_start(
         NodeKind::Disk => {
             state.abort_capture(&id);
             return Err("un disco no tiene tráfico de red: no se puede capturar".into());
+        }
+        NodeKind::Optical => {
+            state.abort_capture(&id);
+            return Err("una unidad óptica no tiene tráfico de red: no se puede capturar".into());
         }
     };
 

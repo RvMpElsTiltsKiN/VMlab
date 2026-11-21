@@ -13,6 +13,7 @@
   --vbox: #8b7cf6;
   --docker: #38a8f0;
   --disk: #d6a24a;
+  --optical: #5cc8ff;
   --mount: #9aa6b6;
   --running: #3ddc97;
   --stopped: #6b7789;
@@ -34,6 +35,7 @@
   --vbox: #6d5ce0;
   --docker: #1b8fd6;
   --disk: #b07d16;
+  --optical: #1687bd;
   --mount: #7b8798;
   --running: #1fa971;
   --stopped: #8b97a8;
@@ -175,6 +177,7 @@ button:disabled { cursor: default; opacity: 0.45; }
 .pal-item.vbox .pal-icon { background: var(--vbox); }
 .pal-item.docker .pal-icon { background: var(--docker); }
 .pal-item.disk .pal-icon { background: var(--disk); }
+.pal-item.optical .pal-icon { background: var(--optical); }
 .pal-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pal-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .pal-sub {
@@ -266,6 +269,25 @@ button:disabled { cursor: default; opacity: 0.45; }
   flex: 1; min-width: 0; color: var(--muted);
   font-size: 11px; overflow-wrap: anywhere; user-select: text;
 }
+
+.optical-panel .optical-iso {
+  margin: 6px 0; color: var(--optical); font-size: 13px; font-weight: 600;
+  overflow-wrap: anywhere; user-select: text;
+}
+.optical-panel .optical-path {
+  display: block; max-height: 60px; margin-bottom: 8px; color: var(--muted);
+  font-size: 10px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+}
+.optical-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 10px 0; }
+.optical-vm-list { display: grid; gap: 6px; margin: 6px 0; }
+.optical-vm {
+  padding: 7px 8px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--panel-2);
+}
+.optical-vm-name { font-weight: 600; }
+.optical-vm-state { margin-top: 2px; color: var(--muted); font-size: 11px; }
+.optical-vm-state.ok { color: var(--accent); }
+.optical-vm-state.err { color: var(--danger); }
 
 .disk-mount {
   margin-bottom: 8px; padding: 8px; border: 1px solid var(--border);
@@ -498,6 +520,9 @@ button:disabled { cursor: default; opacity: 0.45; }
 .node.vbox { --kind: var(--vbox); }
 .node.docker { --kind: var(--docker); }
 .node.disk { --kind: var(--disk); }
+.node.optical { --kind: var(--optical); }
+.node.optical .node-sub.mono { font-size: 10px; }
+.node.optical .status.err { color: var(--danger); }
 .node.disk .node-sub.mono { font-size: 10px; }
 .node.disk .node-foot .status { color: var(--muted); font-size: 11px; }
 .node.selected { border-color: var(--kind); box-shadow: 0 0 0 3px color-mix(in srgb, var(--kind) 28%, transparent), var(--shadow); }
@@ -636,6 +661,42 @@ button:disabled { cursor: default; opacity: 0.45; }
 }
 .delete-vm-destructive small { color: var(--muted); font-size: 11px; }
 
+/* ───────── Gestor de discos ───────── */
+.side-manage-btn { height: 22px; padding: 0 8px; font-size: 11px; text-transform: none; letter-spacing: normal; }
+.modal-backdrop.confirm { z-index: 110; }
+.disk-manager .side-title { margin-bottom: 4px; }
+.disk-manager > .hint { margin-top: 0; }
+.disk-manager-scroll { max-height: min(52vh, 420px); overflow: auto; border: 1px solid var(--border); border-radius: 9px; }
+.disk-manager-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.disk-manager-table th, .disk-manager-table td {
+  padding: 8px 10px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--border); overflow-wrap: anywhere;
+}
+.disk-manager-table th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--panel-2); color: var(--muted); font-size: 11px;
+  font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+}
+.disk-manager-table tbody tr:last-child td { border-bottom: 0; }
+.disk-manager-name { font-weight: 600; }
+.disk-manager-note, .disk-manager-reason { display: block; margin-top: 4px; color: var(--busy); font-size: 11px; }
+.disk-manager-kind {
+  display: inline-block; padding: 2px 7px; border-radius: 99px;
+  border: 1px solid var(--border); font-size: 10px; font-weight: 700; text-transform: uppercase;
+}
+.disk-manager-kind.vdi { color: var(--disk); }
+.disk-manager-kind.volume { color: var(--docker); }
+.disk-manager-actions { display: grid; gap: 4px; justify-items: start; min-width: 116px; }
+.disk-manager-actions .btn { height: 24px; padding: 0 8px; font-size: 11px; }
+.disk-manager-actions .btn.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.disk-manager-actions .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.disk-manager-empty {
+  padding: 22px; text-align: center; color: var(--muted); font-size: 12px;
+  border: 1px dashed var(--border); border-radius: 9px;
+}
+.disk-manager-confirm { width: min(460px, 100%); }
+.disk-manager-warning { margin: 10px 0; font-weight: 600; color: var(--danger); }
+
 /* ───────── Acerca de ───────── */
 .about { display: grid; gap: 10px; }
 .about-head { display: flex; align-items: center; gap: 10px; }
@@ -651,6 +712,7 @@ button:disabled { cursor: default; opacity: 0.45; }
 }
 .about-repo .btn { flex-shrink: 0; }
 .about-privacy { margin: 2px 0 0; }
+.about-optical { margin: 6px 0 0; }
 
 /* ───────── Actualización disponible ───────── */
 .update-banner {

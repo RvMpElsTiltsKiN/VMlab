@@ -8,6 +8,7 @@
 pub mod capture;
 pub mod compose;
 pub mod connectivity;
+pub mod disk_manager;
 pub mod disks;
 pub mod docker;
 pub mod docker_desktop;
@@ -17,6 +18,7 @@ pub mod guest;
 pub mod labsnap;
 pub mod model;
 pub mod netem;
+pub mod optical;
 pub mod runner;
 pub mod terminal;
 pub mod tools;

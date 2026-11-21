@@ -3,7 +3,7 @@ import type { Edge as FlowEdge, Node } from '@xyflow/react';
 /** Tipos que viajan a las acciones IPC de máquina. Los discos no son máquinas. */
 export type MachineKind = 'vbox' | 'docker';
 /** Tipos que pueden aparecer en el lienzo. */
-export type NodeKind = MachineKind | 'disk';
+export type NodeKind = MachineKind | 'disk' | 'optical';
 /** Los cables de red y los enlaces de montaje de un disco. */
 export type EdgeKind = 'network' | 'mount';
 /** Arista del lienzo. `kind` ausente equivale a red (archivos antiguos). */
@@ -96,6 +96,12 @@ export interface DiskMount {
 }
 
 /** Configuración de un nodo Disco (camelCase, ver `DiskSpec` de model.rs). */
+/** Configuración de una unidad óptica (`optical` en el backend). */
+export interface OpticalSpec {
+  /** Ruta absoluta a la imagen `.iso`; `undefined` deja la unidad vacía. */
+  iso?: string;
+}
+
 export interface DiskSpec {
   shared: boolean;
   mounts: DiskMount[];
@@ -121,6 +127,8 @@ export interface MachineData extends Record<string, unknown> {
   slot?: boolean;
   /** Solo Disco: modo de uso y rutas de montaje en los contenedores enlazados. */
   disk?: DiskSpec;
+  /** Solo Unidad óptica: imagen ISO montada (ruta local de este equipo). */
+  optical?: OpticalSpec;
   /** Solo VirtualBox/Linux: usuario para Guest Additions (la contraseña nunca se guarda). */
   guestUser?: string;
   guestSystem?: GuestSystem;
@@ -282,6 +290,8 @@ export interface NodeSpec {
   options?: DockerRunOptions;
   /** Solo Disco: modo de uso y rutas de montaje en los contenedores enlazados. */
   disk?: DiskSpec;
+  /** Solo Unidad óptica: ISO a montar en la unidad gestionada. */
+  optical?: OpticalSpec;
 }
 
 export interface TopologyPayload {
@@ -294,6 +304,48 @@ export interface ApplyReport {
   applied: number;
   errors: string[];
   warnings: string[];
+}
+
+/** Resultado de `optical_set_iso` en una de las VMs conectadas al nodo. */
+export interface OpticalIsoResult {
+  name: string;
+  uuid: string;
+  ok: boolean;
+  error?: string;
+}
+
+/** Estado en esta sesión de la unidad de un nodo óptico en una VM concreta. */
+export interface OpticalVmStatus {
+  ready: boolean;
+  error?: string;
+}
+
+/** Tipos de almacenamiento que VMLab puede listar, ampliar y borrar. */
+export type ManagedDiskKind = 'vdi' | 'volume';
+
+/** Máquina virtual o contenedor que está usando un disco gestionado. */
+export interface ManagedDiskUser {
+  name: string;
+  /** Los contenedores Docker no tienen UUID. */
+  uuid: string | null;
+}
+
+/**
+ * Disco gestionado por el backend (ver `ManagedDisk` de model.rs).
+ * `name` es el nombre base para VDI (`datos`) y el nombre completo para
+ * volúmenes (`vmlab-vol-datos`).
+ */
+export interface ManagedDisk {
+  name: string;
+  kind: ManagedDiskKind;
+  capacityMb: number | null;
+  sizeOnDiskMb: number | null;
+  inUseBy: ManagedDiskUser[];
+  /** `false` si está en uso o si no se pudo leer su información con seguridad. */
+  deletable: boolean;
+  /** `false` para volúmenes y cuando VirtualBox no pudo leer el medio. */
+  resizable: boolean;
+  note: string | null;
 }
 
 /** Nodo del lienzo sobre el que se guarda o restaura una instantánea del laboratorio. */

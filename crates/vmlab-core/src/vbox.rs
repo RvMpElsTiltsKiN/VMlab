@@ -994,6 +994,439 @@ pub async fn prepare_guest_additions(tools: &Tools, target: &str) -> Result<Gues
     })
 }
 
+// ───────────────────── Unidades ópticas ─────────────────────
+
+/// Prefijo de las claves de extradata con las que VMLab recuerda qué unidades
+/// ópticas ha creado. Nunca se usa una heurística sobre el medio: una ISO que el
+/// usuario montó a mano jamás debe ser tocada ni borrada.
+pub const VMLAB_OPTICAL_EXTRADATA: &str = "VMLab/Optical";
+/// Controlador IDE que se crea solo si la VM no tiene IDE y no hay SATA libre.
+pub const VMLAB_IDE_CONTROLLER: &str = "VMLab IDE";
+/// Medio de una unidad vacía en la sintaxis de `storageattach`.
+pub const OPTICAL_EMPTY_MEDIUM: &str = "emptydrive";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpticalSlot {
+    pub controller: String,
+    pub port: u32,
+    pub device: u32,
+}
+
+impl OpticalSlot {
+    /// Valor guardado en `VBoxManage setextradata`: `controlador|puerto|dispositivo`.
+    pub fn location(&self) -> Result<String> {
+        validate::host_iface(&self.controller)?;
+        Ok(format!("{}|{}|{}", self.controller, self.port, self.device))
+    }
+}
+
+/// Lee el valor de `VBoxManage getextradata`. `None` cuando no hay valor.
+pub fn parse_extradata_value(out: &str) -> Option<String> {
+    for line in out.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("Value:") else { continue };
+        let value = value.trim();
+        if value.is_empty() || value.starts_with('<') || value.eq_ignore_ascii_case("null") {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Lee la salida de `VBoxManage getextradata <vm> enumerate` como pares clave/valor.
+pub fn parse_extradata_enumeration(out: &str) -> Vec<(String, Option<String>)> {
+    out.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("Key:")?;
+            let (key, value) = rest.split_once(',')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = value.trim().strip_prefix("Value:").and_then(|v| {
+                let v = v.trim();
+                (!v.is_empty() && !v.starts_with('<')).then(|| v.to_string())
+            });
+            Some((key.to_string(), value))
+        })
+        .collect()
+}
+
+/// Parsea `controlador|puerto|dispositivo` con los mismos límites que los argv.
+pub fn parse_optical_location(value: &str) -> Option<OpticalSlot> {
+    let mut parts = value.split('|');
+    let controller = parts.next()?.trim();
+    let port = parts.next()?.trim().parse::<u32>().ok()?;
+    let device = parts.next()?.trim().parse::<u32>().ok()?;
+    if parts.next().is_some()
+        || controller.is_empty()
+        || controller.starts_with('-')
+        || controller.chars().count() > 128
+        || controller.chars().any(|c| c.is_control())
+        || port > MAX_SATA_PORTS
+        || device > 1
+    {
+        return None;
+    }
+    Some(OpticalSlot { controller: controller.to_string(), port, device })
+}
+
+pub fn optical_extradata_key(node_id: &str) -> Result<String> {
+    validate::optical_node_id(node_id)?;
+    Ok(format!("{VMLAB_OPTICAL_EXTRADATA}/{node_id}"))
+}
+
+fn extradata_key(key: &str) -> Result<&str> {
+    let ok = !key.is_empty()
+        && key.chars().count() <= 160
+        && !key.starts_with('-')
+        && !key.chars().any(|c| c.is_control());
+    if ok { Ok(key) } else { Err(CoreError::Invalid("clave de extradata no válida".into())) }
+}
+
+pub fn setextradata_args(vm: &str, key: &str, value: &str) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    extradata_key(key)?;
+    if value.starts_with('-') || value.chars().any(|c| c.is_control()) {
+        return Err(CoreError::Invalid("valor de extradata no válido".into()));
+    }
+    Ok(vec!["setextradata".into(), vm.into(), key.into(), value.into()])
+}
+
+pub fn getextradata_args(vm: &str, key: &str) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    extradata_key(key)?;
+    Ok(vec!["getextradata".into(), vm.into(), key.into()])
+}
+
+pub fn enumerate_extradata_args(vm: &str) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    Ok(vec!["getextradata".into(), vm.into(), "enumerate".into()])
+}
+
+/// Medio que se quiere dejar en la unidad. La ISO se valida como en la creación
+/// de VMs: nunca se copia, nunca se borra y nunca empieza por `-`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpticalMedium<'a> {
+    Iso(&'a str),
+    Empty,
+    None,
+}
+
+pub fn storageattach_optical_args(
+    vm: &str,
+    slot: &OpticalSlot,
+    medium: OpticalMedium<'_>,
+    force_unmount: bool,
+) -> Result<Vec<String>> {
+    validate::vbox_target(vm)?;
+    validate::host_iface(&slot.controller)?;
+    let value = match medium {
+        OpticalMedium::Iso(iso) => validate::vm_iso(iso)?.to_string(),
+        OpticalMedium::Empty => OPTICAL_EMPTY_MEDIUM.to_string(),
+        OpticalMedium::None => "none".into(),
+    };
+    let mut args = vec![
+        "storageattach".into(),
+        vm.into(),
+        "--storagectl".into(),
+        slot.controller.clone(),
+        "--port".into(),
+        slot.port.to_string(),
+        "--device".into(),
+        slot.device.to_string(),
+        "--type".into(),
+        "dvddrive".into(),
+        "--medium".into(),
+        value,
+    ];
+    if force_unmount {
+        args.push("--forceunmount".into());
+    }
+    Ok(args)
+}
+
+/// Un hueco solo está libre si `showvminfo` no muestra ningún dispositivo allí.
+/// `emptydrive` significa que ya hay una unidad óptica del usuario: no se toca.
+fn optical_slot_free(storage: &VmStorageInfo, controller: &str, port: u32, device: u32) -> bool {
+    !storage.attachments.iter().any(|a| {
+        a.controller == controller
+            && a.port == port
+            && a.device == device
+            && !a.medium.is_empty()
+            && !a.medium.eq_ignore_ascii_case("none")
+    })
+}
+
+/// Busca un hueco real en los IDE (`2 × 2`) o en los SATA (`1 × puertos`).
+fn pick_optical_slot(storage: &VmStorageInfo, ide: bool) -> Option<OpticalSlot> {
+    let mut controllers: Vec<&VmStorageController> = storage
+        .controllers
+        .iter()
+        .filter(|c| {
+            let suitable = if ide { controller_rank(&c.kind) == 0 } else { is_sata(&c.kind) };
+            suitable && c.ports > 0 && !c.name.starts_with('-')
+        })
+        .collect();
+    controllers.sort_by_key(|c| c.name.clone());
+    for c in controllers {
+        let devices = if ide { 2 } else { 1 };
+        for port in 0..c.ports.min(MAX_SATA_PORTS) {
+            for device in 0..devices {
+                if optical_slot_free(storage, &c.name, port, device) {
+                    return Some(OpticalSlot { controller: c.name.clone(), port, device });
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpticalPrepare {
+    None,
+    /// Ampliar el SATA existente como se hace con los discos VDI.
+    GrowSata { controller: String, ports: u32 },
+    /// Crear `VMLab IDE`: solo cuando la VM no tiene ningún IDE.
+    CreateIde,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpticalPlacement {
+    pub slot: OpticalSlot,
+    pub prepare: OpticalPrepare,
+}
+
+/// Orden de preferencia: IDE libre → SATA libre → ampliar SATA → crear IDE.
+/// Si el IDE existe y está lleno y no hay SATA, devuelve un error claro.
+pub fn plan_optical_slot(storage: &VmStorageInfo) -> Result<OpticalPlacement> {
+    if let Some(slot) = pick_optical_slot(storage, true) {
+        return Ok(OpticalPlacement { slot, prepare: OpticalPrepare::None });
+    }
+    if let Some(slot) = pick_optical_slot(storage, false) {
+        return Ok(OpticalPlacement { slot, prepare: OpticalPrepare::None });
+    }
+    if let Some((controller, ports)) = grow_sata_controller(storage) {
+        let slot = OpticalSlot { controller: controller.clone(), port: ports - 1, device: 0 };
+        return Ok(OpticalPlacement {
+            slot,
+            prepare: OpticalPrepare::GrowSata { controller, ports },
+        });
+    }
+    if !storage.controllers.iter().any(|c| controller_rank(&c.kind) == 0) {
+        let slot = OpticalSlot { controller: VMLAB_IDE_CONTROLLER.into(), port: 0, device: 0 };
+        return Ok(OpticalPlacement { slot, prepare: OpticalPrepare::CreateIde });
+    }
+    Err(CoreError::Message(
+        "no queda ningún hueco libre: el controlador IDE está lleno y SATA no admite más puertos".into(),
+    ))
+}
+
+/// ¿El medio montado en ese hueco coincide ya con lo que pide el lienzo?
+pub fn optical_medium_is(storage: &VmStorageInfo, slot: &OpticalSlot, iso: Option<&str>) -> bool {
+    let Some(a) = storage
+        .attachments
+        .iter()
+        .find(|a| a.controller == slot.controller && a.port == slot.port && a.device == slot.device)
+    else {
+        return false;
+    };
+    match iso {
+        Some(iso) => !empty_medium(&a.medium) && same_path(&a.medium, iso),
+        None => empty_medium(&a.medium),
+    }
+}
+
+/// Mismo aviso que para los discos, con «unidad óptica» en el texto.
+pub fn optical_state_warning(vm: &str, state: &str, action: &str) -> Option<String> {
+    if storage_editable(state) {
+        return None;
+    }
+    let state = state.trim();
+    if state.eq_ignore_ascii_case("saved") {
+        return Some(format!(
+            "«{vm}» tiene un estado guardado. Inicia la máquina y apágala del todo, o descarta el estado guardado desde VirtualBox, y vuelve a aplicar."
+        ));
+    }
+    if state.eq_ignore_ascii_case("running") || state.eq_ignore_ascii_case("paused") {
+        return Some(format!("apaga «{vm}» para {action} la unidad óptica"));
+    }
+    Some(format!(
+        "«{vm}» está en estado «{state}»: apágala del todo para cambiar sus unidades ópticas."
+    ))
+}
+
+pub async fn vm_optical_storage(tools: &Tools, vm: &str) -> Result<VmStorageInfo> {
+    validate::vbox_target(vm)?;
+    let bin = tools.vbox()?;
+    let info = run_ok(bin, &["showvminfo", vm, "--machinereadable"], SHORT)
+        .await
+        .map_err(|e| vdi_command_error("leer la información de la VM", e))?;
+    Ok(parse_vm_storage(&info.stdout))
+}
+
+pub async fn read_optical_extradata(
+    tools: &Tools,
+    vm: &str,
+    node_id: &str,
+) -> Result<Option<OpticalSlot>> {
+    let key = optical_extradata_key(node_id)?;
+    let bin = tools.vbox()?;
+    let args = getextradata_args(vm, &key)?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_ok(bin, &argv, SHORT)
+        .await
+        .map_err(|e| vdi_command_error("leer la ubicación de la unidad óptica", e))?;
+    Ok(parse_extradata_value(&out.stdout).and_then(|v| parse_optical_location(&v)))
+}
+
+/// Todas las unidades que VMLab ha creado en una VM, con el `id` del nodo.
+pub async fn list_optical_extradata(tools: &Tools, vm: &str) -> Result<Vec<(String, OpticalSlot)>> {
+    validate::vbox_target(vm)?;
+    let bin = tools.vbox()?;
+    let args = enumerate_extradata_args(vm)?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_ok(bin, &argv, SHORT)
+        .await
+        .map_err(|e| vdi_command_error("listar las unidades ópticas gestionadas", e))?;
+    let prefix = format!("{VMLAB_OPTICAL_EXTRADATA}/");
+    Ok(parse_extradata_enumeration(&out.stdout)
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let id = key.strip_prefix(&prefix)?;
+            if validate::optical_node_id(id).is_err() {
+                return None;
+            }
+            let slot = value.and_then(|v| parse_optical_location(&v))?;
+            Some((id.to_string(), slot))
+        })
+        .collect())
+}
+
+pub async fn set_optical_extradata(
+    tools: &Tools,
+    vm: &str,
+    node_id: &str,
+    slot: &OpticalSlot,
+) -> Result<()> {
+    let key = optical_extradata_key(node_id)?;
+    let value = slot.location()?;
+    let bin = tools.vbox()?;
+    let args = setextradata_args(vm, &key, &value)?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(bin, &argv, SHORT)
+        .await
+        .map_err(|e| vdi_command_error("guardar la ubicación de la unidad óptica", e))?;
+    Ok(())
+}
+
+pub async fn clear_optical_extradata(tools: &Tools, vm: &str, node_id: &str) -> Result<()> {
+    let key = optical_extradata_key(node_id)?;
+    let bin = tools.vbox()?;
+    // Un valor vacío borra la clave en VirtualBox.
+    let args = setextradata_args(vm, &key, "")?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(bin, &argv, SHORT)
+        .await
+        .map_err(|e| vdi_command_error("borrar la ubicación de la unidad óptica", e))?;
+    Ok(())
+}
+
+fn optical_locked(e: &CoreError) -> bool {
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("locked")
+        || text.contains("bloquead")
+        || text.contains("in use")
+        || text.contains("en uso")
+        || text.contains("unmount")
+        || text.contains("desmont")
+}
+
+fn optical_medium_error(medium: OpticalMedium<'_>, e: CoreError) -> CoreError {
+    let action = match medium {
+        OpticalMedium::Iso(_) => "insertar la ISO",
+        OpticalMedium::Empty => "expulsar la ISO",
+        OpticalMedium::None => "quitar la unidad óptica",
+    };
+    vdi_command_error(action, e)
+}
+
+/// Cambia el medio en caliente (VM encendida incluida). `--forceunmount` se usa
+/// solo cuando se expulsa o se retira y el invitado tiene el medio bloqueado.
+pub async fn set_optical_medium(
+    tools: &Tools,
+    vm: &str,
+    slot: &OpticalSlot,
+    medium: OpticalMedium<'_>,
+    allow_force_unmount: bool,
+) -> Result<()> {
+    validate::vbox_target(vm)?;
+    let bin = tools.vbox()?;
+    let args = storageattach_optical_args(vm, slot, medium, false)?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(e) = run_ok(bin, &argv, SHORT).await {
+        let can_force = allow_force_unmount
+            && matches!(medium, OpticalMedium::Empty | OpticalMedium::None)
+            && optical_locked(&e);
+        if !can_force {
+            return Err(optical_medium_error(medium, e));
+        }
+        let retry = storageattach_optical_args(vm, slot, medium, true)?;
+        let retry_argv: Vec<&str> = retry.iter().map(String::as_str).collect();
+        run_ok(bin, &retry_argv, SHORT)
+            .await
+            .map_err(|e| optical_medium_error(medium, e))?;
+    }
+    Ok(())
+}
+
+async fn prepare_optical_slot(tools: &Tools, vm: &str, placement: &OpticalPlacement) -> Result<()> {
+    let bin = tools.vbox()?;
+    let args = match &placement.prepare {
+        OpticalPrepare::None => return Ok(()),
+        OpticalPrepare::GrowSata { controller, ports } => {
+            storagectl_portcount_args(vm, controller, *ports)?
+        }
+        OpticalPrepare::CreateIde => storagectl_create_args(vm, VMLAB_IDE_CONTROLLER, "ide", None)?,
+    };
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ok(bin, &argv, SHORT)
+        .await
+        .map_err(|e| vdi_storagectl_error("preparar la unidad óptica", e))?;
+    Ok(())
+}
+
+/// Crea la unidad, monta la ISO (o la deja vacía) y recuerda su ubicación.
+pub async fn create_optical_drive(
+    tools: &Tools,
+    vm: &str,
+    node_id: &str,
+    placement: &OpticalPlacement,
+    iso: Option<&str>,
+) -> Result<()> {
+    validate::vbox_target(vm)?;
+    validate::optical_node_id(node_id)?;
+    prepare_optical_slot(tools, vm, placement).await?;
+    let medium = iso.map_or(OpticalMedium::Empty, OpticalMedium::Iso);
+    set_optical_medium(tools, vm, &placement.slot, medium, false).await?;
+    set_optical_extradata(tools, vm, node_id, &placement.slot).await
+}
+
+/// Quita solo una unidad creada por VMLab y borra su extradata. La ISO del
+/// usuario nunca se borra: `--medium none` solo desconecta el medio.
+pub async fn remove_optical_drive(
+    tools: &Tools,
+    vm: &str,
+    node_id: &str,
+    slot: &OpticalSlot,
+) -> Result<()> {
+    validate::vbox_target(vm)?;
+    validate::optical_node_id(node_id)?;
+    set_optical_medium(tools, vm, slot, OpticalMedium::None, true).await?;
+    clear_optical_extradata(tools, vm, node_id).await
+}
+
 // ───────────────────── Discos VDI ─────────────────────
 
 /// Controlador creado por VMLab cuando la VM no tiene ninguno compatible libre.
@@ -1232,6 +1665,22 @@ pub fn closemedium_delete_args(path: &Path, vm_dir: &Path) -> Result<Vec<String>
 
 pub fn showmediuminfo_args(path: &Path) -> Result<Vec<String>> {
     Ok(vec!["showmediuminfo".into(), "disk".into(), vdi_path_arg(path)?])
+}
+
+/// Argumentos de `VBoxManage modifymedium disk <ruta> --resize <MB>`.
+/// Solo se construyen con un tamaño dentro del rango permitido y una ruta que
+/// no pueda interpretarse como opción.
+pub fn modifymedium_resize_args(path: &Path, size_mb: u32) -> Result<Vec<String>> {
+    if !(1..=validate::MAX_VDI_SIZE_MB).contains(&size_mb) {
+        return Err(CoreError::Invalid("el tamaño del disco VDI no está en el rango permitido".into()));
+    }
+    Ok(vec![
+        "modifymedium".into(),
+        "disk".into(),
+        vdi_path_arg(path)?,
+        "--resize".into(),
+        size_mb.to_string(),
+    ])
 }
 
 pub fn storagectl_args(vm: &str) -> Result<Vec<String>> {
@@ -1796,6 +2245,25 @@ pub fn parse_medium_size_mb(info: &str) -> Option<u32> {
     None
 }
 
+/// GB legibles a partir de MB, sin ceros sobrantes (`1024` → `1`, `1536` → `1.5`).
+pub fn vdi_gb_text(mb: u32) -> String {
+    let value = f64::from(mb) / 1024.0;
+    let text = format!("{value:.2}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() { "0".into() } else { trimmed.into() }
+}
+
+/// Aviso al aplicar una topología con un VDI que ya existe: se indican la
+/// capacidad real y la del lienzo para que quede claro que no se ha ampliado.
+pub fn vdi_size_warning(label: &str, real_mb: u32, wanted_mb: u32) -> String {
+    format!(
+        "Disco «{label}»: el disco existente mide {} GB y el lienzo indica {} GB; \
+         el tamaño no cambia (usa «Gestionar discos» para ampliarlo).",
+        vdi_gb_text(real_mb),
+        vdi_gb_text(wanted_mb)
+    )
+}
+
 fn vdi_command_error(action: &str, e: CoreError) -> CoreError {
     CoreError::Message(format!("no se pudo {action}: {e}"))
 }
@@ -1835,6 +2303,7 @@ pub async fn ensure_vdi_file(
     disks_dir: &Path,
     path: &Path,
     size_mb: u32,
+    label: &str,
 ) -> Result<Option<String>> {
     if !disks::vdi_path_allowed(disks_dir, path) {
         return Err(CoreError::Invalid("la ruta del disco VDI queda fuera de la carpeta de discos".into()));
@@ -1851,7 +2320,8 @@ pub async fn ensure_vdi_file(
                 if info.code == 0 {
                     if let Some(real_mb) = parse_medium_size_mb(&info.stdout) {
                         if real_mb != size_mb {
-                            return Ok(Some("el tamaño no cambia con discos existentes".into()));
+                            // Solo avisamos cuando se ha podido leer la capacidad real.
+                            return Ok(Some(vdi_size_warning(label, real_mb, size_mb)));
                         }
                     }
                 }
@@ -2891,6 +3361,17 @@ storagecontrollermaxportcount0="2"
         assert_eq!(parse_medium_size_mb("otro=1\n"), None);
     }
 
+    #[test]
+    fn warns_with_the_real_and_canvas_sizes_when_a_vdi_exists() {
+        assert_eq!(vdi_gb_text(1024), "1");
+        assert_eq!(vdi_gb_text(1536), "1.5");
+        assert_eq!(
+            vdi_size_warning("datos", 1024, 20_480),
+            "Disco «datos»: el disco existente mide 1 GB y el lienzo indica 20 GB; \
+             el tamaño no cambia (usa «Gestionar discos» para ampliarlo)."
+        );
+    }
+
     // ── C1: creación de VMs ──
 
     const REAL_OSTYPES_72: &str = r#"Supported guest OS types:
@@ -3270,5 +3751,209 @@ VMState="poweroff"
         assert!(req.tpm);
         assert_eq!(req.disk_bus, "sata");
         assert!(req.iso.is_some());
+    }
+
+    #[test]
+    fn optical_slot_prefers_a_free_ide_slot_without_touching_existing_drives() {
+        let info = r#"
+VMState="running"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="SATA"
+storagecontrollertype1="IntelAhci"
+storagecontrollerportcount1="2"
+"IDE-1-0"="C:\\ISOs\\installer.iso"
+"IDE-1-1"="none"
+"SATA-0-0"="C:\\VMs\\system.vdi"
+"#;
+        let storage = parse_vm_storage(info);
+        let placement = plan_optical_slot(&storage).unwrap();
+        assert_eq!(
+            placement.slot,
+            OpticalSlot { controller: "IDE".into(), port: 0, device: 0 }
+        );
+        assert_eq!(placement.prepare, OpticalPrepare::None);
+
+        // Un `emptydrive` es una unidad del usuario: no se reutiliza.
+        let with_drive = info.replace("\"IDE-1-1\"=\"none\"", "\"IDE-0-0\"=\"emptydrive\"");
+        let storage = parse_vm_storage(&with_drive);
+        let placement = plan_optical_slot(&storage).unwrap();
+        assert_eq!(placement.slot.device, 1);
+    }
+
+    #[test]
+    fn optical_slot_uses_or_grows_sata_when_ide_is_full() {
+        let full_ide = r#"
+"IDE-0-0"="C:\\a.vdi"
+"IDE-0-1"="C:\\b.vdi"
+"IDE-1-0"="C:\\c.iso"
+"IDE-1-1"="C:\\d.vdi"
+"#;
+        let info = format!(
+            r#"
+VMState="poweroff"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="SATA"
+storagecontrollertype1="IntelAhci"
+storagecontrollerportcount1="1"
+storagecontrollermaxportcount1="30"
+{full_ide}
+"SATA-0-0"="none"
+"#
+        );
+        let storage = parse_vm_storage(&info);
+        let placement = plan_optical_slot(&storage).unwrap();
+        assert_eq!(placement.slot.controller, "SATA");
+        assert_eq!((placement.slot.port, placement.slot.device), (0, 0));
+        assert_eq!(placement.prepare, OpticalPrepare::None);
+
+        let grown = info.replace("\"SATA-0-0\"=\"none\"", "\"SATA-0-0\"=\"C:\\\\system.vdi\"");
+        let storage = parse_vm_storage(&grown);
+        let placement = plan_optical_slot(&storage).unwrap();
+        assert_eq!(
+            placement.prepare,
+            OpticalPrepare::GrowSata { controller: "SATA".into(), ports: 2 }
+        );
+        assert_eq!(placement.slot.port, 1);
+    }
+
+    #[test]
+    fn optical_slot_creates_ide_only_when_there_is_no_alternative() {
+        let no_controller = "VMState=\"poweroff\"\n";
+        let placement = plan_optical_slot(&parse_vm_storage(no_controller)).unwrap();
+        assert_eq!(
+            placement.slot,
+            OpticalSlot { controller: VMLAB_IDE_CONTROLLER.into(), port: 0, device: 0 }
+        );
+        assert_eq!(placement.prepare, OpticalPrepare::CreateIde);
+
+        // Hay IDE (lleno) y SATA agotado: no se crea otro controlador.
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+storagecontrollername1="SATA"
+storagecontrollertype1="IntelAhci"
+storagecontrollerportcount1="2"
+storagecontrollermaxportcount1="2"
+"IDE-0-0"="a"
+"IDE-0-1"="b"
+"IDE-1-0"="c"
+"IDE-1-1"="d"
+"SATA-0-0"="e"
+"SATA-1-0"="f"
+"#;
+        let err = plan_optical_slot(&parse_vm_storage(info)).unwrap_err().to_string();
+        assert!(err.contains("no queda ningún hueco"), "{err}");
+    }
+
+    #[test]
+    fn optical_storageattach_arguments_are_closed() {
+        let iso = std::env::temp_dir().join(format!("vmlab-vbox-{}.iso", std::process::id()));
+        std::fs::write(&iso, b"ISO").unwrap();
+        let iso_s = iso.to_string_lossy().into_owned();
+        let slot = OpticalSlot { controller: "IDE".into(), port: 1, device: 0 };
+        let base: Vec<String> = ["storageattach", "Ubuntu", "--storagectl", "IDE", "--port", "1",
+            "--device", "0", "--type", "dvddrive", "--medium"]
+            .iter().map(|s| s.to_string()).collect();
+
+        let mut expected = base.clone();
+        expected.push("emptydrive".into());
+        assert_eq!(
+            storageattach_optical_args("Ubuntu", &slot, OpticalMedium::Empty, false).unwrap(),
+            expected
+        );
+        let mut expected = base.clone();
+        expected.push("none".into());
+        assert_eq!(
+            storageattach_optical_args("Ubuntu", &slot, OpticalMedium::None, false).unwrap(),
+            expected
+        );
+        let mut expected = base.clone();
+        expected.push(iso_s.clone());
+        expected.push("--forceunmount".into());
+        assert_eq!(
+            storageattach_optical_args("Ubuntu", &slot, OpticalMedium::Iso(&iso_s), true).unwrap(),
+            expected
+        );
+
+        assert!(storageattach_optical_args("--vm", &slot, OpticalMedium::Empty, false).is_err());
+        let bad_slot = OpticalSlot { controller: "--IDE".into(), port: 0, device: 0 };
+        assert!(storageattach_optical_args("Ubuntu", &bad_slot, OpticalMedium::Empty, false).is_err());
+        assert!(storageattach_optical_args("Ubuntu", &slot, OpticalMedium::Iso("relativa.iso"), false).is_err());
+        // El `--forceunmount` nunca se construye automáticamente al insertar.
+        let inserted = storageattach_optical_args("Ubuntu", &slot, OpticalMedium::Iso(&iso_s), false).unwrap();
+        assert!(!inserted.iter().any(|a| a == "--forceunmount"));
+        std::fs::remove_file(&iso).unwrap();
+    }
+
+    #[test]
+    fn optical_extradata_arguments_and_parsing_are_symmetric() {
+        let key = optical_extradata_key("n_abc").unwrap();
+        assert_eq!(key, "VMLab/Optical/n_abc");
+        assert!(optical_extradata_key("n|mal").is_err());
+
+        let expected: Vec<String> = ["setextradata", "Ubuntu", "VMLab/Optical/n_abc", "IDE|1|0"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(setextradata_args("Ubuntu", &key, "IDE|1|0").unwrap(), expected);
+        assert!(setextradata_args("--vm", &key, "IDE|1|0").is_err());
+        assert!(setextradata_args("Ubuntu", "--clave", "IDE|1|0").is_err());
+        assert!(setextradata_args("Ubuntu", &key, "--mal").is_err());
+        assert!(setextradata_args("Ubuntu", &key, "IDE|1\n0").is_err());
+        assert_eq!(
+            getextradata_args("Ubuntu", &key).unwrap(),
+            ["getextradata", "Ubuntu", "VMLab/Optical/n_abc"]
+                .iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            enumerate_extradata_args("Ubuntu").unwrap(),
+            ["getextradata", "Ubuntu", "enumerate"]
+                .iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+
+        assert_eq!(parse_extradata_value("Value: IDE|1|0\n"), Some("IDE|1|0".into()));
+        assert_eq!(parse_extradata_value("Value: <no value>\n"), None);
+        assert_eq!(parse_extradata_value(""), None);
+        let slot = parse_optical_location("IDE|1|0").unwrap();
+        assert_eq!(slot, OpticalSlot { controller: "IDE".into(), port: 1, device: 0 });
+        assert_eq!(slot.location().unwrap(), "IDE|1|0");
+        for bad in ["IDE|-1|0", "IDE|1|0|extra", "--evil|0|0", "IDE|31|0", "IDE|0|2", ""] {
+            assert!(parse_optical_location(bad).is_none(), "{bad}");
+        }
+
+        let out = "Key: VMLab/Optical/n_abc, Value: IDE|1|0\nKey: Otra, Value: <no value>\n";
+        assert_eq!(
+            parse_extradata_enumeration(out),
+            vec![
+                ("VMLab/Optical/n_abc".into(), Some("IDE|1|0".into())),
+                ("Otra".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn optical_medium_comparison_ignores_the_rest_of_the_storage() {
+        let info = r#"
+VMState="poweroff"
+storagecontrollername0="IDE"
+storagecontrollertype0="PIIX4"
+storagecontrollerportcount0="2"
+"IDE-1-0"="C:\\ISOs\\ubuntu.iso"
+"IDE-0-0"="emptydrive"
+"#;
+        let storage = parse_vm_storage(info);
+        let iso_slot = OpticalSlot { controller: "IDE".into(), port: 1, device: 0 };
+        assert!(optical_medium_is(&storage, &iso_slot, Some("C:\\ISOs\\ubuntu.iso")));
+        assert!(!optical_medium_is(&storage, &iso_slot, Some("C:\\ISOs\\otra.iso")));
+        assert!(!optical_medium_is(&storage, &iso_slot, None));
+        let empty_slot = OpticalSlot { controller: "IDE".into(), port: 0, device: 0 };
+        assert!(optical_medium_is(&storage, &empty_slot, None));
+        assert!(optical_state_warning("Ubuntu", "poweroff", "crear").is_none());
+        let saved = optical_state_warning("Ubuntu", "saved", "crear").unwrap();
+        assert!(saved.contains("estado guardado"), "{saved}");
     }
 }

@@ -7,7 +7,8 @@ import type { GuestAdditionsPrep, MachineInfo, PaletteItem } from '../types';
 import { DRAG_MIME } from './Canvas';
 import { NewVmDialog } from './NewVmDialog';
 import { DeleteVmDialog } from './DeleteVmDialog';
-import { CheckIcon, ContainerIcon, CubeIcon, DiskIcon, PlayIcon, PlusIcon, RefreshIcon, TrashIcon, WarnIcon } from './icons';
+import { DiskManagerDialog } from './DiskManagerDialog';
+import { CheckIcon, ContainerIcon, CubeIcon, DiskIcon, OpticalIcon, PlayIcon, PlusIcon, RefreshIcon, TrashIcon, WarnIcon } from './icons';
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,199}$/;
@@ -175,6 +176,30 @@ function DiskItem() {
   );
 }
 
+/** Paleta de unidades ópticas: solo se pueden enlazar con VMs de VirtualBox. */
+function OpticalItem() {
+  const t = useT();
+  const addMachine = useLab((s) => s.addMachine);
+  const item: PaletteItem = { kind: 'optical', label: t('sidebar.optical'), target: '' };
+  const onDragStart = (e: DragEvent) => {
+    const payload = JSON.stringify(item);
+    e.dataTransfer.setData(DRAG_MIME, payload);
+    e.dataTransfer.setData('text/plain', `vmlab:${payload}`);
+    e.dataTransfer.effectAllowed = 'copy';
+  };
+
+  return (
+    <li className="pal-item optical" draggable onDragStart={onDragStart}
+      onDoubleClick={() => addMachine(item)} title={t('sidebar.dragItemHint')}>
+      <span className="pal-icon"><OpticalIcon /></span>
+      <span className="pal-text">
+        <span className="pal-name" title={t('sidebar.optical')}>{t('sidebar.optical')}</span>
+        <span className="pal-sub" title={t('sidebar.opticalHint')}>{t('sidebar.opticalHint')}</span>
+      </span>
+    </li>
+  );
+}
+
 export function Sidebar() {
   const t = useT();
   const [deleteVm, setDeleteVm] = useState<MachineInfo | null>(null);
@@ -190,6 +215,7 @@ export function Sidebar() {
   const [name, setName] = useState('');
   const [image, setImage] = useState('');
   const [newVmOpen, setNewVmOpen] = useState(false);
+  const [diskManagerOpen, setDiskManagerOpen] = useState(false);
 
   const used = (m: MachineInfo) => nodes.some((n) => n.data.kind === m.kind && n.data.target === m.target);
 
@@ -239,8 +265,18 @@ export function Sidebar() {
         </div>
 
         <div className="side-section">
-          <div className="side-title"><span>{t('sidebar.disks')}</span></div>
-          <ul className="pal-list"><DiskItem /></ul>
+          <div className="side-title">
+            <span>{t('sidebar.disks')}</span>
+            <button
+              className="btn side-manage-btn"
+              type="button"
+              onClick={() => setDiskManagerOpen(true)}
+              title={t('diskManager.openHint')}
+            >
+              {t('diskManager.open')}
+            </button>
+          </div>
+          <ul className="pal-list"><DiskItem /><OpticalItem /></ul>
         </div>
 
         <div className="side-section">
@@ -282,6 +318,7 @@ export function Sidebar() {
       </div>
       {newVmOpen && <NewVmDialog onClose={() => setNewVmOpen(false)} />}
       {deleteVm && <DeleteVmDialog vm={deleteVm} onClose={() => setDeleteVm(null)} />}
+      {diskManagerOpen && <DiskManagerDialog onClose={() => setDiskManagerOpen(false)} />}
     </aside>
   );
 }

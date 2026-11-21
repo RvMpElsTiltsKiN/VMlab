@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { technicalText, useLocale, useT, type Locale, type Translate } from '../i18n';
 import { groupLive, probeKey } from '../lib/connectivity';
 import {
+  diskName,
   diskSizeLabel,
   edgeKind,
   isDisk,
@@ -14,6 +15,7 @@ import {
 import { ipc, isTauri } from '../lib/ipc';
 import { charLength, ENV_KEY_RE, hasControlChars, RUN_LIMITS } from '../lib/labFile';
 import { hasLinkConditions, LINK_LIMITS, sameLink } from '../lib/link';
+import { isMachineNode, isOptical, isoFileName, isoPathLooksValid, linkedVmsOf } from '../lib/optical';
 import { resolveState, stateLabel } from '../lib/status';
 import { computeGroups, NET_COLORS, uniqueHostSlug } from '../lib/topology';
 import { useLab } from '../store/useLab';
@@ -1436,6 +1438,7 @@ function DiskPanel({ node }: { node: MachineNode }) {
   const t = useT();
   const nodes = useLab((s) => s.nodes);
   const edges = useLab((s) => s.edges);
+  const managedDisks = useLab((s) => s.managedDisks);
   const { updateNode, removeNode, setMountPath, onEdgesChange } = useLab.getState();
   const disk = node.data.disk ?? { shared: false, mounts: [] };
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -1444,6 +1447,10 @@ function DiskPanel({ node }: { node: MachineNode }) {
     .map((mount) => byId.get(mount.container))
     .filter((n): n is MachineNode => !!n && n.data.kind === 'vbox');
   const hasVm = linkedVms.length > 0;
+  // Caché del gestor de discos: nada de IPC en cada render del Inspector.
+  const actualDisk =
+    managedDisks.find((d) => d.kind === 'vdi' && d.name === diskName(node.data.target)) ??
+    managedDisks.find((d) => d.kind === 'volume' && d.name === volumeName(node.data.target));
 
   // El tamaño se edita en GB pero se guarda en MB (lo que espera el backend).
   const sizeFromNode = (): string =>
@@ -1491,6 +1498,9 @@ function DiskPanel({ node }: { node: MachineNode }) {
         />
       </label>
       <p className="hint">{t('disk.sizeHelp')}</p>
+      {actualDisk?.capacityMb != null && (
+        <p className="hint">{t('disk.actualSize', { size: diskSizeLabel(actualDisk.capacityMb) })}</p>
+      )}
       {sizeInvalid && <p className="hint err">{t('disk.sizeInvalid')}</p>}
 
       {hasVm ? (
@@ -1565,6 +1575,134 @@ function DiskPanel({ node }: { node: MachineNode }) {
   );
 }
 
+/** Panel derecho de una unidad óptica: ISO, VM enlazada y cambio en caliente. */
+function OpticalPanel({ node }: { node: MachineNode }) {
+  const t = useT();
+  const nodes = useLab((s) => s.nodes);
+  const edges = useLab((s) => s.edges);
+  const ready = useLab((s) => !!s.opticalReady[node.id]);
+  const missing = useLab((s) => !!s.opticalIsoMissing[node.id]);
+  const vmStates = useLab((s) => s.opticalVmState[node.id] ?? {});
+  const busy = useLab((s) => !!s.busy[node.id]);
+  const labsnapBusy = useLab((s) => s.labsnapBusy);
+  const toast = useLab((s) => s.toast);
+  const { updateNode, removeNode, setOpticalIso } = useLab.getState();
+  const vms = linkedVmsOf(node, nodes, edges);
+  const iso = node.data.optical?.iso?.trim();
+  const invalid = !isoPathLooksValid(iso);
+  const [draft, setDraft] = useState(iso ?? '');
+  const [choosing, setChoosing] = useState(false);
+
+  useEffect(() => {
+    setDraft(iso ?? '');
+  }, [node.id, iso]);
+
+  const applyIso = async (value: string) => {
+    if (choosing || busy) return;
+    setChoosing(true);
+    try {
+      await setOpticalIso(node.id, value.trim() || undefined);
+    } finally {
+      setChoosing(false);
+    }
+  };
+
+  const chooseIso = async () => {
+    if (choosing || busy) return;
+    if (!isTauri) {
+      await applyIso(draft);
+      return;
+    }
+    setChoosing(true);
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({
+        title: t('optical.chooseIso'),
+        multiple: false,
+        filters: [{ name: 'ISO', extensions: ['iso'] }],
+      });
+      if (typeof selected === 'string') {
+        setDraft(selected);
+        await setOpticalIso(node.id, selected);
+      }
+    } catch (e) {
+      const text = technicalText(t('optical.isoError', { detail: errText(e) }));
+      toast('error', text);
+    } finally {
+      setChoosing(false);
+    }
+  };
+
+  return (
+    <aside className="inspector optical-panel">
+      <div className="side-title"><span>{t('optical.title')}</span></div>
+      <label className="field">{t('insp.label')}
+        <input value={node.data.label} onChange={(e) => updateNode(node.id, { label: e.target.value })} />
+      </label>
+
+      <div className="side-title"><span>{t('optical.iso')}</span></div>
+      <div className="optical-iso mono" title={iso}>{iso ? isoFileName(iso) : t('optical.empty')}</div>
+      {iso && <code className="optical-path mono" title={iso}>{iso}</code>}
+
+      {!isTauri && (
+        <label className="field">{t('optical.isoPath')}
+          <input
+            className={`mono ${invalid ? 'invalid' : ''}`}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder={t('optical.isoPlaceholder')}
+            spellCheck={false}
+          />
+        </label>
+      )}
+
+      <div className="optical-actions">
+        <button className="btn" disabled={choosing || busy} onClick={() => void chooseIso()}>
+          {choosing ? t('optical.choosingIso') : t('optical.chooseIso')}
+        </button>
+        <button className="btn" disabled={choosing || busy || !iso} onClick={() => void applyIso('')}>
+          {t('optical.eject')}
+        </button>
+      </div>
+      {invalid && <p className="hint err">{t('optical.isoInvalid')}</p>}
+      {missing && <p className="hint err">{t('optical.isoMissing')}</p>}
+      <p className="hint">{t('optical.isoHint')}</p>
+
+      <div className="side-title"><span>{t('optical.vm')}</span></div>
+      {vms.length ? (
+        <div className="optical-vm-list">
+          {vms.map((vm) => {
+            const state = vmStates[vm.id];
+            const error = state?.error;
+            return (
+              <div className="optical-vm" key={vm.id}>
+                <div className="optical-vm-name mono">{vm.data.label}</div>
+                <div className={`optical-vm-state ${error ? 'err' : state?.ready ? 'ok' : ''}`}>
+                  {error
+                    ? t('optical.vmError', { detail: error })
+                    : state?.ready
+                      ? t('optical.ready')
+                      : t('optical.pending')}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="hint">{t('optical.notLinked')}</p>
+      )}
+      <p className="hint">{t('optical.linkHint')}</p>
+
+      <div className="side-title"><span>{t('optical.status')}</span></div>
+      <p className="hint">{ready ? t('optical.ready') : t('optical.pending')}</p>
+      <p className="hint">{t('optical.createHint')}</p>
+      <p className="hint">{t('optical.hotSwapHint')}</p>
+
+      <button className="btn ghost danger-text" disabled={labsnapBusy} onClick={() => removeNode(node.id)}><TrashIcon /> {t('insp.remove')}</button>
+    </aside>
+  );
+}
+
 /** Panel derecho cuando hay un cable seleccionado. */
 function CablePanel({ edge }: { edge: Edge }) {
   const t = useT();
@@ -1574,11 +1712,17 @@ function CablePanel({ edge }: { edge: Edge }) {
   const b = nodes.find((n) => n.id === edge.target);
 
   if (edgeKind(edge) === 'mount') {
-    const disk = nodes.find((n) => isDisk(n) && (n.id === edge.source || n.id === edge.target));
-    const container = nodes.find((n) => !isDisk(n) && (n.id === edge.source || n.id === edge.target));
+    const disk = nodes.find(
+      (n) =>
+        (isDisk(n) || isOptical(n)) && (n.id === edge.source || n.id === edge.target),
+    );
+    const container = nodes.find(
+      (n) => isMachineNode(n) && (n.id === edge.source || n.id === edge.target),
+    );
     const path = mountPathOf(edge) ?? '';
     const invalid = !validMountPath(path);
     const isVm = container?.data.kind === 'vbox';
+    const isOpticalMount = disk?.data.kind === 'optical';
     return (
       <aside className="inspector mount-panel">
         <div className="side-title"><span>{t('mount.title')}</span></div>
@@ -1589,7 +1733,12 @@ function CablePanel({ edge }: { edge: Edge }) {
               <span aria-hidden="true">→</span>
               <span>{container.data.label}</span>
             </div>
-            {isVm ? (
+            {isOpticalMount ? (
+              <>
+                <p className="hint">{t('optical.iso')}: <b>{isoFileName(disk?.data.optical?.iso) || t('optical.empty')}</b></p>
+                <p className="hint">{t('optical.linkHint')}</p>
+              </>
+            ) : isVm ? (
               <>
                 <p className="hint">{t('mount.size')}: <b>{diskSizeLabel(disk.data.disk?.sizeMb)}</b></p>
                 <p className="hint">{t('mount.sizeHint')}</p>
@@ -1660,6 +1809,7 @@ export function Inspector() {
 
   if (edge) return <CablePanel edge={edge} />;
   if (node && isDisk(node)) return <DiskPanel node={node} />;
+  if (node && isOptical(node)) return <OpticalPanel node={node} />;
 
   return (
     <aside className="inspector">
