@@ -1,7 +1,7 @@
 {
   "name": "vmlab",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Lienzo visual para gestionar laboratorios locales de VirtualBox y Docker",
   "author": "RvMpElsTiltsKiN",
   "license": "MIT",
